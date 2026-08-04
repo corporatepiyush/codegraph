@@ -3684,7 +3684,20 @@ class PhpAnalyzer(TreeSitterAnalyzer):
         # -- structure -----------------------------------------------------
         ("n_traits_used", "INT NOT NULL DEFAULT 0"),
         ("n_static_calls", "INT NOT NULL DEFAULT 0"),
-        ("n_elif", "INT NOT NULL DEFAULT 0"),
+        ("n_extract_call", "INT NOT NULL DEFAULT 0"),
+    ("n_weak_hash", "INT NOT NULL DEFAULT 0"),
+    ("n_weak_random", "INT NOT NULL DEFAULT 0"),
+    ("n_remote_fetch", "INT NOT NULL DEFAULT 0"),
+    ("n_header_call", "INT NOT NULL DEFAULT 0"),
+    ("n_session_call", "INT NOT NULL DEFAULT 0"),
+    ("n_move_uploaded", "INT NOT NULL DEFAULT 0"),
+    ("n_serialize_call", "INT NOT NULL DEFAULT 0"),
+    ("n_inarray_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_array_merge_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_count_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_preg_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_keycheck_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_elif", "INT NOT NULL DEFAULT 0"),
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
         ("namespace_", "TEXT NOT NULL DEFAULT ''"),
         ("class_name", "TEXT NOT NULL DEFAULT ''"),
@@ -4198,6 +4211,38 @@ UPDATE namespaces AS n SET n_classes = (
                     st.bump(col)
         if name.lstrip("->") in ESCAPERS or name in ESCAPERS:
             st.bump("n_escaped_output")
+
+        # -- facts PHPStan, Psalm, PHPMD and phpcs-security-audit check.
+        # Counted, never judged: whether an `unserialize` is a gadget chain
+        # depends on what reaches it, and that is a graph question.
+        _b = name.lstrip("->").rsplit("::", 1)[-1].lower()
+        if _b in ("extract", "compact"):
+            st.bump("n_extract_call")
+        if _b in ("md5", "sha1", "crc32"):
+            st.bump("n_weak_hash")
+        if _b in ("rand", "mt_rand", "srand", "mt_srand", "uniqid"):
+            st.bump("n_weak_random")
+        if _b in ("file_get_contents", "fopen", "curl_exec", "fsockopen"):
+            st.bump("n_remote_fetch")
+        if _b == "header":
+            st.bump("n_header_call")
+        if _b in ("session_start", "setcookie", "session_regenerate_id"):
+            st.bump("n_session_call")
+        if _b == "move_uploaded_file":
+            st.bump("n_move_uploaded")
+        if _b in ("serialize", "unserialize"):
+            st.bump("n_serialize_call")
+        if loop_depth:
+            if _b == "in_array":
+                st.bump("n_inarray_in_loop")
+            elif _b in ("array_merge", "array_push", "array_combine"):
+                st.bump("n_array_merge_in_loop")
+            elif _b in ("count", "sizeof", "strlen", "str_repeat"):
+                st.bump("n_count_in_loop")
+            elif _b in ("preg_replace", "preg_match", "preg_split"):
+                st.bump("n_preg_in_loop")
+            elif _b in ("array_key_exists", "isset", "property_exists"):
+                st.bump("n_keycheck_in_loop")
 
     def on_string(self, node: Any, text: str, src: bytes, st: BodyStats,
                   loop_depth: int) -> None:
@@ -5764,6 +5809,82 @@ PhpAnalyzer.QUERIES = PhpAnalyzer.QUERIES + [
       AND f.is_test=0 AND f.is_generated=0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.sloc DESC LIMIT :lim"""),
+
+    ("outbound-fetch-below-a-controller", "file_get_contents, fopen or curl_exec reachable from a controller",
+    "ANSWERS the SSRF question Psalm\'s taint analysis needs a full config to\n"
+    "     ask and PHPStan will not ask at all: not whether the code fetches a\n"
+    "     URL -- most apps do -- but whether a request-facing controller can\n"
+    "     reach the fetch. That is the difference between a scheduled importer\n"
+    "     and an open proxy into the private network.\n"
+    "ACT allow-list the host before the call and forbid redirects to private\n"
+    "     ranges. `reached_from` names the controller whose input needs the\n"
+    "     check; fewest hops first, because those have the least code in\n"
+    "     between to sanitise anything.\n"
+    "MISLEADS reachability is not taint -- a controller may reach a fetch that\n"
+    "     only ever sees a constant URL. Depth stops at 4 hops, and a call made\n"
+    "     through a container (`$app->make(...)`) or a magic `__call` is not an\n"
+    "     edge here at all.",
+    """WITH RECURSIVE walk(root, sym, depth) AS (
+        SELECT s.id, s.id, 0 FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        WHERE (s.is_controller = 1 OR s.is_entrypoint = 1)
+          AND f.is_test = 0
+        UNION
+        SELECT w.root, e.callee_id, w.depth + 1
+        FROM walk w JOIN edges e ON e.caller_id = w.sym
+        WHERE w.depth < 4 AND e.is_self = 0),      -- depth bound: 4 hops
+    reach(root, sym, depth) AS (
+        SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
+    SELECT s.name, entry.name AS reached_from, MIN(r.depth) AS hops,
+        s.n_remote_fetch AS fetch_calls,
+        s.n_serialize_call AS serialize_calls,
+        s.n_extract_call AS extract_calls,
+        s.n_header_call AS header_calls, s.fan_in,
+        f.path || \':\' || s.line_start AS at
+    FROM reach r
+    JOIN symbols s ON s.id = r.sym
+    JOIN symbols entry ON entry.id = r.root
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE r.depth > 0 AND f.is_test = 0
+      AND (s.n_remote_fetch > 0 OR s.n_serialize_call > 0
+           OR s.n_extract_call > 0)
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id, entry.id
+    ORDER BY hops ASC, fetch_calls DESC, s.fan_in DESC LIMIT :lim"""),
+
+    ("array-scan-in-a-hot-method", "in_array, array_merge or count inside a loop, weighted by how many callers reach it",
+    "ANSWERS what PHPMD and the PHPStan perf extensions flag statement by\n"
+    "     statement and cannot prioritise. `in_array` in a loop is O(n*m);\n"
+    "     `array_merge` in a loop reallocates the whole array every iteration,\n"
+    "     turning an append into O(n^2). Both are only worth fixing where they\n"
+    "     run, and `distinct_callers` is the graph\'s answer to where.\n"
+    "ACT flip the haystack with array_flip and use isset(), and replace the\n"
+    "     merge with `$out[] =` plus one merge after the loop. Hoist count()\n"
+    "     into a variable above the loop.\n"
+    "MISLEADS the loop bound is not visible here, and a scan over a\n"
+    "     five-element config array is not worth touching. `distinct_callers`\n"
+    "     counts static call sites; a single caller inside a request loop beats\n"
+    "     fifty callers on a cron path.",
+    """SELECT s.name, s.n_inarray_in_loop AS inarray_in_loop,
+        s.n_array_merge_in_loop AS array_merge_in_loop,
+        s.n_count_in_loop AS count_in_loop,
+        s.n_preg_in_loop AS preg_in_loop,
+        s.n_keycheck_in_loop AS keycheck_in_loop,
+        s.max_loop_depth AS loop_depth, s.fan_in,
+        COUNT(DISTINCT e.caller_id) AS distinct_callers,
+        f.path || \':\' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN edges e ON e.callee_id = s.id AND e.is_self = 0
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE (s.n_inarray_in_loop > 0 OR s.n_array_merge_in_loop > 0
+           OR s.n_count_in_loop > 0)
+      AND f.is_test = 0
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id
+    ORDER BY array_merge_in_loop DESC, inarray_in_loop DESC,
+        distinct_callers DESC LIMIT :lim"""),
 ]
 
 ANALYZER = PhpAnalyzer()

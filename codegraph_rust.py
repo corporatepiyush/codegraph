@@ -3547,7 +3547,19 @@ class RustAnalyzer(TreeSitterAnalyzer):
         ("n_match_arms", "INT NOT NULL DEFAULT 0"),
         ("n_let_chains", "INT NOT NULL DEFAULT 0"),
         ("is_const_fn", "INT NOT NULL DEFAULT 0"),
-        ("n_elif", "INT NOT NULL DEFAULT 0"),
+        ("n_lock_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_to_owned_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_safe_fallback", "INT NOT NULL DEFAULT 0"),
+    ("n_iter_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_push_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_io_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_block_on", "INT NOT NULL DEFAULT 0"),
+    ("n_thread_sleep", "INT NOT NULL DEFAULT 0"),
+    ("n_len_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_borrow_mut", "INT NOT NULL DEFAULT 0"),
+    ("n_unwrap_err", "INT NOT NULL DEFAULT 0"),
+    ("n_unchecked_call", "INT NOT NULL DEFAULT 0"),
+    ("n_elif", "INT NOT NULL DEFAULT 0"),
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
         # -- where this symbol lives, for the queries that need the receiver
         ("impl_type", "TEXT NOT NULL DEFAULT ''"),
@@ -4073,6 +4085,32 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
                              bool(loop_depth)))
             return
         name = text_of(fn, src).strip()
+        # -- facts clippy checks, recorded not judged --------------------
+        _b = name.rsplit("::", 1)[-1].rsplit(".", 1)[-1]
+        if _b in ("lock", "read", "write") and loop_depth:
+            st.bump("n_lock_in_loop")
+        if _b in ("to_string", "to_owned", "to_vec") and loop_depth:
+            st.bump("n_to_owned_in_loop")     # clippy::redundant_clone family
+        if _b in ("unwrap_or_else", "unwrap_or_default", "ok_or_else"):
+            st.bump("n_safe_fallback")        # the GOOD pattern, for contrast
+        if _b in ("iter", "into_iter", "chars", "bytes") and loop_depth:
+            st.bump("n_iter_in_loop")
+        if _b in ("push", "insert", "extend") and loop_depth:
+            st.bump("n_push_in_loop")         # clippy::needless_collect adjacent
+        if _b in ("read_to_string", "read_to_end", "write_all") and loop_depth:
+            st.bump("n_io_in_loop")
+        if _b in ("block_on",):
+            st.bump("n_block_on")             # blocking inside async
+        if _b in ("sleep",) and "thread" in name:
+            st.bump("n_thread_sleep")         # clippy async blocking
+        if _b in ("len",) and loop_depth:
+            st.bump("n_len_in_loop")
+        if _b in ("get_mut", "borrow_mut"):
+            st.bump("n_borrow_mut")           # RefCell runtime-panic surface
+        if _b in ("expect_err", "unwrap_err"):
+            st.bump("n_unwrap_err")
+        if _b in ("from_utf8_unchecked", "get_unchecked", "get_unchecked_mut"):
+            st.bump("n_unchecked_call")       # clippy::undocumented_unsafe_blocks
         # A turbofish call's `function` field is a `generic_function`; its own
         # `function` child is the real callee, so peel it or every generic call
         # records `foo::<u32>` and resolves to nothing.
@@ -5588,6 +5626,85 @@ RustAnalyzer.QUERIES = RustAnalyzer.QUERIES + [
     WHERE (f.n_parse_errors > 0 OR f.parsed = 0)
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY f.n_parse_errors DESC, f.lines DESC LIMIT :lim"""),
+
+    ("blocking-work-below-public-api", "a lock, a blocking sleep or I/O inside a loop, reachable from a public function",
+    "ANSWERS what clippy sees per-function and cannot connect: `await_holding_lock`\n"
+    "     and the perf lints fire on one body at a time. A lock taken inside a\n"
+    "     loop is a convoy; the same code three frames under a published API is\n"
+    "     a convoy any caller can trigger. This walks down from every `pub`\n"
+    "     item and reports what it lands on.\n"
+    "ACT hoist the lock out of the loop, or take it once and pass the guard.\n"
+    "     `reached_from` names the published function whose contract now\n"
+    "     includes this cost; `hops` says how much code sits between them.\n"
+    "MISLEADS a `pub` item inside a private module is not part of the crate\'s\n"
+    "     API and is counted here anyway -- `pub(crate)` and re-export chains\n"
+    "     are not modelled. Depth stops at 4 hops. A lock in a loop over three\n"
+    "     elements is fine and looks the same as one over three million.",
+    """WITH RECURSIVE walk(root, sym, depth) AS (
+        SELECT s.id, s.id, 0 FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        WHERE s.is_public = 1 AND f.is_test = 0
+        UNION
+        SELECT w.root, e.callee_id, w.depth + 1
+        FROM walk w JOIN edges e ON e.caller_id = w.sym
+        WHERE w.depth < 4 AND e.is_self = 0),      -- depth bound: 4 hops
+    reach(root, sym, depth) AS (
+        SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
+    SELECT s.name, entry.name AS reached_from, MIN(r.depth) AS hops,
+        s.n_lock_in_loop AS lock_in_loop, s.n_io_in_loop AS io_in_loop,
+        s.n_block_on AS block_on, s.n_thread_sleep AS sleeps,
+        s.n_push_in_loop AS push_in_loop, s.is_async_fn AS is_async,
+        s.fan_in, f.path || \':\' || s.line_start AS at
+    FROM reach r
+    JOIN symbols s ON s.id = r.sym
+    JOIN symbols entry ON entry.id = r.root
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE r.depth > 0 AND f.is_test = 0
+      AND (s.n_lock_in_loop > 0 OR s.n_io_in_loop > 0
+           OR s.n_block_on > 0 OR s.n_thread_sleep > 0)
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id, entry.id
+    ORDER BY lock_in_loop DESC, io_in_loop DESC, hops ASC,
+        s.fan_in DESC LIMIT :lim"""),
+
+    ("runtime-borrow-panic-surface", "RefCell borrow_mut reachable from a public API, with the allocation churn around it",
+    "ANSWERS the half of clippy\'s advice that is a runtime property: a\n"
+    "     `borrow_mut()` is a compile-time-free, run-time-checked lock, and two\n"
+    "     live borrows on one path is a panic, not an error. Reachability from\n"
+    "     a public entry point is what turns that from a local invariant into\n"
+    "     a caller-triggerable abort.\n"
+    "ACT the columns rank by how hard the path is to reason about:\n"
+    "     `borrow_muts` is the panic surface, `to_owned_in_loop` and\n"
+    "     `push_in_loop` are the clippy perf lints on the same code, and a\n"
+    "     function high in both is the one to restructure first.\n"
+    "MISLEADS a single borrow_mut with no reentrancy cannot panic, and most\n"
+    "     here are that. Depth is bounded at 4 hops. Interior mutability via\n"
+    "     Mutex or atomics does not appear at all.",
+    """WITH RECURSIVE walk(root, sym, depth) AS (
+        SELECT s.id, s.id, 0 FROM symbols s
+        WHERE s.is_public = 1 OR s.is_entrypoint = 1
+        UNION
+        SELECT w.root, e.callee_id, w.depth + 1
+        FROM walk w JOIN edges e ON e.caller_id = w.sym
+        WHERE w.depth < 4 AND e.is_self = 0),      -- depth bound: 4 hops
+    reach(root, sym, depth) AS (
+        SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
+    SELECT s.name, entry.name AS reached_from, MIN(r.depth) AS hops,
+        s.n_borrow_mut AS borrow_muts, s.n_unwrap_err AS unwraps,
+        s.n_to_owned_in_loop AS to_owned_in_loop,
+        s.n_push_in_loop AS push_in_loop,
+        s.n_lock_in_loop AS lock_in_loop, s.fan_in,
+        f.path || \':\' || s.line_start AS at
+    FROM reach r
+    JOIN symbols s ON s.id = r.sym
+    JOIN symbols entry ON entry.id = r.root
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_borrow_mut > 0 AND r.depth > 0 AND f.is_test = 0
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id, entry.id
+    ORDER BY borrow_muts DESC, hops ASC, s.fan_in DESC LIMIT :lim"""),
 ]
 
 ANALYZER = RustAnalyzer()

@@ -2857,6 +2857,61 @@ class TreeSitterAnalyzer(Analyzer):
             st.calls.append(("", node.start_point[0] + 1, True, bool(loop_depth)))
             return
         name = text_of(fn, src).strip()
+        base = name.rsplit(".", 1)[-1]
+
+        # -- facts golangci-lint checks, recorded rather than judged ---------
+        # Counters, never verdicts. `n_http_no_timeout` says the code built a
+        # client without a timeout; whether that matters depends on whether a
+        # request handler reaches it, which is a graph question. Rule ids are
+        # cited so the original rationale stays findable.
+        if name in ("context.Background", "context.TODO"):
+            st.bump("n_ctx_background_call")     # containedctx / fatcontext
+        if name in ("http.Get", "http.Post", "http.PostForm", "http.Head",
+                    "http.DefaultClient.Do"):
+            st.bump("n_http_default_client")     # noctx / bodyclose
+        if base in ("Fatal", "Fatalf", "Fatalln", "Exit") and \
+                name.split(".", 1)[0] in ("log", "os", "logrus", "klog"):
+            st.bump("n_exit_call")               # revive deep-exit
+        if name in ("time.After",) and loop_depth:
+            st.bump("n_time_after_in_loop")      # staticcheck SA1023-adjacent
+        if name in ("time.Tick",):
+            st.bump("n_time_tick_call")          # SA1015: leaks a ticker
+        if name in ("fmt.Errorf",):
+            txt = text_of(node, src)
+            if "%w" not in txt:
+                st.bump("n_errorf_no_wrap")      # errorlint / wrapcheck
+        if name in ("rand.Int", "rand.Intn", "rand.Float64", "rand.Read",
+                    "rand.Int31", "rand.Int63"):
+            st.bump("n_weak_random")             # gosec G404
+        if name in ("md5.New", "sha1.New", "md5.Sum", "sha1.Sum",
+                    "des.NewCipher", "rc4.NewCipher"):
+            st.bump("n_weak_crypto")             # gosec G401/G403/G405
+        if name in ("ioutil.ReadAll", "io.ReadAll") and loop_depth:
+            st.bump("n_readall_in_loop")         # PERF: unbounded read per pass
+        if name in ("os.Getenv", "os.LookupEnv"):
+            st.bump("n_env_read")                # config surface
+        if name in ("json.Unmarshal", "json.NewDecoder", "yaml.Unmarshal",
+                    "gob.NewDecoder", "xml.Unmarshal"):
+            st.bump("n_decode_call")             # decode surface for taint
+        if name in ("sync.WaitGroup", "wg.Add") or base == "Add" and \
+                name.startswith("wg."):
+            st.bump("n_waitgroup_add")           # SA2000 family
+        if base in ("Lock", "RLock"):
+            st.bump("n_lock_call")
+        if base in ("Unlock", "RUnlock"):
+            st.bump("n_unlock_call")
+        if base == "Close":
+            st.bump("n_close_call")              # bodyclose / sqlclosecheck
+        if name in ("reflect.ValueOf", "reflect.TypeOf", "reflect.DeepEqual"):
+            st.bump("n_reflect_call")            # perf + opacity
+        if name in ("unsafe.Pointer", "unsafe.Sizeof", "unsafe.Slice",
+                    "unsafe.String"):
+            st.bump("n_unsafe_call")             # gosec G103
+        if name in ("exec.Command", "exec.CommandContext", "syscall.Exec"):
+            st.bump("n_exec_call")               # gosec G204
+        if name in ("filepath.Join", "path.Join") and loop_depth:
+            st.bump("n_pathjoin_in_loop")
+
         dynamic = not name or not name[0].isalpha() and name[0] not in "_$"
         st.calls.append((name[:200], node.start_point[0] + 1, dynamic,
                          bool(loop_depth)))
@@ -3456,7 +3511,30 @@ class GoAnalyzer(TreeSitterAnalyzer):
         ("n_sql_concat", "INT NOT NULL DEFAULT 0"),
         ("n_lock_by_value_params", "INT NOT NULL DEFAULT 0"),
         ("n_nolint", "INT NOT NULL DEFAULT 0"),
-        ("n_elif", "INT NOT NULL DEFAULT 0"),
+        #: Facts golangci-lint's members check, recorded so SQL can combine them
+    #: with the call graph. A count, never a judgement: whether a
+    #: context.Background() deep in a call chain is wrong depends on whether
+    #: something above it had a real context to pass, and only the graph knows.
+    ("n_ctx_background_call", "INT NOT NULL DEFAULT 0"),   # containedctx
+    ("n_http_default_client", "INT NOT NULL DEFAULT 0"),   # noctx/bodyclose
+    ("n_exit_call", "INT NOT NULL DEFAULT 0"),             # revive deep-exit
+    ("n_time_after_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_time_tick_call", "INT NOT NULL DEFAULT 0"),        # SA1015
+    ("n_errorf_no_wrap", "INT NOT NULL DEFAULT 0"),        # errorlint
+    ("n_weak_random", "INT NOT NULL DEFAULT 0"),           # G404
+    ("n_weak_crypto", "INT NOT NULL DEFAULT 0"),           # G401/G403/G405
+    ("n_readall_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_env_read", "INT NOT NULL DEFAULT 0"),
+    ("n_decode_call", "INT NOT NULL DEFAULT 0"),
+    ("n_waitgroup_add", "INT NOT NULL DEFAULT 0"),
+    ("n_lock_call", "INT NOT NULL DEFAULT 0"),
+    ("n_unlock_call", "INT NOT NULL DEFAULT 0"),
+    ("n_close_call", "INT NOT NULL DEFAULT 0"),            # bodyclose
+    ("n_reflect_call", "INT NOT NULL DEFAULT 0"),
+    ("n_unsafe_call", "INT NOT NULL DEFAULT 0"),           # G103
+    ("n_exec_call", "INT NOT NULL DEFAULT 0"),             # G204
+    ("n_pathjoin_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_elif", "INT NOT NULL DEFAULT 0"),
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
         ("receiver_is_pointer", "INT NOT NULL DEFAULT 0"),
         ("receiver_type", "TEXT NOT NULL DEFAULT ''"),
@@ -4749,6 +4827,82 @@ WITH RECURSIVE down(root, sym, depth) AS (
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.is_handler DESC, s.n_type_assert_unchecked * (1 + s.fan_in) DESC
     LIMIT :lim"""),
+(
+    "context-severed-by-caller",
+    "context.Background() called from a function whose own caller had a real context",
+    "ANSWERS the question `containedctx` and `fatcontext` cannot: not whether\n"
+    "     a fresh Background() exists, but whether one was NEEDED. A\n"
+    "     Background() at main() is correct. The same call two frames below a\n"
+    "     handler that was handed a ctx severs cancellation for everything\n"
+    "     underneath -- the request is abandoned and the work carries on.\n"
+    "ACT thread the caller's ctx down instead of minting a new one. The\n"
+    "     `caller` column names a function that already had one; if several\n"
+    "     callers appear, the signature needs a ctx parameter.\n"
+    "MISLEADS a Background() used to deliberately OUTLIVE the request -- a\n"
+    "     fire-and-forget audit write, a cache warm -- is correct and looks\n"
+    "     identical here. The tell is whether the result is awaited. This also\n"
+    "     inherits containedctx's blind spot: a ctx stored in a struct field\n"
+    "     rather than passed is invisible to both.",
+    """SELECT callee.name AS makes_background, caller.name AS caller,
+        caller.n_ctx_params AS caller_had_ctx,
+        callee.n_ctx_background_call AS background_calls,
+        callee.n_ctx_params AS callee_ctx_params,
+        callee.n_goroutines AS goroutines, callee.fan_in,
+        COUNT(DISTINCT e.caller_id) AS callers_with_ctx,
+        f.path || ':' || callee.line_start AS at
+    FROM edges e
+    JOIN symbols caller ON caller.id = e.caller_id
+    JOIN symbols callee ON callee.id = e.callee_id
+    JOIN files f ON f.id = callee.file_id
+    LEFT JOIN modules m ON m.id = callee.module_id
+    WHERE callee.n_ctx_background_call > 0
+      AND caller.n_ctx_params > 0
+      AND callee.n_ctx_params = 0
+      AND e.is_self = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY callee.id, caller.id
+    ORDER BY callers_with_ctx DESC, callee.fan_in DESC,
+        callee.n_goroutines DESC LIMIT :lim"""),
+(
+    "lock-release-imbalance-reachable",
+    "Functions that lock more than they unlock, weighted by what reaches them",
+    "ANSWERS which unbalanced locking can actually be hit. Counting Lock and\n"
+    "     Unlock per function is trivial and staticcheck does it; the useful\n"
+    "     question is whether an HTTP handler or a goroutine reaches the\n"
+    "     imbalance, because an unreleased mutex there deadlocks the server\n"
+    "     rather than one test.\n"
+    "ACT `defer mu.Unlock()` immediately after the Lock is the fix for almost\n"
+    "     all of these. Where the imbalance is deliberate -- lock in one\n"
+    "     method, unlock in another -- name the pair so the next reader knows.\n"
+    "MISLEADS a deferred Unlock IS counted, so a correctly balanced function\n"
+    "     shows equal numbers; what appears here is genuinely lopsided text.\n"
+    "     But lock and unlock in different FUNCTIONS is a legitimate pattern\n"
+    "     for a guard type and reads as an imbalance in both halves. Depth is\n"
+    "     bounded at 4 hops, so a deeper caller is simply not seen.",
+    """WITH RECURSIVE walk(root, sym, depth) AS (
+        SELECT s.id, s.id, 0 FROM symbols s
+        WHERE s.is_handler = 1 OR s.n_goroutines > 0
+        UNION
+        SELECT w.root, e.callee_id, w.depth + 1
+        FROM walk w JOIN edges e ON e.caller_id = w.sym
+        WHERE w.depth < 4 AND e.is_self = 0),      -- depth bound: 4 hops
+    reach(root, sym, depth) AS (
+        SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
+    SELECT s.name, s.receiver_type AS receiver, entry.name AS reached_from,
+        MIN(r.depth) AS hops,
+        s.n_lock_call AS locks, s.n_unlock_call AS unlocks,
+        s.n_lock_call - s.n_unlock_call AS imbalance,
+        s.n_defer_close AS defers, s.n_goroutines AS goroutines,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM reach r
+    JOIN symbols s ON s.id = r.sym
+    JOIN symbols entry ON entry.id = r.root
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_lock_call > s.n_unlock_call AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id, entry.id
+    ORDER BY hops ASC, imbalance DESC, s.fan_in DESC LIMIT :lim"""),
 ]
 
 ANALYZER = GoAnalyzer()

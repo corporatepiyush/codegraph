@@ -3734,7 +3734,22 @@ class JavaAnalyzer(TreeSitterAnalyzer):
         ("has_serial_uid", "INT NOT NULL DEFAULT 0"),
         # -- shape --
         ("owner_type", "TEXT NOT NULL DEFAULT ''"),
-        ("n_elif", "INT NOT NULL DEFAULT 0"),
+        ("n_runtime_exec", "INT NOT NULL DEFAULT 0"),
+    ("n_print_stacktrace", "INT NOT NULL DEFAULT 0"),
+    ("n_default_charset", "INT NOT NULL DEFAULT 0"),
+    ("n_parse_no_radix", "INT NOT NULL DEFAULT 0"),
+    ("n_equals_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_weak_random", "INT NOT NULL DEFAULT 0"),
+    ("n_timeout_set", "INT NOT NULL DEFAULT 0"),
+    ("n_executor_create", "INT NOT NULL DEFAULT 0"),
+    ("n_submit_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_future_get", "INT NOT NULL DEFAULT 0"),
+    ("n_monitor_call", "INT NOT NULL DEFAULT 0"),
+    ("n_string_intern", "INT NOT NULL DEFAULT 0"),
+    ("n_raw_statement", "INT NOT NULL DEFAULT 0"),
+    ("n_read_object", "INT NOT NULL DEFAULT 0"),
+    ("n_load_library", "INT NOT NULL DEFAULT 0"),
+    ("n_elif", "INT NOT NULL DEFAULT 0"),
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
     )
 
@@ -4129,10 +4144,53 @@ UPDATE symbols SET arity_rank = CASE
         base = _txt(nm, src).strip()
         full = base
         obj = node.child_by_field_name("object")
-        if obj is not None and obj.type in QUALIFIER_NODES:
-            q = _txt(obj, src).strip()
-            if len(q) <= 80 and "\n" not in q:
-                full = q + "." + base
+        recv = ""
+        if obj is not None:
+            recv = _txt(obj, src).strip()
+            if obj.type in QUALIFIER_NODES and len(recv) <= 80 \
+                    and "\n" not in recv:
+                full = recv + "." + base
+            recv = recv[:120]         # for the fact checks below only
+        # -- facts SpotBugs, find-sec-bugs and Error Prone check ----------
+        # Counters, never verdicts: `n_runtime_exec` says the code shells
+        # out; whether that is a vulnerability depends on whether untrusted
+        # input reaches it, and only the call graph knows that.
+        _b = full.rsplit(".", 1)[-1]
+        if (_b == "exec" and ("Runtime" in full or "Runtime" in recv)) or \
+                (_b == "start" and "ProcessBuilder" in recv):
+            st.bump("n_runtime_exec")            # find-sec-bugs COMMAND_INJECTION
+        if _b in ("printStackTrace",):
+            st.bump("n_print_stacktrace")        # SpotBugs / PMD AvoidPrintStackTrace
+        if _b in ("getBytes", "toString") and "String" in full:
+            st.bump("n_default_charset")         # find-sec-bugs DM_DEFAULT_ENCODING
+        if _b in ("parseInt", "parseLong", "parseDouble") and \
+                full.split(".", 1)[0] in ("Integer", "Long", "Double"):
+            st.bump("n_parse_no_radix")
+        if _b in ("equals",) and loop_depth:
+            st.bump("n_equals_in_loop")
+        if _b in ("getInstance",) and "Random" in full:
+            st.bump("n_weak_random")             # find-sec-bugs PREDICTABLE_RANDOM
+        if full in ("Math.random", "Random.nextInt", "Random.nextLong"):
+            st.bump("n_weak_random")
+        if _b in ("setSoTimeout", "setConnectTimeout", "setReadTimeout"):
+            st.bump("n_timeout_set")
+        if _b in ("newFixedThreadPool", "newCachedThreadPool",
+                  "newSingleThreadExecutor", "newWorkStealingPool"):
+            st.bump("n_executor_create")         # unbounded pool creation
+        if _b in ("submit", "execute") and loop_depth:
+            st.bump("n_submit_in_loop")
+        if _b in ("get",) and "Future" in full:
+            st.bump("n_future_get")              # blocking get: SpotBugs / Loom
+        if _b in ("wait", "notify", "notifyAll"):
+            st.bump("n_monitor_call")            # SpotBugs NN_NAKED_NOTIFY
+        if _b in ("intern",):
+            st.bump("n_string_intern")
+        if _b in ("createStatement", "prepareCall"):
+            st.bump("n_raw_statement")           # find-sec-bugs SQL_INJECTION
+        if _b in ("readObject", "readUnshared"):
+            st.bump("n_read_object")             # OBJECT_DESERIALIZATION
+        if _b in ("loadLibrary", "load") and "System" in full:
+            st.bump("n_load_library")
         st.calls.append((full[:200], line, False, bool(loop_depth)))
 
         # -- per-call metric columns, keyed on the simple name --------------
@@ -5891,6 +5949,83 @@ JavaAnalyzer.QUERIES = JavaAnalyzer.QUERIES + [
       AND f.is_test=0 AND f.is_generated=0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.sloc DESC LIMIT :lim"""),
+
+    ("native-surface-reachable", "Runtime.exec / readObject / loadLibrary reachable from a public entry point",
+    "ANSWERS what find-sec-bugs and SpotBugs report one call at a time:\n"
+    "     COMMAND_INJECTION, OBJECT_DESERIALIZATION and the JNI loaders. Each\n"
+    "     alone is a fact, not a finding -- a loadLibrary in a static\n"
+    "     initialiser is how JNI works. What matters is whether an outside\n"
+    "     caller can steer one, so this walks the call graph from every public\n"
+    "     or entry-point method and reports the ones that land on it.\n"
+    "ACT read `reached_from`: that is the method whose arguments an attacker\n"
+    "     controls. Fewest hops first -- a 1-hop reach has almost no code\n"
+    "     between the boundary and the sink.\n"
+    "MISLEADS reachability is not taint. A method may reach exec() and pass it\n"
+    "     only a constant. Depth is bounded at 4 hops, so a deeper path is not\n"
+    "     seen, and reflection or a DI container breaks the edge entirely.",
+    """WITH RECURSIVE walk(root, sym, depth) AS (
+        SELECT s.id, s.id, 0 FROM symbols s
+        WHERE (s.is_entrypoint = 1 OR s.is_public = 1 OR s.is_handler = 1)
+        UNION
+        SELECT w.root, e.callee_id, w.depth + 1
+        FROM walk w JOIN edges e ON e.caller_id = w.sym
+        WHERE w.depth < 4 AND e.is_self = 0),      -- depth bound: 4 hops
+    reach(root, sym, depth) AS (
+        SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
+    SELECT s.name, entry.name AS reached_from, MIN(r.depth) AS hops,
+        s.n_runtime_exec AS exec_calls, s.n_read_object AS deserializes,
+        s.n_load_library AS loads_native, s.n_raw_statement AS raw_sql,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM reach r
+    JOIN symbols s ON s.id = r.sym
+    JOIN symbols entry ON entry.id = r.root
+    JOIN files f ON f.id = s.file_id
+    JOIN files ef ON ef.id = entry.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE (s.n_runtime_exec > 0 OR s.n_read_object > 0
+           OR s.n_load_library > 0 OR s.n_raw_statement > 0)
+      AND r.depth > 0 AND f.is_test = 0 AND ef.is_test = 0
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id, entry.id
+    ORDER BY hops ASC, exec_calls DESC, deserializes DESC,
+        s.fan_in DESC LIMIT :lim"""),
+
+    ("platform-charset-across-module-boundary", "default-charset conversion called from more than one module",
+    "ANSWERS the question SpotBugs\' DM_DEFAULT_ENCODING raises 21,497 times on\n"
+    "     a large tree and cannot rank: every `new String(bytes)`, `getBytes()`\n"
+    "     and `FileWriter` without an explicit Charset is platform-dependent.\n"
+    "     Most are harmless because one module owns both ends. The dangerous\n"
+    "     ones are read by callers in OTHER modules, where the two sides can\n"
+    "     disagree about encoding and the bug only shows on a machine whose\n"
+    "     file.encoding differs.\n"
+    "ACT pass StandardCharsets.UTF_8 explicitly. `caller_modules` is the blast\n"
+    "     radius: each one is a module that inherited an encoding it never\n"
+    "     chose.\n"
+    "MISLEADS a module boundary is not a process boundary -- if the whole tree\n"
+    "     always runs under one JVM with a fixed -Dfile.encoding, none of this\n"
+    "     fires in practice. Since JEP 400 (Java 18) the default is UTF-8\n"
+    "     anyway, so on a modern-only codebase this is a portability warning\n"
+    "     rather than a bug.",
+    """SELECT s.name, COUNT(DISTINCT e.caller_id) AS callers,
+        COUNT(DISTINCT cm.name) AS caller_modules,
+        s.n_default_charset AS charset_calls,
+        s.n_parse_no_radix AS radixless_parses,
+        s.n_string_intern AS interns, s.fan_in,
+        f.path || \':\' || s.line_start AS at
+    FROM edges e
+    JOIN symbols s ON s.id = e.callee_id
+    JOIN symbols c ON c.id = e.caller_id
+    JOIN files f ON f.id = s.file_id
+    JOIN files cf ON cf.id = c.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN modules cm ON cm.id = c.module_id
+    WHERE s.n_default_charset > 0 AND e.same_module = 0
+      AND e.is_self = 0 AND f.is_test = 0 AND cf.is_test = 0
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id
+    HAVING COUNT(DISTINCT e.caller_id) > 1
+    ORDER BY caller_modules DESC, charset_calls DESC, s.fan_in DESC
+    LIMIT :lim"""),
 ]
 
 ANALYZER = JavaAnalyzer()

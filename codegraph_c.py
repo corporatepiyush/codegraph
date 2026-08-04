@@ -2205,6 +2205,9 @@ GRAMMAR_NOTE = (
 HAZARD_CATEGORIES = (
     "memory", "alloc", "io", "stdio", "exec", "libm", "integer",
     "concurrency", "control",
+    # CERT CON33-C / MSC24-C: libc calls with a shared static buffer.
+    # Correct single-threaded, a data race the moment it is not.
+    "reentrancy",
 )
 
 HAZARD_FUNCS: dict[str, str] = {
@@ -2269,6 +2272,120 @@ HAZARD_FUNCS: dict[str, str] = {
     "siglongjmp": "control", "abort": "control", "exit": "control",
     "_exit": "control", "assert": "control", "raise": "control",
     "signal": "control", "sigaction": "control",
+    # -- CERT, clang-tidy, cppcheck and flawfinder name these. They
+    # land in `hazards` per-pattern, and no rule fires here: whether an
+    # `atoi` matters depends on where its input came from, which is a
+    # join, not a lookup.
+    "stpcpy": "memory",
+    "stpncpy": "memory",
+    "wcscpy": "memory",
+    "wcscat": "memory",
+    "wcsncpy": "memory",
+    "memccpy": "memory",
+    "strsep": "memory",
+    "realpath": "memory",
+    "getwd": "memory",
+    "getcwd": "memory",
+    "swprintf": "memory",
+    "asprintf": "memory",
+    "vasprintf": "memory",
+    "reallocf": "alloc",
+    "strdupa": "alloc",
+    "strndupa": "alloc",
+    "xmalloc": "alloc",
+    "xrealloc": "alloc",
+    "xcalloc": "alloc",
+    "xstrdup": "alloc",
+    "g_malloc": "alloc",
+    "g_free": "alloc",
+    "cfree": "alloc",
+    "execle": "exec",
+    "execvpe": "exec",
+    "fexecve": "exec",
+    "wordexp": "exec",
+    "posix_spawnp": "exec",
+    "vfork": "exec",
+    "dlmopen": "exec",
+    "dlclose": "exec",
+    "tmpnam": "io",
+    "tempnam": "io",
+    "mktemp": "io",
+    "mkstemp": "io",
+    "mkdtemp": "io",
+    "freopen": "io",
+    "chmod": "io",
+    "fchmod": "io",
+    "chown": "io",
+    "fchown": "io",
+    "umask": "io",
+    "access": "io",
+    "faccessat": "io",
+    "link": "io",
+    "symlink": "io",
+    "unlink": "io",
+    "unlinkat": "io",
+    "rename": "io",
+    "remove": "io",
+    "truncate": "io",
+    "ftruncate": "io",
+    "fsync": "io",
+    "fdatasync": "io",
+    "readlink": "io",
+    "opendir": "io",
+    "readdir": "io",
+    "pthread_cancel": "concurrency",
+    "pthread_kill": "concurrency",
+    "sem_trywait": "concurrency",
+    "atomic_thread_fence": "concurrency",
+    "sched_yield": "concurrency",
+    "pthread_barrier_wait": "concurrency",
+    "atexit": "control",
+    "at_quick_exit": "control",
+    "quick_exit": "control",
+    "kill": "control",
+    "alarm": "control",
+    "sigprocmask": "control",
+    "sigsuspend": "control",
+    "pause": "control",
+    "atoi": "integer",
+    "atol": "integer",
+    "atoll": "integer",
+    "atof": "integer",
+    "strtol": "integer",
+    "strtoul": "integer",
+    "strtoll": "integer",
+    "strtoull": "integer",
+    "strtod": "integer",
+    "strtof": "integer",
+    "strtoimax": "integer",
+    "strtoumax": "integer",
+    "gmtime": "reentrancy",
+    "localtime": "reentrancy",
+    "ctime": "reentrancy",
+    "asctime": "reentrancy",
+    "getenv": "reentrancy",
+    "setenv": "reentrancy",
+    "putenv": "reentrancy",
+    "strerror": "reentrancy",
+    "getpwnam": "reentrancy",
+    "getpwuid": "reentrancy",
+    "getgrnam": "reentrancy",
+    "getgrgid": "reentrancy",
+    "gethostbyaddr": "reentrancy",
+    "setlocale": "reentrancy",
+    "ttyname": "reentrancy",
+    "crypt": "reentrancy",
+    "basename": "reentrancy",
+    "dirname": "reentrancy",
+    "tmpfile": "reentrancy",
+    "rand": "reentrancy",
+    "srand": "reentrancy",
+    "random": "reentrancy",
+    "srandom": "reentrancy",
+    "drand48": "reentrancy",
+    "lrand48": "reentrancy",
+    "mrand48": "reentrancy",
+    "initstate": "reentrancy",
 }
 
 HAZARD_RE: list[tuple[str, str, "re.Pattern[str]"]] = [
@@ -4443,6 +4560,72 @@ CAnalyzer.QUERIES = CAnalyzer.QUERIES + [
       AND f.is_test=0 AND f.is_generated=0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.sloc DESC LIMIT :lim"""),
+
+    ("nonreentrant-under-threads", "a libc call with a shared static buffer, in a function that also touches threads",
+    "ANSWERS CERT CON33-C and MSC24-C, which clang-tidy states as a per-call\n"
+    "     rule and cppcheck barely states at all: `localtime`, `strerror`,\n"
+    "     `getenv`, `basename` and friends return a pointer into one static\n"
+    "     buffer. Single-threaded that is correct and cheap. In a function that\n"
+    "     also creates threads or takes locks it is a data race that corrupts\n"
+    "     the OTHER thread\'s result, silently, under load.\n"
+    "ACT use the _r form -- localtime_r, strerror_r, getpwnam_r -- or copy the\n"
+    "     result before releasing the lock. `patterns` names exactly which\n"
+    "     calls, so the fix is mechanical.\n"
+    "MISLEADS a function that touches threads is not necessarily called from\n"
+    "     more than one, and pthread_create in main() next to a getenv() at\n"
+    "     startup is fine. This sees categories in the same body, not the\n"
+    "     happens-before between them.",
+    """SELECT s.name, m.name AS module,
+        COUNT(DISTINCT h.pattern) AS n_patterns,
+        GROUP_CONCAT(DISTINCT h.pattern) AS patterns,
+        s.n_reentrancy AS reentrancy_calls,
+        s.n_concurrency AS concurrency_calls,
+        s.n_atomic AS atomics, s.fan_in, s.cyclomatic AS cyclo,
+        f.path || \':\' || s.line_start AS at
+    FROM symbols s
+    JOIN hazards h ON h.symbol_id = s.id AND h.category = \'reentrancy\'
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_concurrency > 0 AND f.is_test = 0
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id
+    ORDER BY concurrency_calls DESC, n_patterns DESC, s.fan_in DESC
+    LIMIT :lim"""),
+
+    ("unchecked-conversion-on-an-io-path", "atoi/strtol in a function that also reads input",
+    "ANSWERS CERT ERR34-C, which flawfinder and clang-tidy report on every\n"
+    "     `atoi` in the tree. `atoi(\"42\")` on a literal is fine. `atoi` on\n"
+    "     bytes that just came off a socket or a file returns 0 for the string\n"
+    "     \"0\" and for garbage alike, and sets no errno to distinguish them.\n"
+    "     The graph supplies the missing half: whether the same function also\n"
+    "     performs I/O.\n"
+    "ACT use strtol with an end pointer and check both `end` and `errno`, or\n"
+    "     reject the input outright. `conversions` names the exact calls;\n"
+    "     `returns_value` says whether the function can even report a failure\n"
+    "     to its caller, and a 0 there means the error has nowhere to go.\n"
+    "MISLEADS co-occurrence in one body is not dataflow -- a function may read\n"
+    "     a file and separately parse a constant. A wrapper that validates\n"
+    "     before calling this one makes the row correct and harmless, and that\n"
+    "     wrapper is not visible in the row.",
+    """SELECT s.name, m.name AS module,
+        COUNT(DISTINCT h.pattern) AS n_conversions,
+        GROUP_CONCAT(DISTINCT h.pattern) AS conversions,
+        SUM(h.n) AS conversion_calls,
+        s.n_io AS io_calls, s.n_stdio AS stdio_calls,
+        s.n_memory AS memory_calls, s.ret_val AS returns_value, s.fan_in,
+        f.path || \':\' || s.line_start AS at
+    FROM symbols s
+    JOIN hazards h ON h.symbol_id = s.id AND h.category = \'integer\'
+        AND h.pattern IN (\'atoi\',\'atol\',\'atoll\',\'atof\',\'strtol\',
+            \'strtoul\',\'strtoll\',\'strtoull\',\'strtod\',\'strtof\',
+            \'strtoimax\',\'strtoumax\')
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE (s.n_io > 0 OR s.n_stdio > 0) AND f.is_test = 0
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id
+    ORDER BY conversion_calls DESC, io_calls DESC, s.fan_in DESC
+    LIMIT :lim"""),
 ]
 
 ANALYZER = CAnalyzer()

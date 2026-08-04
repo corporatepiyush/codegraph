@@ -3730,7 +3730,20 @@ class RubyAnalyzer(TreeSitterAnalyzer):
         ("n_super", "INT NOT NULL DEFAULT 0"),
         ("n_forwarding", "INT NOT NULL DEFAULT 0"),
         ("n_end_data", "INT NOT NULL DEFAULT 0"),
-        ("n_elif", "INT NOT NULL DEFAULT 0"),
+        ("n_system_call", "INT NOT NULL DEFAULT 0"),
+    ("n_constantize", "INT NOT NULL DEFAULT 0"),
+    ("n_html_safe", "INT NOT NULL DEFAULT 0"),
+    ("n_raw_sql", "INT NOT NULL DEFAULT 0"),
+    ("n_weak_hash", "INT NOT NULL DEFAULT 0"),
+    ("n_weak_random", "INT NOT NULL DEFAULT 0"),
+    ("n_open_call", "INT NOT NULL DEFAULT 0"),
+    ("n_sleep_call", "INT NOT NULL DEFAULT 0"),
+    ("n_include_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_enum_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_count_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_ar_write_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_serialize_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_elif", "INT NOT NULL DEFAULT 0"),
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
         # -- file/class role -------------------------------------------------
         ("has_frozen_literal", "INT NOT NULL DEFAULT 0"),
@@ -4184,6 +4197,36 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
             elif rt == "string":
                 full = "String#" + meth
         line = node.start_point[0] + 1
+
+        # -- facts RuboCop (Performance/, Security/) and Brakeman check.
+        # Recorded as counts; the verdict is a join away, not a rule here.
+        if meth in ("system", "exec", "spawn", "syscall"):
+            st.bump("n_system_call")
+        elif meth in ("constantize", "safe_constantize"):
+            st.bump("n_constantize")
+        elif meth in ("html_safe", "raw"):
+            st.bump("n_html_safe")
+        elif meth in ("find_by_sql", "execute", "select_all", "select_values"):
+            st.bump("n_raw_sql")
+        elif meth in ("md5", "sha1"):
+            st.bump("n_weak_hash")
+        elif meth in ("rand", "srand"):
+            st.bump("n_weak_random")
+        elif meth == "open":
+            st.bump("n_open_call")
+        elif meth == "sleep":
+            st.bump("n_sleep_call")
+        if loop_depth:
+            if meth == "include?":
+                st.bump("n_include_in_loop")
+            elif meth in ("map", "select", "reject", "each", "detect"):
+                st.bump("n_enum_in_loop")
+            elif meth in ("count", "size", "length"):
+                st.bump("n_count_in_loop")
+            elif meth in ("save", "save!", "update", "create", "destroy"):
+                st.bump("n_ar_write_in_loop")
+            elif meth in ("to_json", "to_yaml", "to_s"):
+                st.bump("n_serialize_in_loop")
 
         col = METAPROGRAM_APIS.get(meth) or METAPROGRAM_APIS.get(full)
         if col is not None:
@@ -5654,6 +5697,79 @@ RubyAnalyzer.QUERIES = RubyAnalyzer.QUERIES + [
     WHERE (f.n_parse_errors > 0 OR f.parsed = 0)
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY f.n_parse_errors DESC, f.lines DESC LIMIT :lim"""),
+
+    ("raw-sql-below-a-controller", "find_by_sql, execute or constantize reachable from a controller action",
+    "ANSWERS the ranking Brakeman cannot do. It reports every `find_by_sql`\n"
+    "     and every `constantize` with a confidence level derived from the call\n"
+    "     site alone. The graph adds the part that decides severity: whether a\n"
+    "     controller action -- the code an HTTP request actually enters --\n"
+    "     can reach it, and in how few hops.\n"
+    "ACT for `raw_sql`, move to a parameterised `where`. For `constantize`,\n"
+    "     replace with an explicit allow-list hash; a `constantize` on request\n"
+    "     data is remote code execution, not a lookup.\n"
+    "MISLEADS reachability is not taint -- the SQL may be a frozen constant.\n"
+    "     Depth stops at 4 hops. Rails resolves a great deal at runtime\n"
+    "     (`send`, `method_missing`, concerns mixed in by string name), and\n"
+    "     none of that produces an edge, so absence here proves nothing.",
+    """WITH RECURSIVE walk(root, sym, depth) AS (
+        SELECT s.id, s.id, 0 FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        WHERE (s.is_controller = 1 OR s.is_entrypoint = 1 OR s.is_job = 1)
+          AND f.is_test = 0
+        UNION
+        SELECT w.root, e.callee_id, w.depth + 1
+        FROM walk w JOIN edges e ON e.caller_id = w.sym
+        WHERE w.depth < 4 AND e.is_self = 0),      -- depth bound: 4 hops
+    reach(root, sym, depth) AS (
+        SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
+    SELECT s.name, entry.name AS reached_from, MIN(r.depth) AS hops,
+        s.n_raw_sql AS raw_sql, s.n_constantize AS constantize,
+        s.n_system_call AS system_calls, s.n_html_safe AS html_safe,
+        s.n_open_call AS open_calls, s.fan_in,
+        f.path || \':\' || s.line_start AS at
+    FROM reach r
+    JOIN symbols s ON s.id = r.sym
+    JOIN symbols entry ON entry.id = r.root
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE r.depth > 0 AND f.is_test = 0
+      AND (s.n_raw_sql > 0 OR s.n_constantize > 0 OR s.n_system_call > 0
+           OR s.n_html_safe > 0)
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id, entry.id
+    ORDER BY hops ASC, constantize DESC, raw_sql DESC,
+        s.fan_in DESC LIMIT :lim"""),
+
+    ("write-per-iteration", "save, update or create called inside a loop, ranked by how many callers reach it",
+    "ANSWERS the write-side N+1 that RuboCop\'s Rails cops do not cover and\n"
+    "     Bullet only catches at runtime on the read side. One `save` per\n"
+    "     iteration is one INSERT, one transaction and one round trip per\n"
+    "     iteration; a thousand-element collection is a thousand of each. The\n"
+    "     read-side N+1 gets all the attention and this one is usually worse.\n"
+    "ACT use `insert_all` / `upsert_all`, or wrap the loop in a single\n"
+    "     `transaction` block so the commits collapse. `enum_in_loop` next to a\n"
+    "     write marks a nested iteration, which multiplies it again.\n"
+    "MISLEADS a loop over two records is fine, and the bound is invisible here.\n"
+    "     `save` on a non-ActiveRecord object -- a form object, a service --\n"
+    "     reads identically and costs nothing. Callbacks that themselves write\n"
+    "     are not counted, so the real number can be higher.",
+    """SELECT s.name, s.n_ar_write_in_loop AS writes_in_loop,
+        s.n_enum_in_loop AS enum_in_loop,
+        s.n_count_in_loop AS count_in_loop,
+        s.n_serialize_in_loop AS serialize_in_loop,
+        s.max_loop_depth AS loop_depth, s.is_model AS in_model,
+        s.is_job AS in_job, s.fan_in,
+        COUNT(DISTINCT e.caller_id) AS distinct_callers,
+        f.path || \':\' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN edges e ON e.callee_id = s.id AND e.is_self = 0
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_ar_write_in_loop > 0 AND f.is_test = 0
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id
+    ORDER BY writes_in_loop DESC, loop_depth DESC,
+        distinct_callers DESC LIMIT :lim"""),
 ]
 
 ANALYZER = RubyAnalyzer()

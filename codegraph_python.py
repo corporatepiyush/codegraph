@@ -2721,6 +2721,56 @@ class FunctionMetrics(ast.NodeVisitor):
                 self.bump("n_open")
             if base in ("print",):
                 self.bump("n_print")
+
+            # -- facts the linters check, recorded rather than judged --------
+            # Each is a counter, never a verdict: the query decides what is
+            # bad and at what threshold. Rule ids are cited so a reader can go
+            # read the original rationale rather than trusting this comment.
+            if name in ("pickle.load", "pickle.loads", "cPickle.load",
+                        "cPickle.loads", "dill.load", "dill.loads",
+                        "shelve.open"):
+                self.bump("n_pickle_load")          # bandit S301/S302
+            if name in ("yaml.load", "yaml.unsafe_load", "yaml.full_load"):
+                self.bump("n_yaml_load")            # bandit S506
+            if name.startswith("random.") and base not in ("SystemRandom",):
+                self.bump("n_weak_random")          # bandit S311
+            if name in ("hashlib.md5", "hashlib.sha1", "md5.new"):
+                self.bump("n_weak_hash")            # bandit S324
+            if base in ("eval", "exec", "compile") and not name.startswith("re."):
+                self.bump("n_eval_exec")            # bandit S307 / pylint W0122
+            if name in ("os.system", "os.popen", "commands.getoutput"):
+                self.bump("n_os_system")            # bandit S605
+            if name.startswith(("tempfile.mktemp",)):
+                self.bump("n_insecure_temp")        # bandit S306
+            if name in ("time.sleep", "asyncio.sleep") and self.loop_depth:
+                self.bump("n_sleep_in_loop")        # ruff ASYNC101 / PERF
+            if base in ("getattr", "setattr", "delattr", "hasattr") and \
+                    len(node.args) > 1 and not isinstance(
+                        node.args[1], ast.Constant):
+                self.bump("n_dynamic_attr")         # pylint / ruff B009-B010
+            if base == "get" and self.loop_depth:
+                self.bump("n_dict_get_in_loop")     # ruff PERF
+            if base == "open" and not any(
+                    k.arg == "encoding" for k in node.keywords):
+                self.bump("n_open_no_encoding")     # ruff PLW1514
+            if name in ("datetime.datetime.now", "datetime.now",
+                        "datetime.datetime.utcnow", "datetime.utcnow") and \
+                    not node.args and not node.keywords:
+                self.bump("n_naive_datetime")       # ruff DTZ005/DTZ003
+            if name in ("requests.get", "requests.post", "requests.put",
+                        "requests.delete", "requests.patch",
+                        "requests.head", "requests.request",
+                        "urllib.request.urlopen") and not any(
+                        k.arg == "timeout" for k in node.keywords):
+                self.bump("n_request_no_timeout")   # bandit S113 / ruff ASYNC210
+            if base in ("assertEquals", "assertEqual") and self.loop_depth:
+                self.bump("n_assert_in_loop")
+            if name in ("subprocess.run", "subprocess.call",
+                        "subprocess.check_output", "subprocess.Popen",
+                        "subprocess.check_call"):
+                self.bump("n_subprocess")           # bandit S603
+            if base in ("format",) and self.loop_depth:
+                self.bump("n_format_in_loop")       # ruff PERF
             if self.loop_depth and name in HAZARD_CALLS:
                 cat = HAZARD_CALLS[name]
                 if cat in ("io", "net", "sql"):
@@ -2816,6 +2866,28 @@ class PythonAnalyzer(Analyzer):
         ("n_shell_true", "INT NOT NULL DEFAULT 0"),
         ("n_annotated_assign", "INT NOT NULL DEFAULT 0"),
         ("n_try_else", "INT NOT NULL DEFAULT 0"),
+        #: Facts the Python linters check, recorded so SQL can COMBINE them.
+        #: Each is a count, not a judgement -- `n_pickle_load` says what the
+        #: code does; whether that is a bug depends on whether untrusted input
+        #: can reach it, which is a question only the call graph answers. A
+        #: column costs four bytes per symbol; a fact not recorded cannot be
+        #: joined to anything later.
+        ("n_pickle_load", "INT NOT NULL DEFAULT 0"),        # S301/S302
+        ("n_yaml_load", "INT NOT NULL DEFAULT 0"),          # S506
+        ("n_weak_random", "INT NOT NULL DEFAULT 0"),        # S311
+        ("n_weak_hash", "INT NOT NULL DEFAULT 0"),          # S324
+        ("n_eval_exec", "INT NOT NULL DEFAULT 0"),          # S307/W0122
+        ("n_os_system", "INT NOT NULL DEFAULT 0"),          # S605
+        ("n_insecure_temp", "INT NOT NULL DEFAULT 0"),      # S306
+        ("n_sleep_in_loop", "INT NOT NULL DEFAULT 0"),      # ASYNC101
+        ("n_dynamic_attr", "INT NOT NULL DEFAULT 0"),       # B009/B010
+        ("n_dict_get_in_loop", "INT NOT NULL DEFAULT 0"),   # PERF
+        ("n_open_no_encoding", "INT NOT NULL DEFAULT 0"),   # PLW1514
+        ("n_naive_datetime", "INT NOT NULL DEFAULT 0"),     # DTZ003/DTZ005
+        ("n_request_no_timeout", "INT NOT NULL DEFAULT 0"), # S113/ASYNC210
+        ("n_assert_in_loop", "INT NOT NULL DEFAULT 0"),
+        ("n_subprocess", "INT NOT NULL DEFAULT 0"),         # S603
+        ("n_format_in_loop", "INT NOT NULL DEFAULT 0"),     # PERF
         ("n_elif", "INT NOT NULL DEFAULT 0"),
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
         ("is_property", "INT NOT NULL DEFAULT 0"),
@@ -4470,6 +4542,82 @@ QUERIES: list[tuple[str, str, str, str]] = [
     WHERE (f.n_parse_errors > 0 OR f.parsed = 0)
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY f.lines DESC LIMIT :lim"""),
+(
+    "unsafe-decode-reachable",
+    "pickle, yaml.load and eval, and how far they sit from something that takes input",
+    "ANSWERS which of bandit's deserialization findings actually matter here.\n"
+    "     S301 and S506 fire on every pickle and every yaml.load in the tree,\n"
+    "     including the ones only a build script reaches. The question they\n"
+    "     cannot answer alone is whether attacker-controlled bytes get there.\n"
+    "ACT work down from hops=0. A pickle.load inside a request handler is\n"
+    "     remote code execution; the same call in a management command run by\n"
+    "     an operator is a design smell at worst. Replace with JSON, or sign\n"
+    "     the payload and verify before decoding.\n"
+    "MISLEADS reachability here is the CALL graph only, so a handler that\n"
+    "     dispatches through a registry, a signal, or a Celery task name looks\n"
+    "     unreachable and is not. hops is a lower bound on distance, never an\n"
+    "     upper bound on safety, and bandit's own false-positive rate on S301\n"
+    "     comes along unchanged -- a pickle of a constant is still counted.",
+    """WITH RECURSIVE walk(root, sym, depth) AS (
+        SELECT s.id, s.id, 0 FROM symbols s
+        WHERE s.is_entrypoint = 1 OR s.is_public = 1
+        UNION
+        SELECT w.root, e.callee_id, w.depth + 1
+        FROM walk w JOIN edges e ON e.caller_id = w.sym
+        WHERE w.depth < 4 AND e.is_self = 0),      -- depth bound: 4 hops
+    reach(root, sym, depth) AS (
+        SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
+    SELECT s.name, src.name AS reached_from, MIN(r.depth) AS hops,
+        s.n_pickle_load AS pickles, s.n_yaml_load AS yaml_loads,
+        s.n_eval_exec AS evals, s.n_subprocess AS subprocs,
+        s.fan_in, m.name AS module_,
+        f.path || ':' || s.line_start AS at
+    FROM reach r
+    JOIN symbols s ON s.id = r.sym
+    JOIN symbols src ON src.id = r.root
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE (s.n_pickle_load + s.n_yaml_load + s.n_eval_exec) > 0
+      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id, src.id
+    ORDER BY hops ASC, (s.n_pickle_load + s.n_eval_exec) DESC LIMIT :lim"""),
+(
+    "latent-risk-density",
+    "Cheap linter facts that only matter together, ranked by who depends on them",
+    "ANSWERS which functions carry several small smells at once in code that\n"
+    "     many things call. Each fact here is individually reported by ruff or\n"
+    "     bandit and individually ignorable -- an open() without encoding, a\n"
+    "     naive datetime, a getattr on a computed name, an md5. A function\n"
+    "     with four of them that 200 callers reach is a different proposition.\n"
+    "ACT read `facts` as a count of DISTINCT smells, not severity. Start where\n"
+    "     facts and fan_in are both high: that is where one careful rewrite\n"
+    "     retires several warnings and the blast radius justifies the risk.\n"
+    "MISLEADS this deliberately mixes security and correctness facts, so a\n"
+    "     high score can be four harmless portability warnings. It ranks\n"
+    "     ATTENTION, not danger -- read the columns, not the total. Encoding\n"
+    "     and timezone defaults are also platform-dependent, so a codebase\n"
+    "     that only ever runs in one container may have decided already.",
+    """SELECT s.name, m.name AS module_,
+        (CASE WHEN s.n_open_no_encoding > 0 THEN 1 ELSE 0 END
+         + CASE WHEN s.n_naive_datetime > 0 THEN 1 ELSE 0 END
+         + CASE WHEN s.n_dynamic_attr > 0 THEN 1 ELSE 0 END
+         + CASE WHEN s.n_weak_hash > 0 THEN 1 ELSE 0 END
+         + CASE WHEN s.n_weak_random > 0 THEN 1 ELSE 0 END
+         + CASE WHEN s.n_request_no_timeout > 0 THEN 1 ELSE 0 END
+         + CASE WHEN s.n_sleep_in_loop > 0 THEN 1 ELSE 0 END
+         + CASE WHEN s.n_bare_except > 0 THEN 1 ELSE 0 END) AS facts,
+        s.n_open_no_encoding AS open_noenc, s.n_naive_datetime AS naive_dt,
+        s.n_dynamic_attr AS dyn_attr, s.n_weak_hash AS weak_hash,
+        s.n_request_no_timeout AS no_timeout, s.n_bare_except AS bare_except,
+        s.fan_in, s.cyclomatic AS cyclo,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND (s.n_open_no_encoding + s.n_naive_datetime + s.n_dynamic_attr
+           + s.n_weak_hash + s.n_weak_random + s.n_request_no_timeout
+           + s.n_sleep_in_loop + s.n_bare_except) > 0
+    ORDER BY facts DESC, s.fan_in DESC, s.cyclomatic DESC LIMIT :lim"""),
 ]
 
 _SYMBOL_COLS: set[str] = set()

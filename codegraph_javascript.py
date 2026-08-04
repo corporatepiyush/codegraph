@@ -3652,7 +3652,20 @@ class JavaScriptAnalyzer(TreeSitterAnalyzer):
         ("n_generator", "INT NOT NULL DEFAULT 0"),
         ("n_yield", "INT NOT NULL DEFAULT 0"),
         ("n_labeled", "INT NOT NULL DEFAULT 0"),
-        ("n_elif", "INT NOT NULL DEFAULT 0"),
+        ("n_child_process", "INT NOT NULL DEFAULT 0"),
+    ("n_fs_sync", "INT NOT NULL DEFAULT 0"),
+    ("n_assign_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_json_parse_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_array_grow_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_search_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_math_random", "INT NOT NULL DEFAULT 0"),
+    ("n_weak_hash", "INT NOT NULL DEFAULT 0"),
+    ("n_then_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_catch_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_process_exit", "INT NOT NULL DEFAULT 0"),
+    ("n_buffer_call", "INT NOT NULL DEFAULT 0"),
+    ("n_proto_mutate", "INT NOT NULL DEFAULT 0"),
+    ("n_elif", "INT NOT NULL DEFAULT 0"),
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
         ("n_modules_calling", "INT NOT NULL DEFAULT 0"),
         ("class_name", "TEXT NOT NULL DEFAULT ''"),
@@ -4140,6 +4153,39 @@ UPDATE exports AS e SET symbol_id = x.id FROM
             return
         raw = text_of(fn, src).strip()
         name = " ".join(raw.split())
+        # -- facts ESLint and its security/promise/unicorn plugins check --
+        # Counters, never verdicts: whether a child_process.exec matters
+        # depends on whether request data reaches it, which is a graph fact.
+        _b = name.rsplit(".", 1)[-1]
+        if _b in ("exec", "execSync", "spawnSync") and "child_process" in name:
+            st.bump("n_child_process")        # eslint-plugin-security
+        if _b in ("readFileSync", "writeFileSync", "existsSync", "statSync"):
+            st.bump("n_fs_sync")              # detect-non-literal-fs-filename
+        if name in ("Object.assign",) and loop_depth:
+            st.bump("n_assign_in_loop")
+        if _b in ("parse",) and name.startswith("JSON") and loop_depth:
+            st.bump("n_json_parse_in_loop")
+        if _b in ("push", "concat", "unshift") and loop_depth:
+            st.bump("n_array_grow_in_loop")   # unicorn/no-array-push-push
+        if _b in ("indexOf", "includes", "find") and loop_depth:
+            st.bump("n_search_in_loop")       # accidental O(n^2)
+        if name in ("Math.random",):
+            st.bump("n_math_random")          # security/detect-pseudoRandomBytes
+        if _b in ("createHash", "createHmac", "createCipher"):
+            _args = node.child_by_field_name("arguments")
+            _at = text_of(_args, src).lower() if _args is not None else ""
+            if "md5" in _at or "sha1" in _at or "rc4" in _at or "des" in _at:
+                st.bump("n_weak_hash")           # the algorithm is an ARGUMENT
+        if _b in ("then",) and loop_depth:
+            st.bump("n_then_in_loop")         # promise/no-promise-in-callback
+        if _b in ("catch",) and loop_depth:
+            st.bump("n_catch_in_loop")
+        if name in ("process.exit",):
+            st.bump("n_process_exit")         # unicorn/no-process-exit
+        if name in ("Buffer",) or name.startswith("Buffer."):
+            st.bump("n_buffer_call")          # node/no-deprecated-api
+        if _b in ("setPrototypeOf", "__defineGetter__"):
+            st.bump("n_proto_mutate")
         if fn.type == "import":
             st.bump("n_import_dynamic")
             st.calls.append(("import()", node.start_point[0] + 1, True,
@@ -5969,6 +6015,78 @@ JavaScriptAnalyzer.QUERIES = JavaScriptAnalyzer.QUERIES + [
       AND f.is_test=0 AND f.is_generated=0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.sloc DESC LIMIT :lim"""),
+
+    ("sync-io-below-a-handler", "a synchronous fs call reachable from a request handler or exported entry point",
+    "ANSWERS what eslint-plugin-node\'s no-sync reports one line at a time and\n"
+    "     cannot rank: `readFileSync` at module load is how config is read and\n"
+    "     is correct. The same call under a handler stops the event loop for\n"
+    "     every other connection until the disk answers. The difference is\n"
+    "     reachability, not the call.\n"
+    "ACT switch to the promise API and await it, or hoist the read to startup\n"
+    "     and cache it. `reached_from` names the handler that pays the latency.\n"
+    "MISLEADS a sync read of a small file already in the page cache costs\n"
+    "     microseconds and is often the right call. Depth stops at 4 hops, and\n"
+    "     a callback passed as a value breaks the edge, so a real blocking path\n"
+    "     through `array.map(cb)` is invisible here.",
+    """WITH RECURSIVE walk(root, sym, depth) AS (
+        SELECT s.id, s.id, 0 FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        WHERE (s.is_handler = 1 OR s.is_entrypoint = 1 OR s.is_exported = 1)
+          AND f.is_test = 0
+        UNION
+        SELECT w.root, e.callee_id, w.depth + 1
+        FROM walk w JOIN edges e ON e.caller_id = w.sym
+        WHERE w.depth < 4 AND e.is_self = 0),      -- depth bound: 4 hops
+    reach(root, sym, depth) AS (
+        SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
+    SELECT s.name, entry.name AS reached_from, MIN(r.depth) AS hops,
+        s.n_fs_sync AS sync_fs_calls,
+        s.n_child_process AS child_process_calls,
+        s.n_json_parse_in_loop AS json_parse_in_loop,
+        s.is_async AS callee_is_async, s.fan_in,
+        f.path || \':\' || s.line_start AS at
+    FROM reach r
+    JOIN symbols s ON s.id = r.sym
+    JOIN symbols entry ON entry.id = r.root
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE r.depth > 0 AND f.is_test = 0
+      AND (s.n_fs_sync > 0 OR s.n_child_process > 0)
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id, entry.id
+    ORDER BY hops ASC, sync_fs_calls DESC, s.fan_in DESC LIMIT :lim"""),
+
+    ("quadratic-scan-in-hot-callee", "a linear search inside a loop, in a function many callers reach",
+    "ANSWERS the shape no ESLint rule can see, because it is not a shape at\n"
+    "     all: `includes`, `indexOf` or `find` inside a loop is O(n*m), and\n"
+    "     unicorn/no-array-push-push or the perf plugins only look at one\n"
+    "     statement. What makes it matter is `fan_in` -- the same nested scan\n"
+    "     in a leaf called twice is noise; in a function 200 call sites reach\n"
+    "     it is the profile.\n"
+    "ACT build a Set or Map before the loop and test membership in O(1). Rows\n"
+    "     are ranked by callers first, so the top of the list is where the\n"
+    "     rewrite pays.\n"
+    "MISLEADS the loop bound is invisible here. A scan over a 3-element array\n"
+    "     is faster than the Set that replaces it. `fan_in` counts static call\n"
+    "     sites, not executions -- a function called once from a hot loop\n"
+    "     outranks nothing.",
+    """SELECT s.name, s.n_search_in_loop AS search_in_loop,
+        s.n_array_grow_in_loop AS array_grow_in_loop,
+        s.n_assign_in_loop AS assign_in_loop,
+        s.n_then_in_loop AS then_in_loop,
+        s.max_loop_depth AS loop_depth, s.cyclomatic AS cyclo,
+        s.fan_in, COUNT(DISTINCT e.caller_id) AS distinct_callers,
+        f.path || \':\' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN edges e ON e.callee_id = s.id AND e.is_self = 0
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE (s.n_search_in_loop > 0 OR s.n_array_grow_in_loop > 0)
+      AND f.is_test = 0
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id
+    ORDER BY distinct_callers DESC, search_in_loop DESC,
+        s.max_loop_depth DESC LIMIT :lim"""),
 ]
 
 ANALYZER = JavaScriptAnalyzer()

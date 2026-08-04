@@ -160,7 +160,7 @@ while missing all 221 files in type-fest's `test-d/`.
 
 ## The query catalogue
 
-**236 queries across nine languages.** Every one carries `ANSWERS` / `ACT` /
+**254 queries across nine languages.** Every one carries `ANSWERS` / `ACT` /
 `MISLEADS`, and every one is graded on real repositories rather than merely
 executed — a query that runs, returns rows and ranks by a column that is always
 zero looks exactly like a working one.
@@ -171,7 +171,7 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 
 ### C — `codegraph_c.py`
 
-32 queries. Target: C11/C17.
+34 queries. Target: C11/C17.
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`hot-multipliers`** — Where one fix multiplies: highest fan-in, ranked with complexity
@@ -205,10 +205,12 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 30. **`hand-linked-objects`** — Build rules and object lists that enumerate their inputs by hand
 31. **`parse-coverage`** — How much of the tree this run actually read
 32. **`dead-code`** — Nothing in this tree calls these
+33. **`nonreentrant-under-threads`** — a libc call with a shared static buffer, in a function that also touches threads
+34. **`unchecked-conversion-on-an-io-path`** — atoi/strtol in a function that also reads input, with no error path
 
 ### Python — `codegraph_python.py`
 
-35 queries. Target: Python 3.15.
+37 queries. Target: Python 3.15.
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`risk-ranked`** — Review order: if you can only read N functions this week, which N
@@ -245,10 +247,12 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 33. **`magic-numbers`** — Unexplained constants, and the ones repeated across files
 34. **`markers`** — TODO, FIXME, HACK and BUG, weighted by the code they sit in
 35. **`parse-coverage`** — What this run could not read
+36. **`unsafe-decode-reachable`** — pickle, yaml.load and eval, and how far they sit from something that takes input
+37. **`latent-risk-density`** — Cheap linter facts that only matter together, ranked by who depends on them
 
 ### Go — `codegraph_go.py`
 
-28 queries. Target: Go 1.26.
+30 queries. Target: Go 1.26.
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`goroutine-leak-frontier`** — Goroutines with no context, no WaitGroup and no errgroup
@@ -278,10 +282,12 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 26. **`error-handling-drift`** — Ignored errors, shadowed errors, and errors compared instead of unwrapped
 27. **`slice-growth-and-copies`** — append in a loop with no capacity, and range copying whole structs
 28. **`unchecked-type-assertions`** — Type assertions without the comma-ok form, and interface{} at the boundary
+29. **`context-severed-by-caller`** — context.Background() called from a function whose own caller had a real context
+30. **`lock-release-imbalance-reachable`** — Functions that lock more than they unlock, weighted by what reaches them
 
 ### Rust — `codegraph_rust.py`
 
-23 queries. Target: Rust 1.97 / edition 2024.
+25 queries. Target: Rust 1.97 / edition 2024.
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`unsafe-under-pub-api`** — unsafe reachable from a public function, up to 4 hops
@@ -306,10 +312,12 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 21. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
 22. **`dead-code`** — Nothing in this tree calls these
 23. **`parse-coverage`** — What this run could not read
+24. **`blocking-work-below-public-api`** — a lock, a blocking sleep or I/O inside a loop, reachable from a public function
+25. **`runtime-borrow-panic-surface`** — RefCell borrow_mut reachable from a public API, with the allocation churn around it
 
 ### Java — `codegraph_java.py`
 
-23 queries. Target: Java 25 (LTS).
+25 queries. Target: Java 25 (LTS).
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`reflection-frontier`** — Public entry points that reach Class.forName or setAccessible
@@ -334,10 +342,12 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 21. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
 22. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
 23. **`dead-code`** — Nothing in this tree calls these
+24. **`native-surface-reachable`** — Runtime.exec / readObject / loadLibrary reachable from a public entry point
+25. **`platform-charset-across-module-boundary`** — default-charset conversion called from more than one module
 
 ### JavaScript — `codegraph_javascript.py`
 
-22 queries. Target: ES2026.
+24 queries. Target: ES2026.
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`retention-leak-frontier`** — Listeners and timers registered with nothing in the module that undoes it
@@ -361,10 +371,12 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 20. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
 21. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
 22. **`dead-code`** — Nothing in this tree calls these
+23. **`sync-io-below-a-handler`** — a synchronous fs call reachable from a request handler or exported entry point
+24. **`quadratic-scan-in-hot-callee`** — a linear search inside a loop, in a function many callers reach
 
 ### TypeScript — `codegraph_typescript.py`
 
-29 queries. Target: TypeScript 7.
+31 queries. Target: TypeScript 7.
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`any-blast-radius`** — `any` weighted by how much code inherits the hole
@@ -395,10 +407,12 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 27. **`index-signature-holes`** — Index signatures and unknown, where excess-property checking stops applying
 28. **`declaration-vs-implementation`** — Ambient .d.ts declarations, and whether an implementation exists in this tree
 29. **`dead-code`** — Nothing in this tree calls these
+30. **`event-loop-block-below-entry`** — synchronous fs or a nested scan reachable from an exported or handler entry point
+31. **`registers-without-disposing`** — a function that registers listeners or subscriptions and never calls dispose
 
 ### PHP — `codegraph_php.py`
 
-21 queries. Target: PHP 8.5.
+23 queries. Target: PHP 8.5.
 
  1. **`graph-blindspots`** — Read this first: where a PHP call graph cannot see
  2. **`superglobal-to-sql`** — Attacker-controlled input reaching a SQL-building site, up to 4 hops
@@ -421,10 +435,12 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 19. **`untyped-public-boundary`** — Public methods taking untyped parameters, where strict_types is off
 20. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
 21. **`dead-code`** — Nothing in this tree calls these
+22. **`outbound-fetch-below-a-controller`** — file_get_contents, fopen or curl_exec reachable from a controller
+23. **`array-scan-in-a-hot-method`** — in_array, array_merge or count inside a loop, weighted by how many callers reach it
 
 ### Ruby — `codegraph_ruby.py`
 
-23 queries. Target: Ruby 4.0.
+25 queries. Target: Ruby 4.0.
 
  1. **`graph-blindspots`** — Read this first: Ruby's call graph is a lower bound, and here is by how much
  2. **`n-plus-one`** — An ActiveRecord query inside a block iterating a relation
@@ -449,6 +465,8 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 21. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
 22. **`dead-code`** — Nothing in this tree calls these
 23. **`parse-coverage`** — What this run could not read
+24. **`raw-sql-below-a-controller`** — find_by_sql, execute or constantize reachable from a controller action
+25. **`write-per-iteration`** — save, update or create called inside a loop, ranked by how many callers reach it
 
 ## Correctness, and how it is checked
 

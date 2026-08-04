@@ -2865,6 +2865,28 @@ class TreeSitterAnalyzer(Analyzer):
             st.calls.append(("", node.start_point[0] + 1, True, bool(loop_depth)))
             return
         name = text_of(fn, src).strip()
+        # -- facts typescript-eslint and the Node plugins check ------------
+        _b = name.rsplit(".", 1)[-1]
+        if _b in ("exec", "execSync", "spawnSync") and "child_process" in name:
+            st.bump("n_child_process")
+        if _b in ("readFileSync", "writeFileSync", "existsSync"):
+            st.bump("n_fs_sync")
+        if _b in ("push", "concat", "unshift") and loop_depth:
+            st.bump("n_array_grow_in_loop")
+        if _b in ("indexOf", "includes", "find") and loop_depth:
+            st.bump("n_search_in_loop")
+        if name in ("Math.random",):
+            st.bump("n_math_random")
+        if _b in ("parse",) and name.startswith("JSON") and loop_depth:
+            st.bump("n_json_parse_in_loop")
+        if name in ("process.exit",):
+            st.bump("n_process_exit")
+        if _b in ("then",) and loop_depth:
+            st.bump("n_then_in_loop")
+        if _b in ("assign",) and name.startswith("Object") and loop_depth:
+            st.bump("n_assign_in_loop")
+        if _b in ("dispose", "unsubscribe", "removeEventListener"):
+            st.bump("n_dispose_call")     # vscode-style lifecycle pairing
         dynamic = not name or not name[0].isalpha() and name[0] not in "_$"
         st.calls.append((name[:200], node.start_point[0] + 1, dynamic,
                          bool(loop_depth)))
@@ -3446,7 +3468,17 @@ class TypeScriptAnalyzer(TreeSitterAnalyzer):
         ("timer_in_loop", "INT NOT NULL DEFAULT 0"),
         ("parse_in_loop", "INT NOT NULL DEFAULT 0"),
         ("dom_in_loop", "INT NOT NULL DEFAULT 0"),
-        ("n_elif", "INT NOT NULL DEFAULT 0"),
+        ("n_child_process", "INT NOT NULL DEFAULT 0"),
+    ("n_fs_sync", "INT NOT NULL DEFAULT 0"),
+    ("n_array_grow_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_search_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_math_random", "INT NOT NULL DEFAULT 0"),
+    ("n_json_parse_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_process_exit", "INT NOT NULL DEFAULT 0"),
+    ("n_then_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_assign_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_dispose_call", "INT NOT NULL DEFAULT 0"),
+    ("n_elif", "INT NOT NULL DEFAULT 0"),
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
         ("is_declaration_only", "INT NOT NULL DEFAULT 0"),
         ("is_component", "INT NOT NULL DEFAULT 0"),
@@ -4937,6 +4969,78 @@ TypeScriptAnalyzer.QUERIES = TypeScriptAnalyzer.QUERIES + [
       AND f.is_test=0 AND f.is_generated=0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.sloc DESC LIMIT :lim"""),
+
+    ("event-loop-block-below-entry", "synchronous fs or a nested scan reachable from an exported or handler entry point",
+    "ANSWERS the question typescript-eslint answers per-file: no-sync,\n"
+    "     no-await-in-loop and the perf rules each see one function. The graph\n"
+    "     sees the path. A `readFileSync` in a helper is fine until an exported\n"
+    "     API reaches it, at which point every consumer of that API inherits a\n"
+    "     blocked event loop.\n"
+    "ACT for `sync_fs_calls`, move to the promise API. For `search_in_loop`,\n"
+    "     hoist a Set. `reached_from` names the exported symbol whose latency\n"
+    "     budget this spends.\n"
+    "MISLEADS an exported symbol is not necessarily public API -- a barrel file\n"
+    "     re-exports everything, so `is_exported` overcounts. Depth is bounded\n"
+    "     at 4 hops, and a call through an interface method is only resolved\n"
+    "     when the implementation is unambiguous.",
+    """WITH RECURSIVE walk(root, sym, depth) AS (
+        SELECT s.id, s.id, 0 FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        WHERE (s.is_exported = 1 OR s.is_handler = 1 OR s.is_entrypoint = 1)
+          AND f.is_test = 0
+        UNION
+        SELECT w.root, e.callee_id, w.depth + 1
+        FROM walk w JOIN edges e ON e.caller_id = w.sym
+        WHERE w.depth < 4 AND e.is_self = 0),      -- depth bound: 4 hops
+    reach(root, sym, depth) AS (
+        SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
+    SELECT s.name, entry.name AS reached_from, MIN(r.depth) AS hops,
+        s.n_fs_sync AS sync_fs_calls, s.n_search_in_loop AS search_in_loop,
+        s.n_json_parse_in_loop AS json_parse_in_loop,
+        s.n_array_grow_in_loop AS array_grow_in_loop,
+        s.is_async AS callee_is_async, s.fan_in,
+        f.path || \':\' || s.line_start AS at
+    FROM reach r
+    JOIN symbols s ON s.id = r.sym
+    JOIN symbols entry ON entry.id = r.root
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE r.depth > 0 AND f.is_test = 0
+      AND (s.n_fs_sync > 0 OR s.n_search_in_loop > 0
+           OR s.n_json_parse_in_loop > 0)
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id, entry.id
+    ORDER BY sync_fs_calls DESC, hops ASC, s.fan_in DESC LIMIT :lim"""),
+
+    ("listener-added-never-removed", "a function that adds listeners and neither removes nor disposes them",
+    "ANSWERS the leak no linter states as a rule because the pairing is a\n"
+    "     convention, not a syntax: whatever calls addEventListener, `.on` or\n"
+    "     `.subscribe` must eventually call the matching remove, or hand the\n"
+    "     handle to something that will. A function with adds, zero removes and\n"
+    "     zero dispose calls either delegates ownership or leaks -- and the\n"
+    "     graph shows how many callers currently assume the former.\n"
+    "ACT return the disposable so the caller can own it, or register into a\n"
+    "     DisposableStore. `listener_in_loop` marks the version that leaks once\n"
+    "     per iteration rather than once per call.\n"
+    "MISLEADS the correct case looks identical: a function that adds a listener\n"
+    "     and returns the disposable is right, and the return value is not\n"
+    "     modelled. A listener on an object that dies with the function is also\n"
+    "     fine. Read this as an audit list, not a leak list.",
+    """SELECT s.name, s.n_listener_add AS adds,
+        s.n_listener_remove AS removes, s.n_dispose_call AS dispose_calls,
+        s.listener_in_loop AS adds_in_loop, s.is_async AS is_async,
+        s.fan_in, COUNT(DISTINCT e.caller_id) AS distinct_callers,
+        f.path || \':\' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN edges e ON e.callee_id = s.id AND e.is_self = 0
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_listener_add > 0 AND s.n_listener_remove = 0
+      AND s.n_dispose_call = 0 AND f.is_test = 0
+      AND COALESCE(m.name,\'\') LIKE :mod
+    GROUP BY s.id
+    ORDER BY adds_in_loop DESC, adds DESC, distinct_callers DESC
+    LIMIT :lim"""),
 ]
 
 ANALYZER = TypeScriptAnalyzer()
