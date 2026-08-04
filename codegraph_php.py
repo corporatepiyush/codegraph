@@ -5590,6 +5590,123 @@ PhpAnalyzer.QUERIES = [
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY f.n_parse_errors DESC, f.n_missing_nodes DESC,
         f.lines DESC LIMIT :lim"""),
+(
+    "file-upload-surface",
+    "$_FILES handling, and whether anything nearby validates it",
+    "ANSWERS where uploaded files enter. Unrestricted upload is a direct path\n"
+    "     to remote code execution: a .php written under the web root runs,\n"
+    "     and a filename containing ../ escapes wherever you meant to put it.\n"
+    "ACT never trust the client-supplied name or MIME type. Generate the\n"
+    "     stored name yourself, verify the content, store OUTSIDE the web\n"
+    "     root, and serve through a script rather than a URL path.\n"
+    "MISLEADS this finds the READ of $_FILES, not the write. A handler that\n"
+    "     passes the array straight to a hardened library is fine and appears\n"
+    "     here; one that builds a path by concatenation does not look worse.",
+    """SELECT s.name, s.class_name AS class_, s.n_files_super AS files_reads,
+        s.n_superglobal_reads AS all_super, s.n_io AS io_ops,
+        s.n_dynamic_include AS dyn_includes, s.n_sql_calls AS sql_calls,
+        s.is_controller AS controller, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_files_super > 0 AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_io DESC, s.n_files_super DESC LIMIT :lim"""),
+(
+    "error-suppression",
+    "The @ operator: failures made invisible rather than handled",
+    "ANSWERS where the code silences errors instead of dealing with them.\n"
+    "     `@` suppresses the diagnostic and returns a falsy value, so the\n"
+    "     failure continues as data -- a null that becomes an empty string\n"
+    "     that becomes a wrong row.\n"
+    "ACT delete the @ and handle what it was hiding. `@$a[k]` predates the\n"
+    "     null-coalescing operator and should be `$a[k] ?? default`; `@unlink`\n"
+    "     should be `file_exists` or a caught exception.\n"
+    "MISLEADS a few @ on genuinely optional filesystem probes are pragmatic,\n"
+    "     not wrong. What matters is @ near a superglobal or a SQL call,\n"
+    "     which is why those columns are here.",
+    """SELECT s.name, s.class_name AS class_, s.n_error_suppress AS suppressed,
+        s.n_superglobal_reads AS super_reads, s.n_sql_calls AS sql_calls,
+        s.n_try AS trys, s.n_catch_empty AS empty_catches, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_error_suppress > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_error_suppress * (1 + s.n_superglobal_reads + s.n_sql_calls)
+             DESC LIMIT :lim"""),
+(
+    "dynamic-call-surface",
+    "Variable variables, variable methods and dynamic new: the parts no tool can follow",
+    "ANSWERS how much of this codebase is invisible to every static check,\n"
+    "     including this one. `$$name`, `$obj->$method()` and `new $class`\n"
+    "     are resolved at run time, so the call graph simply stops there.\n"
+    "ACT if the set of targets is known, a match or a map of closures is\n"
+    "     faster AND analysable. Where dynamic dispatch is genuinely needed,\n"
+    "     validate the name against an allow-list before calling it.\n"
+    "MISLEADS this is a blindness measure, not a bug list. A DI container\n"
+    "     doing `new $class` is the correct implementation of a container.\n"
+    "     The rows that matter are the ones that also read a superglobal.",
+    """SELECT s.name, s.class_name AS class_, s.n_variable_var AS var_vars,
+        s.n_dynamic_method AS dyn_methods, s.n_dynamic_new AS dyn_new,
+        s.n_dynamic_call AS dyn_calls, s.n_eval AS evals,
+        s.n_superglobal_reads AS super_reads,
+        s.n_unresolved_calls AS unresolved, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_variable_var + s.n_dynamic_method + s.n_dynamic_new
+           + s.n_eval) > 0 AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_eval*4 + s.n_variable_var*3 + s.n_dynamic_new*2
+              + s.n_dynamic_method) * (1 + s.n_superglobal_reads) DESC
+    LIMIT :lim"""),
+(
+    "magic-method-surface",
+    "__destruct, __wakeup, __toString: the methods an attacker gets to call",
+    "ANSWERS which classes are usable as gadgets. A deserialization attack\n"
+    "     does not call your code directly -- it constructs an object graph\n"
+    "     and lets PHP invoke the magic methods on the way in and out. Any\n"
+    "     __destruct that touches the filesystem is a primitive.\n"
+    "ACT the fix is upstream: never unserialize untrusted input, use JSON.\n"
+    "     Where a magic method must exist, keep it free of side effects --\n"
+    "     no file operations, no exec, no SQL.\n"
+    "MISLEADS a class is only a gadget if the attacker can reach\n"
+    "     unserialize at all; see unserialize-gadget-frontier for that half.\n"
+    "     This lists the ammunition, not the gun.",
+    """SELECT s.name, s.class_name AS class_, s.n_destruct AS destructs,
+        s.n_wakeup AS wakeups, s.n_tostring AS tostrings,
+        s.n_call_magic AS call_magic, s.n_magic_method AS magic_total,
+        s.n_io AS io_ops, s.n_exec AS exec_ops, s.n_sql_calls AS sql_calls,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_destruct + s.n_wakeup + s.n_tostring + s.n_call_magic) > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_io + s.n_exec + s.n_sql_calls) DESC,
+        s.n_destruct DESC LIMIT :lim"""),
+(
+    "untyped-public-boundary",
+    "Public methods taking untyped parameters, where strict_types is off",
+    "ANSWERS where PHP's type coercion still applies. Without\n"
+    "     declare(strict_types=1), \"5 apples\" passed to an int parameter\n"
+    "     becomes 5, and a caller passing the wrong thing gets silently\n"
+    "     corrected instead of corrected loudly.\n"
+    "ACT add the parameter types, then add strict_types=1 to the file. Doing\n"
+    "     it in that order means the types are enforced the moment they are\n"
+    "     declared, rather than documenting an intent nothing checks.\n"
+    "MISLEADS a method whose callers are all internal and all typed is not\n"
+    "     really at risk. fan_in and is_public together are the ranking:\n"
+    "     a widely-called public untyped method is the one that bites.",
+    """SELECT s.name, s.class_name AS class_,
+        s.n_untyped_params AS untyped, s.n_params AS params,
+        s.has_strict_types AS strict_types, s.n_type_declarations AS typed,
+        s.n_loose_compare AS loose_eq, s.is_public AS public_, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_untyped_params > 0 AND s.has_strict_types = 0
+      AND s.is_public = 1 AND s.kind IN ('function','method')
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_untyped_params * (1 + s.fan_in) DESC LIMIT :lim"""),
 ]
 
 PhpAnalyzer.QUERIES = PhpAnalyzer.QUERIES + [

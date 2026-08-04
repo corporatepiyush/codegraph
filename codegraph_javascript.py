@@ -5774,6 +5774,126 @@ JavaScriptAnalyzer.QUERIES = [
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY f.n_parse_errors DESC, f.lines DESC
     LIMIT :lim"""),
+(
+    "timer-balance",
+    "setInterval and setTimeout with no matching clear, weighted by where they run",
+    "ANSWERS which timers outlive whatever registered them. A repeating timer\n"
+    "     holds its closure, and the closure holds everything it captured --\n"
+    "     so one uncleared setInterval per request is an unbounded leak, and\n"
+    "     in Node it also keeps the event loop alive so the process will not\n"
+    "     exit.\n"
+    "ACT keep the handle and clear it in the teardown path -- unmount,\n"
+    "     disconnect, close, whichever this module has. `unref()` fixes only\n"
+    "     the shutdown half, not the retention.\n"
+    "MISLEADS clears are matched per function, not per handle, so a timer set\n"
+    "     in one function and cleared in another reads as unbalanced here and\n"
+    "     is fine. Rank by timers set inside a loop -- those are unambiguous.",
+    """SELECT s.name, s.class_name AS class_, s.n_timer_set AS timers_set,
+        s.n_timer_clear AS timers_cleared, s.n_timer_repeating AS repeating,
+        s.n_timer_in_loop AS set_in_loop, s.n_closures AS closures,
+        s.is_handler AS handler, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_timer_set > s.n_timer_clear AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_timer_in_loop DESC, s.n_timer_repeating DESC,
+        (s.n_timer_set - s.n_timer_clear) DESC LIMIT :lim"""),
+(
+    "shape-deopt-surface",
+    "delete, arguments, with and dynamic property writes: what makes V8 give up",
+    "ANSWERS where the code defeats the engine's hidden-class optimisation.\n"
+    "     `delete` on an object turns it into a dictionary-mode object for\n"
+    "     the rest of its life; `arguments` leaking out of a function blocks\n"
+    "     inlining; `with` disables scope analysis entirely.\n"
+    "ACT set the property to undefined or null instead of deleting it, or\n"
+    "     use a Map when keys are genuinely dynamic. Replace `arguments`\n"
+    "     with rest parameters, which are a real array and do not deopt.\n"
+    "MISLEADS one delete on a config object at startup costs nothing. This\n"
+    "     ranks by fan_in and loop depth precisely because the cost is per\n"
+    "     execution, and a cold path never pays it.",
+    """SELECT s.name, s.class_name AS class_, s.n_delete AS deletes,
+        s.n_arguments AS arguments_, s.n_with_stmt AS with_stmts,
+        s.n_dynamic_prop AS dynamic_props, s.n_computed_member AS computed,
+        s.fan_in, s.max_loop_depth AS depth,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_delete + s.n_arguments + s.n_with_stmt) > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_with_stmt*4 + s.n_delete*2 + s.n_arguments)
+             * (1 + s.fan_in) * (1 + s.max_loop_depth) DESC LIMIT :lim"""),
+(
+    "dynamic-import-and-eval",
+    "eval, dynamic require and import(): code paths no bundler or scanner can follow",
+    "ANSWERS where the module graph stops being knowable. A `require(expr)`\n"
+    "     cannot be resolved by a bundler, cannot be tree-shaken, and cannot\n"
+    "     be audited by a dependency scanner. `eval` is the same problem with\n"
+    "     a security consequence attached.\n"
+    "ACT replace `require(name)` with an explicit map from name to a static\n"
+    "     import -- it is analysable, tree-shakeable and no slower. Use JSON\n"
+    "     for data and a Function factory only where you truly must.\n"
+    "MISLEADS `import()` for genuine code splitting is a feature, not a\n"
+    "     defect, and appears here. The rows worth reading are the ones where\n"
+    "     the argument is computed rather than a literal.",
+    """SELECT s.name, s.class_name AS class_, s.n_eval AS evals,
+        s.n_require_dynamic AS dyn_require, s.n_import_dynamic AS dyn_import,
+        s.n_export_star AS export_star, s.n_json_parse AS json_parses,
+        s.n_unresolved_calls AS unresolved, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_eval + s.n_require_dynamic + s.n_import_dynamic) > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_eval*5 DESC, s.n_require_dynamic DESC,
+        s.n_import_dynamic DESC LIMIT :lim"""),
+(
+    "spread-in-loop",
+    "Spread and object rest inside a loop: accidental quadratic copying",
+    "ANSWERS where an O(n) idiom sits inside an O(n) loop. `acc = [...acc, x]`\n"
+    "     or `{...acc, [k]: v}` in a reduce copies everything accumulated so\n"
+    "     far on every single iteration -- linear code that runs quadratic\n"
+    "     and only shows up once the input gets big.\n"
+    "ACT push into the array and return it, or mutate the accumulator and\n"
+    "     freeze at the end. If immutability is the point, build a Map and\n"
+    "     convert once outside the loop.\n"
+    "MISLEADS spread over a small fixed list -- merging default options,\n"
+    "     three known keys -- is idiomatic and free. This cannot see the\n"
+    "     collection size, only that the copy happens per iteration.",
+    """SELECT s.name, s.class_name AS class_, s.n_spread AS spreads,
+        s.n_inline_object_prop AS inline_objs, s.max_loop_depth AS depth,
+        s.n_destructure AS destructures, s.alloc_in_loop AS allocs_in_loop,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_spread > 0 AND s.max_loop_depth > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_spread * s.max_loop_depth * (1 + s.fan_in) DESC LIMIT :lim"""),
+(
+    "hooks-rules-violations",
+    "React hooks called conditionally, and components that re-render on identity",
+    "ANSWERS where the Rules of Hooks are broken and where re-renders are\n"
+    "     caused by allocation. A hook inside a condition changes the hook\n"
+    "     ORDER between renders, which corrupts React's state slots -- the\n"
+    "     bug appears as one component's state showing up in another.\n"
+    "ACT lift the condition inside the hook: call it unconditionally and\n"
+    "     branch on the value. For re-renders, an object or arrow literal\n"
+    "     passed as a prop is a new identity every render -- memoise it.\n"
+    "MISLEADS an inline object prop is only a problem if the child is\n"
+    "     memoised or the tree below is expensive; on a leaf it costs\n"
+    "     nothing. The conditional-hook count is the part that is always a bug.",
+    """SELECT s.name, s.class_name AS class_,
+        s.n_hooks_conditional AS conditional_hooks, s.n_hooks AS hooks,
+        s.n_inline_object_prop AS inline_props, s.n_setstate AS setstates,
+        s.n_jsx_elements AS jsx, s.is_component AS component,
+        s.is_hook AS is_hook_, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_hooks > 0 OR s.is_component = 1) AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_hooks_conditional DESC, s.n_inline_object_prop DESC,
+        s.n_setstate DESC LIMIT :lim"""),
 ]
 
 JavaScriptAnalyzer.QUERIES = JavaScriptAnalyzer.QUERIES + [

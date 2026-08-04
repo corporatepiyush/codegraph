@@ -5379,6 +5379,122 @@ RustAnalyzer.QUERIES = [
     GROUP BY s.id
     HAVING hazards > 0 OR unsafe_blocks > 0
     ORDER BY s.risk_score DESC, allows DESC LIMIT :lim"""),
+(
+    "arc-mutex-contention",
+    "Arc<Mutex<..>> on hot paths: one lock every caller has to queue behind",
+    "ANSWERS which shared-state choices will flatten under load. A single\n"
+    "     Mutex behind a high fan_in function is a serialisation point --\n"
+    "     throughput stops scaling with cores and latency grows a tail.\n"
+    "ACT sharding beats a bigger critical section: per-key locks, a\n"
+    "     DashMap-style striped map, or an actor owning the state with a\n"
+    "     channel in front. If reads dominate, RwLock or arc-swap.\n"
+    "MISLEADS a lock held for three instructions under low contention costs\n"
+    "     almost nothing, and this cannot see contention -- only structure.\n"
+    "     fan_in is NOT shown because it is zero for every Arc<Mutex>\n"
+    "     holder measured -- these are usually struct fields reached\n"
+    "     through a method, so the holder itself has no direct callers.",
+    """SELECT s.name, s.impl_type AS impl_, s.n_arc_mutex AS arc_mutex,
+        s.n_lock_acquire AS locks, s.n_rc_refcell AS rc_refcell,
+        s.fan_out, s.max_loop_depth AS depth, s.n_await AS awaits,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_arc_mutex > 0 AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_arc_mutex DESC, s.n_lock_acquire DESC, s.fan_out DESC
+    LIMIT :lim"""),
+(
+    "alloc-churn-collect-and-format",
+    "collect() and format!() where an iterator or a writer would do",
+    "ANSWERS where the code allocates a whole collection or a whole String\n"
+    "     only to consume it once. `collect::<Vec<_>>()` in the middle of a\n"
+    "     chain materialises the entire sequence; `format!` in a loop\n"
+    "     allocates per iteration.\n"
+    "ACT drop the intermediate collect and keep the iterator lazy. For\n"
+    "     strings, write into one reused String with `write!` or push_str,\n"
+    "     and reserve with_capacity when the size is known.\n"
+    "MISLEADS a collect that is genuinely needed -- to sort, to borrow twice,\n"
+    "     to escape a lifetime -- is not waste, and this cannot tell those\n"
+    "     apart. Read `with_capacity` as evidence someone already thought.",
+    """SELECT s.name, s.impl_type AS impl_, s.n_collect AS collects,
+        s.n_format_macro AS formats, s.n_iter_adapters AS adapters,
+        s.n_with_capacity AS with_capacity, s.n_to_owned AS to_owned,
+        s.max_loop_depth AS depth, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_collect > 0 OR s.n_format_macro > 0) AND s.max_loop_depth > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_collect + s.n_format_macro) * (1 + s.max_loop_depth)
+             * (1 + s.fan_in) DESC LIMIT :lim"""),
+(
+    "atomic-ordering-audit",
+    "Relaxed and SeqCst orderings, and which functions mix them",
+    "ANSWERS whether the memory orderings were chosen or defaulted. Relaxed\n"
+    "     guarantees only atomicity, not ordering: it is correct for a\n"
+    "     statistics counter and wrong for a flag that publishes data another\n"
+    "     thread will read. SeqCst is always correct and always the slowest.\n"
+    "ACT for a counter nobody synchronises on, Relaxed is right. For\n"
+    "     publishing, use Release/Acquire. Reach for SeqCst only when the\n"
+    "     algorithm genuinely needs a single global order.\n"
+    "MISLEADS this counts orderings, it does not verify them. A Relaxed load\n"
+    "     gating access to non-atomic data is a data race that looks\n"
+    "     identical here to a correct Relaxed counter.",
+    """SELECT s.name, s.impl_type AS impl_, s.n_atomic_ops AS atomics,
+        s.n_relaxed_ordering AS relaxed, s.n_seqcst_ordering AS seqcst,
+        s.n_spawn AS spawns, s.is_unsafe_fn AS unsafe_fn, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_atomic_ops > 0 AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_relaxed_ordering DESC, s.n_atomic_ops DESC LIMIT :lim"""),
+(
+    "transmute-and-raw-pointers",
+    "transmute, raw pointers and static mut: the parts the compiler cannot check",
+    "ANSWERS where Rust's guarantees have been switched off by hand.\n"
+    "     `transmute` reinterprets bits with no check at all; `static mut` is\n"
+    "     a global with no synchronisation and is a hard error to reference\n"
+    "     in edition 2024.\n"
+    "ACT most transmutes have a safe replacement -- `from_bits`, `as` casts,\n"
+    "     `bytemuck`, or a union with a documented invariant. For static mut\n"
+    "     use OnceLock, atomics, or a Mutex.\n"
+    "MISLEADS FFI code legitimately does all of this, and this cannot tell an\n"
+    "     audited FFI shim from an unaudited shortcut. `safety_comments` is\n"
+    "     the tell: unsafe with no SAFETY note is the shortlist.",
+    """SELECT s.name, s.impl_type AS impl_, s.n_transmute AS transmutes,
+        s.n_raw_ptr AS raw_ptrs, s.n_static_mut AS static_mut,
+        s.n_from_raw AS from_raw, s.n_into_raw AS into_raw,
+        s.n_unsafe_blocks AS unsafe_blocks,
+        s.n_safety_comments AS safety_docs, s.is_extern_fn AS extern_,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_transmute > 0 OR s.n_static_mut > 0 OR s.n_raw_ptr > 0)
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_transmute DESC, s.n_static_mut DESC,
+        (s.n_unsafe_blocks - s.n_safety_comments) DESC LIMIT :lim"""),
+(
+    "dynamic-dispatch-cost",
+    "Box<dyn Trait> and &dyn parameters on the paths that run most",
+    "ANSWERS where the code pays for dynamic dispatch. Every call through a\n"
+    "     trait object is an indirect jump the compiler cannot inline, and it\n"
+    "     blocks the optimisations that would have followed inlining.\n"
+    "ACT if the set of implementations is closed, an enum with a match is\n"
+    "     both faster and easier to exhaustively handle. If it is open but\n"
+    "     small, generics monomorphise it away -- at the cost of code size,\n"
+    "     which `mono-blast-radius` measures.\n"
+    "MISLEADS dynamic dispatch is the correct choice for plugin boundaries\n"
+    "     and for keeping compile times sane, and a Box<dyn Error> in a cold\n"
+    "     error path costs nothing. Rank by fan_in, not by count.",
+    """SELECT s.name, s.impl_type AS impl_, s.n_box_dyn AS box_dyn,
+        s.n_dyn_params AS dyn_params, s.n_impl_trait AS impl_trait,
+        s.fan_in, s.max_loop_depth AS depth, s.call_in_loop AS calls_in_loop,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_box_dyn > 0 OR s.n_dyn_params > 0) AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_box_dyn + s.n_dyn_params) * (1 + s.fan_in)
+             * (1 + s.call_in_loop) DESC LIMIT :lim"""),
 ]
 
 RustAnalyzer.QUERIES = RustAnalyzer.QUERIES + [

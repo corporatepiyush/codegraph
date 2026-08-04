@@ -4596,6 +4596,127 @@ WITH RECURSIVE down(root, sym, depth) AS (
     WHERE (f.n_parse_errors>0 OR f.parsed=0)
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY f.lines DESC LIMIT :lim"""),
+(
+    "defer-in-loop",
+    "defer inside a loop: cleanup that piles up until the function returns",
+    "ANSWERS where deferred work does not run when the author thinks it does.\n"
+    "     `defer` fires at FUNCTION exit, not at the end of the iteration --\n"
+    "     so a defer f.Close() in a loop over ten thousand files holds ten\n"
+    "     thousand descriptors open, and the loop hits the ulimit.\n"
+    "ACT move the body into its own function so the defer scopes to one\n"
+    "     iteration, or close explicitly at the end of the loop and drop the\n"
+    "     defer. `defer_close` shows which of these are closing something.\n"
+    "MISLEADS a defer in a loop that runs a bounded handful of times is fine,\n"
+    "     and this cannot see the trip count. The dangerous shape is a defer\n"
+    "     over a range of unknown length -- check what the loop iterates.",
+    """SELECT s.name, s.receiver_type AS receiver, s.n_defer_in_loop AS defer_in_loop,
+        s.n_defer_close AS defer_closes, s.max_loop_depth AS depth,
+        s.n_chan_close AS chan_closes, s.n_io AS io_ops, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_defer_in_loop > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_defer_in_loop * (1 + s.fan_in) DESC,
+        s.max_loop_depth DESC LIMIT :lim"""),
+(
+    "context-not-propagated",
+    "Functions that take a context and never pass it on",
+    "ANSWERS where cancellation stops travelling. A ctx parameter that is\n"
+    "     accepted and then ignored means every call below it is\n"
+    "     uncancellable: the request times out, the client disconnects, and\n"
+    "     the work carries on burning a database connection.\n"
+    "ACT pass ctx to every call that accepts one, and use\n"
+    "     `ctx.Done()` in any select that could block. A function creating\n"
+    "     `context.Background()` deep in a call stack is almost always\n"
+    "     severing a chain it should have continued.\n"
+    "MISLEADS a leaf function doing pure computation takes ctx for interface\n"
+    "     reasons and has nothing to pass it to -- that is correct and shows\n"
+    "     up here. Rank by fan_out: severing a chain matters where work follows.",
+    """SELECT s.name, s.receiver_type AS receiver, s.n_ctx_params AS ctx_params,
+        s.n_ctx_passed AS ctx_passed, s.n_ctx_background AS ctx_background,
+        s.n_ctx_done AS ctx_done, s.n_ctx_withcancel AS with_cancel,
+        s.n_cancel_called AS cancels, s.n_goroutines AS goroutines,
+        s.fan_out, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_ctx_params > 0 AND s.n_ctx_passed = 0 AND s.fan_out > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_out DESC, s.n_goroutines DESC LIMIT :lim"""),
+(
+    "error-handling-drift",
+    "Ignored errors, shadowed errors, and errors compared instead of unwrapped",
+    "ANSWERS where Go's error convention has quietly broken down. An `_`\n"
+    "     assignment discards a failure; a re-declared err inside an if\n"
+    "     shadows the outer one so the outer stays nil; and `err == ErrFoo`\n"
+    "     fails the moment anything in the chain wraps it with %w.\n"
+    "ACT check the error or comment why it cannot fail. Use `errors.Is` and\n"
+    "     `errors.As` rather than == and type assertions, so wrapping stays\n"
+    "     transparent. `err_wrapped` shows who is already doing it.\n"
+    "MISLEADS a deliberately ignored error -- a Close on a read-only file, a\n"
+    "     fmt.Fprintf to a buffer -- is idiomatic and counted here. The\n"
+    "     column that carries real signal is shadowing, which is never intended.",
+    """SELECT s.name, s.receiver_type AS receiver, s.n_err_ignored AS ignored,
+        s.n_err_shadowed AS shadowed, s.n_err_checks AS checked,
+        s.n_err_wrapped AS wrapped, s.n_err_returns AS returns_err,
+        s.n_naked_returns AS naked_returns, s.n_panics AS panics,
+        s.n_log_fatal AS log_fatal, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_err_ignored > 0 OR s.n_err_shadowed > 0) AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_err_shadowed DESC, s.n_err_ignored * (1 + s.fan_in) DESC
+    LIMIT :lim"""),
+(
+    "slice-growth-and-copies",
+    "append in a loop with no capacity, and range copying whole structs",
+    "ANSWERS where a loop reallocates or copies more than it needs to.\n"
+    "     `append` without `make([]T, 0, n)` regrows and copies repeatedly;\n"
+    "     `for _, v := range structs` copies every element by value, which\n"
+    "     for a large struct is a memcpy per iteration.\n"
+    "ACT preallocate with the known length. Range over the index, or use a\n"
+    "     pointer element, when the struct is big. `Sprintf` in a loop is the\n"
+    "     third form of the same problem -- build with a strings.Builder.\n"
+    "MISLEADS a slice that grows a handful of times costs nothing, and Go's\n"
+    "     growth is amortised. This is a ranking of where the pattern is\n"
+    "     densest and hottest, not a list of defects.",
+    """SELECT s.name, s.receiver_type AS receiver,
+        s.n_append_in_loop AS append_in_loop, s.n_make_no_cap AS make_no_cap,
+        s.n_range_value_copy AS range_copies,
+        s.n_sprintf_in_loop AS sprintf_in_loop,
+        s.n_conv_in_loop AS conv_in_loop, s.max_loop_depth AS depth,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_append_in_loop + s.n_sprintf_in_loop + s.n_range_value_copy) > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_append_in_loop*2 + s.n_sprintf_in_loop*3
+              + s.n_range_value_copy) * (1 + s.fan_in) DESC LIMIT :lim"""),
+(
+    "unchecked-type-assertions",
+    "Type assertions without the comma-ok form, and interface{} at the boundary",
+    "ANSWERS which assertions panic instead of failing. `v := x.(T)` aborts\n"
+    "     the goroutine when x is not a T; `v, ok := x.(T)` does not. In a\n"
+    "     handler without recover, that is the request AND the process.\n"
+    "ACT use the comma-ok form and handle the false branch, or a type switch\n"
+    "     with a default. Where the value came from JSON or a plugin, assume\n"
+    "     it will eventually be the wrong shape, because it will.\n"
+    "MISLEADS an assertion immediately after a type switch that already\n"
+    "     proved the type is safe and counted here. `type_switch` in the same\n"
+    "     row is the hint that the author did check.",
+    """SELECT s.name, s.receiver_type AS receiver,
+        s.n_type_assert_unchecked AS unchecked_asserts,
+        s.n_type_assert AS asserts_total, s.n_type_switch AS type_switches,
+        s.n_any_params AS any_params, s.n_iface_params AS iface_params,
+        s.n_recover AS recovers, s.is_handler AS handler, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_type_assert_unchecked > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.is_handler DESC, s.n_type_assert_unchecked * (1 + s.fan_in) DESC
+    LIMIT :lim"""),
 ]
 
 ANALYZER = GoAnalyzer()

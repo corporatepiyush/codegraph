@@ -4755,6 +4755,128 @@ TypeScriptAnalyzer.QUERIES = [
     WHERE (f.n_parse_errors>0 OR f.parsed=0)
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY f.n_parse_errors DESC LIMIT :lim"""),
+(
+    "assertion-escape-hatches",
+    "as any, non-null ! and angle-bracket casts: where the type system was told to be quiet",
+    "ANSWERS where a type was asserted rather than proved. `x!` claims a\n"
+    "     value is not null with no check; `as any` disables every check\n"
+    "     downstream of it. Both move a failure from tsc to run time, and\n"
+    "     `as any` additionally poisons inference for whatever it flows into.\n"
+    "ACT narrow instead of asserting -- an if, a type guard, or `satisfies`,\n"
+    "     which checks without widening. Where an assertion is genuinely\n"
+    "     needed at a boundary, assert to the specific type, never to any.\n"
+    "MISLEADS a single `as any` in a well-fenced adapter is a deliberate,\n"
+    "     correct trade. What this ranks is DENSITY on code others call --\n"
+    "     the assertions that leak their looseness outwards.",
+    """SELECT s.name, s.qual_name AS qual, s.n_as_any AS as_any,
+        s.n_non_null AS non_null, s.n_angle_assertion AS angle_casts,
+        s.n_as_assertion AS assertions, s.n_satisfies AS satisfies_,
+        s.returns_any AS returns_any, s.is_exported AS exported, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_as_any + s.n_non_null + s.n_angle_assertion) > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_as_any*3 + s.n_non_null + s.n_angle_assertion)
+             * (1 + s.fan_in) DESC LIMIT :lim"""),
+(
+    "suppression-debt",
+    "@ts-ignore, @ts-expect-error and eslint-disable, and which are load-bearing",
+    "ANSWERS how much of the codebase compiles only because it was told to.\n"
+    "     The difference matters: `@ts-expect-error` FAILS when the error goes\n"
+    "     away, so it cleans itself up; `@ts-ignore` silently outlives the\n"
+    "     problem it was hiding and then hides the next one.\n"
+    "ACT convert every `@ts-ignore` to `@ts-expect-error`. The ones that then\n"
+    "     fail the build were suppressing nothing and can be deleted; the\n"
+    "     rest now tell you when they become unnecessary.\n"
+    "MISLEADS a suppression on a known upstream typing bug is the right call\n"
+    "     and cannot be distinguished here from one hiding a real defect.\n"
+    "     Density plus fan_in is the ranking, not the raw count.",
+    """SELECT s.name, s.qual_name AS qual, s.n_ts_ignore AS ts_ignore,
+        s.n_ts_expect_error AS ts_expect_error,
+        s.n_eslint_disable AS eslint_disable, s.n_suppressions AS total,
+        s.n_any_total AS anys, s.is_exported AS exported, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_ts_ignore + s.n_ts_expect_error + s.n_eslint_disable) > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_ts_ignore * (1 + s.fan_in) DESC,
+        s.n_eslint_disable DESC LIMIT :lim"""),
+(
+    "type-level-complexity",
+    "Conditional and mapped types deep enough to cost compile time",
+    "ANSWERS which types are programs. Deeply nested conditional types with\n"
+    "     `infer` are evaluated by the compiler on every check, and past a\n"
+    "     certain depth they dominate build time or hit the instantiation\n"
+    "     limit outright -- the error nobody can read.\n"
+    "ACT flatten the conditional chain, or precompute the result as a named\n"
+    "     type alias so it is instantiated once instead of at every use.\n"
+    "     Measure with `tsc --diagnostics` before and after.\n"
+    "MISLEADS depth is structural, not a cost model. A depth-6 type used\n"
+    "     twice is free; a depth-3 type instantiated in a hot generic is not.\n"
+    "     This finds candidates for the profiler, not verdicts.",
+    """SELECT s.name, s.qual_name AS qual, s.max_type_depth AS type_depth,
+        s.n_conditional_depth AS cond_depth, s.n_conditional_type AS conds,
+        s.n_mapped_type AS mapped, s.n_infer AS infers,
+        s.n_template_type AS templates, s.n_union_members AS union_members,
+        s.is_exported AS exported, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.max_type_depth > 2 OR s.n_conditional_depth > 1) AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_conditional_depth DESC, s.max_type_depth DESC,
+        s.n_infer DESC LIMIT :lim"""),
+(
+    "index-signature-holes",
+    "Index signatures and unknown, where excess-property checking stops applying",
+    "ANSWERS which types accept anything. An index signature makes every\n"
+    "     property name legal, so a typo in a key is not a type error -- and\n"
+    "     under `noUncheckedIndexedAccess` every read is silently possibly\n"
+    "     undefined, which most codebases do not have switched on.\n"
+    "ACT use Record with a union of the known keys, or a Map when keys are\n"
+    "     genuinely open. `unknown` is the right escape hatch where `any`\n"
+    "     was reached for, because it forces narrowing at the point of use.\n"
+    "MISLEADS an index signature on a genuine dictionary is exactly correct\n"
+    "     and appears here. The rows worth reading are exported types where\n"
+    "     callers will rely on the shape.",
+    """SELECT s.name, s.qual_name AS qual,
+        s.n_index_signature AS index_sigs, s.n_unknown_type AS unknowns,
+        s.n_any_total AS anys, s.n_keyof AS keyofs,
+        s.n_prop_sig AS prop_sigs, s.n_call_sig AS call_sigs,
+        s.is_exported AS exported, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_index_signature > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.is_exported DESC, s.n_index_signature * (1 + s.fan_in) DESC
+    LIMIT :lim"""),
+(
+    "declaration-vs-implementation",
+    "Ambient .d.ts declarations, and whether an implementation exists in this tree",
+    "ANSWERS which part of the public surface is a promise rather than code.\n"
+    "     A `.d.ts` describes something the compiler will trust absolutely\n"
+    "     and never verify -- if it drifts from the JavaScript it describes,\n"
+    "     every caller type-checks against a fiction.\n"
+    "ACT generate declarations from the source with `declaration: true`\n"
+    "     rather than hand-writing them. Where they must be hand-written --\n"
+    "     describing a JS dependency -- pin the version they were written\n"
+    "     against, because nothing else will catch the drift.\n"
+    "MISLEADS a type-only package is ALL declarations by design and tops this\n"
+    "     list correctly. fan_in of zero on a declaration means nothing in\n"
+    "     THIS tree uses it, not that it is dead.",
+    """SELECT s.name, s.qual_name AS qual,
+        s.is_declaration_only AS declaration_only,
+        s.n_call_sig AS call_sigs, s.n_prop_sig AS prop_sigs,
+        s.n_type_args AS type_args, s.is_exported AS exported, s.fan_in,
+        s.n_any_total AS anys, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.is_declaration_only = 1 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.is_exported DESC, s.n_any_total DESC, s.fan_in DESC
+    LIMIT :lim"""),
 ]
 
 TypeScriptAnalyzer.QUERIES = TypeScriptAnalyzer.QUERIES + [

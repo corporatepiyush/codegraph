@@ -160,7 +160,7 @@ while missing all 221 files in type-fest's `test-d/`.
 
 ## The query catalogue
 
-**201 queries across nine languages.** Every one carries `ANSWERS` / `ACT` /
+**236 queries across nine languages.** Every one carries `ANSWERS` / `ACT` /
 `MISLEADS`, and every one is graded on real repositories rather than merely
 executed — a query that runs, returns rows and ranks by a column that is always
 zero looks exactly like a working one.
@@ -248,7 +248,7 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 
 ### Go — `codegraph_go.py`
 
-23 queries. Target: Go 1.26.
+28 queries. Target: Go 1.26.
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`goroutine-leak-frontier`** — Goroutines with no context, no WaitGroup and no errgroup
@@ -273,10 +273,15 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 21. **`module-coupling`** — Which packages depend on which, and how unstable that makes them
 22. **`markers`** — TODO, FIXME, HACK and BUG, weighted by the code they sit in
 23. **`parse-coverage`** — What this run could not read
+24. **`defer-in-loop`** — defer inside a loop: cleanup that piles up until the function returns
+25. **`context-not-propagated`** — Functions that take a context and never pass it on
+26. **`error-handling-drift`** — Ignored errors, shadowed errors, and errors compared instead of unwrapped
+27. **`slice-growth-and-copies`** — append in a loop with no capacity, and range copying whole structs
+28. **`unchecked-type-assertions`** — Type assertions without the comma-ok form, and interface{} at the boundary
 
 ### Rust — `codegraph_rust.py`
 
-18 queries. Target: Rust 1.97 / edition 2024.
+23 queries. Target: Rust 1.97 / edition 2024.
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`unsafe-under-pub-api`** — unsafe reachable from a public function, up to 4 hops
@@ -292,14 +297,19 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 12. **`cfg-feature-nobody-builds`** — #[cfg(feature)] naming a feature Cargo.toml never declares
 13. **`safety-doc-debt`** — unsafe blocks doing several things behind no SAFETY comment
 14. **`suppression-clusters`** — #[allow] sitting on top of code that actually does the thing
-15. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
-16. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
-17. **`dead-code`** — Nothing in this tree calls these
-18. **`parse-coverage`** — What this run could not read
+15. **`arc-mutex-contention`** — Arc<Mutex<..>> on hot paths: one lock every caller has to queue behind
+16. **`alloc-churn-collect-and-format`** — collect() and format!() where an iterator or a writer would do
+17. **`atomic-ordering-audit`** — Relaxed and SeqCst orderings, and which functions mix them
+18. **`transmute-and-raw-pointers`** — transmute, raw pointers and static mut: the parts the compiler cannot check
+19. **`dynamic-dispatch-cost`** — Box<dyn Trait> and &dyn parameters on the paths that run most
+20. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
+21. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
+22. **`dead-code`** — Nothing in this tree calls these
+23. **`parse-coverage`** — What this run could not read
 
 ### Java — `codegraph_java.py`
 
-18 queries. Target: Java 25 (LTS).
+23 queries. Target: Java 25 (LTS).
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`reflection-frontier`** — Public entry points that reach Class.forName or setAccessible
@@ -316,13 +326,18 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 13. **`n-plus-one`** — A DAO or query method whose CALLER puts it in a loop
 14. **`false-sharing-and-escape`** — Contended counters on one cache line, and allocations that escape
 15. **`parse-coverage`** — What this run could not read, and why
-16. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
-17. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
-18. **`dead-code`** — Nothing in this tree calls these
+16. **`boxing-in-hot-loop`** — Integer/Long boxing inside a loop, on methods the tree actually calls
+17. **`regex-and-format-per-call`** — Pattern.compile and date formatting rebuilt per call instead of once
+18. **`raw-types-and-unchecked`** — Generics defeated: raw types, unchecked casts and wildcard soup
+19. **`setaccessible-and-finalizers`** — setAccessible, Unsafe and finalizers: the parts of Java that are leaving
+20. **`parallel-stream-hazard`** — parallelStream() in a body that also blocks, locks or writes shared state
+21. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
+22. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
+23. **`dead-code`** — Nothing in this tree calls these
 
 ### JavaScript — `codegraph_javascript.py`
 
-17 queries. Target: ES2026.
+22 queries. Target: ES2026.
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`retention-leak-frontier`** — Listeners and timers registered with nothing in the module that undoes it
@@ -338,13 +353,18 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 12. **`async-colour-frontier`** — Where synchronous code calls async code, and how deep the async goes
 13. **`god-functions`** — Functions doing too much, by every measure at once
 14. **`parse-coverage`** — What this run could not read, and which files carry the most risk
-15. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
-16. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
-17. **`dead-code`** — Nothing in this tree calls these
+15. **`timer-balance`** — setInterval and setTimeout with no matching clear, weighted by where they run
+16. **`shape-deopt-surface`** — delete, arguments, with and dynamic property writes: what makes V8 give up
+17. **`dynamic-import-and-eval`** — eval, dynamic require and import(): code paths no bundler or scanner can follow
+18. **`spread-in-loop`** — Spread and object rest inside a loop: accidental quadratic copying
+19. **`hooks-rules-violations`** — React hooks called conditionally, and components that re-render on identity
+20. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
+21. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
+22. **`dead-code`** — Nothing in this tree calls these
 
 ### TypeScript — `codegraph_typescript.py`
 
-24 queries. Target: TypeScript 7.
+29 queries. Target: TypeScript 7.
 
  1. **`graph-blindspots`** — Read this first: where the call graph cannot see
  2. **`any-blast-radius`** — `any` weighted by how much code inherits the hole
@@ -369,11 +389,16 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 21. **`module-coupling`** — Which modules depend on which, and how unstable that makes them
 22. **`markers`** — TODO, FIXME, HACK and BUG, weighted by the code they sit in
 23. **`parse-coverage`** — What this run could not read
-24. **`dead-code`** — Nothing in this tree calls these
+24. **`assertion-escape-hatches`** — as any, non-null ! and angle-bracket casts: where the type system was told to be quiet
+25. **`suppression-debt`** — @ts-ignore, @ts-expect-error and eslint-disable, and which are load-bearing
+26. **`type-level-complexity`** — Conditional and mapped types deep enough to cost compile time
+27. **`index-signature-holes`** — Index signatures and unknown, where excess-property checking stops applying
+28. **`declaration-vs-implementation`** — Ambient .d.ts declarations, and whether an implementation exists in this tree
+29. **`dead-code`** — Nothing in this tree calls these
 
 ### PHP — `codegraph_php.py`
 
-16 queries. Target: PHP 8.5.
+21 queries. Target: PHP 8.5.
 
  1. **`graph-blindspots`** — Read this first: where a PHP call graph cannot see
  2. **`superglobal-to-sql`** — Attacker-controlled input reaching a SQL-building site, up to 4 hops
@@ -389,12 +414,17 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 12. **`god-classes`** — Classes and functions doing too much, by every measure at once
 13. **`risk-ranked`** — Review order: if you can only read N functions this week, which N
 14. **`parse-coverage`** — What this run could not read
-15. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
-16. **`dead-code`** — Nothing in this tree calls these
+15. **`file-upload-surface`** — $_FILES handling, and whether anything nearby validates it
+16. **`error-suppression`** — The @ operator: failures made invisible rather than handled
+17. **`dynamic-call-surface`** — Variable variables, variable methods and dynamic new: the parts no tool can follow
+18. **`magic-method-surface`** — __destruct, __wakeup, __toString: the methods an attacker gets to call
+19. **`untyped-public-boundary`** — Public methods taking untyped parameters, where strict_types is off
+20. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
+21. **`dead-code`** — Nothing in this tree calls these
 
 ### Ruby — `codegraph_ruby.py`
 
-18 queries. Target: Ruby 4.0.
+23 queries. Target: Ruby 4.0.
 
  1. **`graph-blindspots`** — Read this first: Ruby's call graph is a lower bound, and here is by how much
  2. **`n-plus-one`** — An ActiveRecord query inside a block iterating a relation
@@ -410,10 +440,15 @@ clean result: `graph-blindspots`, `hot-multipliers`, `risk-ranked`, `dead-code`,
 12. **`mixin-method-collision`** — Two modules included into one class, both defining the same method
 13. **`sql-interpolation`** — String interpolation inside where, order, pluck and friends
 14. **`per-iteration-cost`** — Collection literals, Range#include? and chained array allocations in loops
-15. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
-16. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
-17. **`dead-code`** — Nothing in this tree calls these
-18. **`parse-coverage`** — What this run could not read
+15. **`frozen-literal-debt`** — Files without frozen_string_literal, ranked by how much they allocate
+16. **`rescue-too-broad`** — rescue Exception and bare rescue: catching what you were never meant to
+17. **`threads-without-synchronisation`** — Thread.new and Ractor next to mutable state, with no Mutex in sight
+18. **`eval-family-surface`** — eval, instance_eval and class_eval: where the program rewrites itself
+19. **`shell-out-surface`** — Backticks, system and exec, ranked by how close request data gets
+20. **`hot-multipliers`** — Where one fix pays back many times: highest fan-in
+21. **`risk-ranked`** — Review order: if you can only read N symbols this week, which N
+22. **`dead-code`** — Nothing in this tree calls these
+23. **`parse-coverage`** — What this run could not read
 
 ## Correctness, and how it is checked
 

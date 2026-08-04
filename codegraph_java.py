@@ -5699,6 +5699,123 @@ WITH fld AS (
     WHERE (f.n_parse_errors > 0 OR f.parsed = 0)
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY unexplained DESC, f.lines DESC LIMIT :lim"""),
+(
+    "boxing-in-hot-loop",
+    "Integer/Long boxing inside a loop, on methods the tree actually calls",
+    "ANSWERS where autoboxing turns an arithmetic loop into an allocation\n"
+    "     loop. Every `Integer` in a `long` accumulation is a heap object and\n"
+    "     a cache miss; the JIT elides some of it and cannot elide the rest.\n"
+    "ACT use the primitive-specialised types -- IntStream over\n"
+    "     Stream<Integer>, long over Long, entrySet() iteration over get()\n"
+    "     per key. Fix the loop with the highest fan_in first.\n"
+    "MISLEADS boxing sites are counted lexically, so a boxed value that never\n"
+    "     escapes and is scalar-replaced by C2 counts here and costs nothing\n"
+    "     at run time. This is a shortlist to profile, not a verdict.",
+    """SELECT s.name, s.owner_type AS owner, s.n_boxing_in_loop AS boxed_in_loop,
+        s.n_boxing_sites AS boxed_total, s.max_loop_depth AS depth,
+        s.n_alloc_sites AS allocs, s.fan_in, s.n_streams AS streams,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_boxing_in_loop > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_boxing_in_loop * (1 + s.fan_in) DESC,
+        s.max_loop_depth DESC LIMIT :lim"""),
+(
+    "regex-and-format-per-call",
+    "Pattern.compile and date formatting rebuilt per call instead of once",
+    "ANSWERS which methods rebuild an expensive immutable object every time\n"
+    "     they run. Pattern.compile parses the regex; SimpleDateFormat\n"
+    "     allocates a calendar and a symbol table. Both belong in a field.\n"
+    "ACT hoist the Pattern to a static final constant. For dates use\n"
+    "     DateTimeFormatter, which IS immutable and thread-safe --\n"
+    "     SimpleDateFormat is neither, so a static one is a data race rather\n"
+    "     than an optimisation.\n"
+    "MISLEADS a compile inside a method that runs once at startup is\n"
+    "     harmless, and this cannot tell startup from steady state. fan_in is\n"
+    "     the proxy: rank by it rather than by the raw count.",
+    """SELECT s.name, s.owner_type AS owner, s.n_regex_compile AS regex_compiles,
+        s.n_datefmt_ops AS datefmt_ops, s.fan_in, s.max_loop_depth AS depth,
+        s.call_in_loop AS calls_in_loop, s.is_static AS static_,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_regex_compile > 0 OR s.n_datefmt_ops > 0)
+      AND s.fan_in > 0 AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_regex_compile + s.n_datefmt_ops) * (1 + s.fan_in) DESC
+    LIMIT :lim"""),
+(
+    "raw-types-and-unchecked",
+    "Generics defeated: raw types, unchecked casts and wildcard soup",
+    "ANSWERS where the compiler stopped being able to help. A raw List or an\n"
+    "     unchecked cast moves a ClassCastException from compile time to\n"
+    "     whichever unlucky request hits it first.\n"
+    "ACT parameterise the type. If the cast is genuinely unavoidable at a\n"
+    "     serialization or reflection boundary, isolate it in one method with\n"
+    "     a SuppressWarnings and a comment, rather than scattering the risk.\n"
+    "MISLEADS raw types in code that predates generics and is never touched\n"
+    "     are not urgent. Rank by fan_in, and read `suppressed` as evidence\n"
+    "     the team already made this decision deliberately.",
+    """SELECT s.name, s.owner_type AS owner, s.n_raw_types AS raw_types,
+        s.n_unchecked_casts AS unchecked, s.n_wildcard_types AS wildcards,
+        s.n_instanceof AS instanceofs, s.n_suppressions AS suppressed,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_raw_types > 0 OR s.n_unchecked_casts > 0) AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_raw_types*2 + s.n_unchecked_casts*3) * (1 + s.fan_in) DESC
+    LIMIT :lim"""),
+(
+    "setaccessible-and-finalizers",
+    "setAccessible, Unsafe and finalizers: the parts of Java that are leaving",
+    "ANSWERS what already warns, or will break, on a modern JDK.\n"
+    "     setAccessible against JDK internals fails under strong\n"
+    "     encapsulation; sun.misc.Unsafe memory access is deprecated for\n"
+    "     removal; finalizers were deprecated in 9 and disabled by default\n"
+    "     in 18.\n"
+    "ACT replace finalizers with Cleaner, or better with AutoCloseable and\n"
+    "     try-with-resources. Replace Unsafe with VarHandle and the FFM API.\n"
+    "MISLEADS this cannot tell WHOSE class is being opened. A framework\n"
+    "     calling setAccessible on your own entities is normal; the same call\n"
+    "     against java.lang is a time bomb. Read the target before acting.",
+    """SELECT s.name, s.owner_type AS owner, s.n_setaccessible AS setaccessible,
+        s.n_unsafe_calls AS unsafe_calls, s.n_finalizers AS finalizers,
+        s.n_native_calls AS native_calls, s.n_ffm_downcall AS ffm_downcalls,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_setaccessible > 0 OR s.n_unsafe_calls > 0
+           OR s.n_finalizers > 0) AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_finalizers DESC, s.n_unsafe_calls DESC,
+        s.n_setaccessible DESC LIMIT :lim"""),
+(
+    "parallel-stream-hazard",
+    "parallelStream() in a body that also blocks, locks or writes shared state",
+    "ANSWERS which parallel streams are actively harmful. They run on the\n"
+    "     common ForkJoinPool, which the whole JVM shares: one blocking task\n"
+    "     in there starves every other parallel stream in the process.\n"
+    "ACT if the body does IO, use a dedicated executor -- or virtual threads,\n"
+    "     which exist for exactly this. If it takes a lock, the parallelism\n"
+    "     is probably fictional. If it mutates shared state, it is a race.\n"
+    "MISLEADS a parallel stream over a large in-memory collection doing pure\n"
+    "     CPU work is exactly right, and will appear here if it happens to\n"
+    "     sit near a lock. Check what the LAMBDA does, not the method.\n"
+    "     fan_out rather than fan_in: a parallelStream is usually reached\n"
+    "     through a framework or a lambda, so the enclosing method often\n"
+    "     has no in-tree caller at all.",
+    """SELECT s.name, s.owner_type AS owner, s.n_parallel_streams AS parallel_,
+        s.n_streams AS streams, s.n_lock_acquire AS locks,
+        s.n_synchronized_blocks AS synced, s.n_io AS io_ops,
+        s.n_static_writes AS static_writes, s.fan_out,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_parallel_streams > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_io + s.n_lock_acquire + s.n_synchronized_blocks
+              + s.n_static_writes) DESC, s.n_parallel_streams DESC LIMIT :lim"""),
 ]
 
 JavaAnalyzer.QUERIES = JavaAnalyzer.QUERIES + [

@@ -5435,6 +5435,132 @@ RubyAnalyzer.QUERIES = [
       AND f.is_test = 0 AND f.is_generated = 0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY cost DESC LIMIT :lim"""),
+(
+    "frozen-literal-debt",
+    "Files without frozen_string_literal, ranked by how much they allocate",
+    "ANSWERS which files pay for string allocation they could get for free.\n"
+    "     Without the magic comment every literal allocates a new String each\n"
+    "     time it is evaluated -- in a loop or a hot method that is pure GC\n"
+    "     pressure, and Ruby's allocator does not return the pages to the OS.\n"
+    "ACT add `# frozen_string_literal: true` at the top of the file, then fix\n"
+    "     whatever breaks -- anything that mutates a literal in place. The\n"
+    "     files listed first are where the win is largest.\n"
+    "MISLEADS the magic comment is per FILE, so this ranks files by the worst\n"
+    "     method inside them. A file with one hot method and forty cold ones\n"
+    "     scores as high as one that is hot throughout.",
+    """SELECT s.name, s.qual_name AS qual,
+        s.has_frozen_literal AS frozen_pragma,
+        s.n_str_lit_in_loop AS str_lits_in_loop,
+        s.n_string_interp AS interpolations, s.n_dup_clone AS dup_clone,
+        s.n_freeze AS freezes, s.max_loop_depth AS depth, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.has_frozen_literal = 0
+      AND (s.n_str_lit_in_loop > 0 OR s.n_string_interp > 2)
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_str_lit_in_loop * (1 + s.fan_in) DESC,
+        s.n_string_interp DESC LIMIT :lim"""),
+(
+    "rescue-too-broad",
+    "rescue Exception and bare rescue: catching what you were never meant to",
+    "ANSWERS where the error handling is wider than any error. Bare `rescue`\n"
+    "     catches StandardError, which is usually intended -- but\n"
+    "     `rescue Exception` also catches SignalException, Interrupt and\n"
+    "     NoMemoryError, so it swallows Ctrl-C and turns an OOM into a\n"
+    "     confusing retry loop.\n"
+    "ACT name the exceptions you can actually handle. If the goal is cleanup,\n"
+    "     `ensure` runs without catching anything. If it is logging, re-raise\n"
+    "     after logging -- `reraises` shows who already does.\n"
+    "MISLEADS a top-level supervisor in a worker process legitimately catches\n"
+    "     Exception so it can report before dying. Those are correct and rank\n"
+    "     high here; check whether the body re-raises.",
+    """SELECT s.name, s.qual_name AS qual,
+        s.n_rescue_exception AS rescue_exception, s.n_rescue_bare AS bare,
+        s.n_rescue_empty AS empty_bodies, s.n_rescue_reraise AS reraises,
+        s.n_ensure AS ensures, s.n_retry AS retries, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_rescue_exception > 0 OR s.n_rescue_bare > 0) AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_rescue_exception DESC,
+        (s.n_rescue_bare - s.n_rescue_reraise) DESC LIMIT :lim"""),
+(
+    "threads-without-synchronisation",
+    "Thread.new and Ractor next to mutable state, with no Mutex in sight",
+    "ANSWERS which concurrency is unguarded. MRI's GIL makes a data race\n"
+    "     unlikely to corrupt an object, but it does NOT make check-then-act\n"
+    "     atomic: two threads can both see nil and both build the thing.\n"
+    "     On JRuby and TruffleRuby the GIL is not there at all.\n"
+    "ACT wrap the compound operation in a Mutex, or use a Queue, which is\n"
+    "     already thread-safe. For memoisation prefer building eagerly at\n"
+    "     boot over lazily under concurrency.\n"
+    "MISLEADS a thread that only reads immutable data needs no mutex and is\n"
+    "     listed here anyway. `class_writes` is the column that distinguishes\n"
+    "     them -- shared MUTABLE state is the actual risk.",
+    """SELECT s.name, s.qual_name AS qual, s.n_thread_new AS threads,
+        s.n_ractor AS ractors, s.n_mutex AS mutexes,
+        s.n_thread_local AS thread_locals,
+        s.n_class_level_write AS class_writes, s.n_global_var AS globals,
+        s.is_threaded_entry AS threaded_entry, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_thread_new > 0 OR s.n_ractor > 0) AND s.n_mutex = 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_class_level_write + s.n_global_var) DESC,
+        s.n_thread_new DESC LIMIT :lim"""),
+(
+    "eval-family-surface",
+    "eval, instance_eval and class_eval: where the program rewrites itself",
+    "ANSWERS how much of this codebase is written at run time. `class_eval`\n"
+    "     with a string builds methods no editor can jump to and no static\n"
+    "     tool can see; `eval` on anything derived from input is remote code\n"
+    "     execution.\n"
+    "ACT `define_method` with a block does everything `class_eval` with a\n"
+    "     string does, keeps the lexical scope, and is visible to tooling.\n"
+    "     Reserve string eval for genuine DSL compilation, and never let a\n"
+    "     parameter reach it.\n"
+    "MISLEADS Rails itself is built on this and the framework rows are\n"
+    "     expected. What matters is eval in APPLICATION code, and eval whose\n"
+    "     argument came from params -- see params-to-dynamic-dispatch.",
+    """SELECT s.name, s.qual_name AS qual, s.n_eval AS evals,
+        s.n_instance_eval AS instance_evals, s.n_class_eval AS class_evals,
+        s.n_define_method AS define_methods,
+        s.n_method_missing AS method_missing, s.n_send AS sends,
+        s.n_params_read AS params_reads, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_eval + s.n_instance_eval + s.n_class_eval) > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_params_read DESC, s.n_eval DESC,
+        (s.n_instance_eval + s.n_class_eval) DESC LIMIT :lim"""),
+(
+    "shell-out-surface",
+    "Backticks, system and exec, ranked by how close request data gets",
+    "ANSWERS where Ruby hands a string to a shell. Backticks and the\n"
+    "     single-argument form of `system` go through /bin/sh, so a semicolon\n"
+    "     anywhere in that string is a second command.\n"
+    "ACT use the multi-argument form -- `system(\"git\", \"log\", ref)` --\n"
+    "     which execs directly and never involves a shell, so quoting stops\n"
+    "     being a security question. Where a shell is genuinely required,\n"
+    "     Shellwords.escape every interpolated value.\n"
+    "MISLEADS this cannot see whether the argument is a literal. A backtick\n"
+    "     running a fixed command is fine and ranks the same as one built by\n"
+    "     interpolation -- `interpolations` is the column that separates them.",
+    """SELECT s.name, s.qual_name AS qual, s.n_subshell AS backticks,
+        s.n_exec AS exec_calls, s.n_string_interp AS interpolations,
+        s.n_params_read AS params_reads, s.n_heredoc AS heredocs,
+        s.is_controller AS controller, s.is_job AS job, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_subshell > 0 OR s.n_exec > 0) AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_params_read DESC, s.n_string_interp DESC,
+        (s.n_subshell + s.n_exec) DESC LIMIT :lim"""),
 ]
 
 RubyAnalyzer.QUERIES = RubyAnalyzer.QUERIES + [
