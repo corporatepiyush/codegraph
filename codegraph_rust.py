@@ -3073,8 +3073,16 @@ class TreeSitterAnalyzer(Analyzer):
             for sid, fid, mid, ty in cands:
                 file_scope.setdefault((fid, nm), sid)
         type_scope: dict[tuple[str, str], int] = {}
+        #: symbol_id -> (file_id, module_id) of the DEFINITION. Needed because
+        #: `same_file` and `same_module` describe where the callee lives, and
+        #: three of the four lookups below know only the caller's location.
+        #: Without this they compared the caller's fid to itself and stamped
+        #: every such edge same_file=1: 42% of Java's edges, 45% of
+        #: TypeScript's. Every cross-module query was reading a constant.
+        sym_loc: dict[int, tuple[int, int]] = {}
         for nm, cands in self.by_name.items():
             for sid, fid, mid, ty in cands:
+                sym_loc.setdefault(sid, (fid, mid))
                 if ty:
                     type_scope.setdefault((ty, nm), sid)
 
@@ -3106,8 +3114,13 @@ class TreeSitterAnalyzer(Analyzer):
                     bufs.add_unresolved(sid, name[:160], line)
                     self.n_unresolved += 1
                 continue
-            bufs.add_edge(sid, target[0], target[1] == fid, target[2] == mid,
-                          line)
+            # Ask where the CALLEE is defined. `target[1]`/`target[2]` are
+            # the caller's own fid/mid in three of the four branches above,
+            # so comparing them to fid/mid was always true.
+            tloc = sym_loc.get(target[0])
+            bufs.add_edge(sid, target[0],
+                          tloc is not None and tloc[0] == fid,
+                          tloc is not None and tloc[1] == mid, line)
             self.n_resolved += 1
 
         if self._ext_by_caller:

@@ -3655,6 +3655,14 @@ WHERE x.id = c.symbol_id;
             if len(cands) == 1:
                 unique[nm] = cands[0]
 
+        #: symbol_id -> (file_id, module_id) of the DEFINITION. `same_file` and
+        #: `same_module` describe where the CALLEE lives, and two of the four
+        #: lookups below know only the caller's location -- comparing that to
+        #: itself stamped 2,735 of django's edges same_file=1 regardless.
+        sym_loc: dict[int, tuple[int, int]] = {}
+        for nm, cands in self.by_name.items():
+            for _sid, _fid, _mid, _c in cands:
+                sym_loc.setdefault(_sid, (_fid, _mid))
         file_scope: dict[tuple[int, str], int] = {}
         for nm, cands in by_name.items():
             for sid, fid, mid, cls in cands:
@@ -3701,8 +3709,12 @@ WHERE x.id = c.symbol_id;
                     n_unres += 1
                 continue
             sid = target[0]
-            bufs.add_edge(caller_sid, sid, target[1] == fid, target[2] == mid,
-                          line)
+            # Ask where the CALLEE is defined; target[1]/[2] carry the
+            # caller's own fid/mid in two of the branches above.
+            tloc = sym_loc.get(sid)
+            bufs.add_edge(caller_sid, sid,
+                          tloc is not None and tloc[0] == fid,
+                          tloc is not None and tloc[1] == mid, line)
             n_res += 1
 
         if n_ext:
