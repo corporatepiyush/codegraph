@@ -2078,10 +2078,11 @@ def main(analyzer: Analyzer, argv: Optional[list[str]] = None) -> int:
         return 0
     if a.csv is not None or a.json is not None:
         idx = (a.csv if a.csv is not None else a.json) - 1
-        if not (0 <= idx < len(analyzer.QUERIES)):
+        qs_csv = analyzer.METRICS if a.metrics else analyzer.QUERIES
+        if not (0 <= idx < len(qs_csv)):
             print("no query %d" % (idx + 1), file=sys.stderr)
             return 2
-        cur = db.execute(analyzer.QUERIES[idx][3], p)
+        cur = db.execute(qs_csv[idx][3], p)
         cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
         if a.csv:

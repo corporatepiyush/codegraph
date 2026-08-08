@@ -32,3 +32,6 @@ py.*.profstats
 test_repos/
 *.py_split
 *.py.bak
+
+# one-shot local helpers
+_*.py
