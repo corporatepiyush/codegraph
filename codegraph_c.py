@@ -2524,6 +2524,14 @@ TAG_BODY = re.compile(r'^[ \t]*(?:typedef[ \t]+)?(struct|enum|union)[ \t]*(\w*)[
 
 STRING_LIT = re.compile(r'"(?:[^"\\\n]|\\.)*"')
 
+#: G07: a string literal that names a credential (mirrors the other packs).
+SECRET_RE = re.compile(
+    r'(api[_-]?key|apikey|secret|password|passwd|pwd|token|bearer|'
+    r'access[_-]?key|private[_-]?key|client[_-]?secret|'
+    r'auth[_-]?token|jwt|credential|smtp[_-]?pass|db[_-]?pass|'
+    r'sk_live|rk_live|pk_live|ghp_|xoxb-|AKIA)', re.I)
+SECRET_MIN_LEN = 12
+
 _STORAGE = (r'(?:const[ \t]+|volatile[ \t]+|_Atomic[ \t]+|atomic_\w+[ \t]+|'
             r'unsigned[ \t]+|signed[ \t]+|long[ \t]+|short[ \t]+|struct[ \t]+|'
             r'enum[ \t]+|union[ \t]+)*')
@@ -3282,6 +3290,14 @@ CREATE TABLE layout(
      line INT NOT NULL DEFAULT 0
  ) STRICT;
 
+ CREATE TABLE secret_candidates(
+     id INTEGER PRIMARY KEY,
+     symbol_id INT REFERENCES symbols(id),
+     file_id INT NOT NULL REFERENCES files(id),
+     value TEXT NOT NULL,
+     line INT NOT NULL
+ ) STRICT;
+
 
 -- The bodies the call graph cannot see into. `n_uses` is filled in during call
 -- resolution, so "which macro is doing the most work" is answerable.
@@ -3357,6 +3373,7 @@ CREATE INDEX idx_cfg_expr ON config_blocks(expr) WHERE is_config=1;
 CREATE INDEX idx_reach_fan ON reach(n_transitive DESC) WHERE n_transitive>0;
 CREATE INDEX idx_decl_name ON declarations(name);
 CREATE INDEX idx_addrtaken ON addr_taken(name);
+CREATE INDEX idx_secret_sym ON secret_candidates(symbol_id);
 CREATE INDEX idx_mk_rule ON makefile_rules(n_objs DESC, n_srcs DESC);
 CREATE INDEX idx_fn_fnptr ON symbols(n_fnptr_calls DESC, name, file_id) WHERE n_fnptr_calls>0;
 CREATE INDEX idx_fn_extern ON symbols(n_external_calls DESC, name, file_id) WHERE n_external_calls>0;
@@ -3760,6 +3777,13 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                 bufs.literals.append(
                     (sid, rec.fid, "hex" if v[:2].lower() == "0x" else "int",
                      v[:40], line_of(body, m2.start()) + ls - 1, 1))
+            for sm in STRING_LIT.finditer(raw_body):
+                sl = sm.group(0)
+                if len(sl) >= SECRET_MIN_LEN and SECRET_RE.search(sl):
+                    # G07: credential-shaped literal -- candidate, not verdict
+                    bufs.rows("secret_candidates").append(
+                        (sid, rec.fid, sl[:200],
+                         line_of(body, sm.start()) + ls - 1))
             for am in ATTR_RE.finditer(sig):
                 bufs.attributes.append((sid, rec.fid, am.group(1)[:80], None, ls))
             for pos, ptype, pname, stars, is_arr, is_const, is_var in ps:
@@ -3968,6 +3992,9 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
              "INSERT INTO declarations(file_id,name,line) VALUES(?,?,?)"),
             ("addr_taken",
              "INSERT INTO addr_taken(symbol_id,file_id,name,line) "
+             "VALUES(?,?,?,?)"),
+            ("secret_candidates",
+             "INSERT INTO secret_candidates(symbol_id,file_id,value,line) "
              "VALUES(?,?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
@@ -4643,9 +4670,9 @@ QUERIES: list[tuple[str, str, str, str]] = [
     "     internal), so the ratio is about the include SPELLING, not about where\n"
     "     the file actually lives.",
     """SELECT f.path,
-        SUM(CASE WHEN i.is_relative=1 THEN 1 ELSE 0 END) AS user_headers,
-        SUM(CASE WHEN i.is_relative=0 THEN 1 ELSE 0 END) AS sys_headers,
-        CAST(100.0 * SUM(CASE WHEN i.is_relative=1 THEN 1 ELSE 0 END)
+        COUNT(*) FILTER (WHERE i.is_relative=1) AS user_headers,
+        COUNT(*) FILTER (WHERE i.is_relative=0) AS sys_headers,
+        CAST(100.0 * COUNT(*) FILTER (WHERE i.is_relative=1)
              / NULLIF(COUNT(*), 0) AS INT) AS pct_user,
         f.sloc
     FROM imports i JOIN files f ON f.id=i.file_id
@@ -4901,6 +4928,26 @@ QUERIES: list[tuple[str, str, str, str]] = [
       AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.fan_in DESC, h.n DESC
     LIMIT :lim"""),
+(
+    "hardcoded-secret-candidates",
+    "Credential-shaped string literals (OWASP G07)",
+    "ANSWERS string literals at least 12 chars long whose text names a\n"
+    "     credential (password, token, api_key, secret, bearer, jwt, ...) --\n"
+    "     the literal that a committed secret looks like.\n"
+    "ACT rotate and move to a secret manager; never commit the literal.\n"
+    "MISLEADS a format string or test fixture containing the WORD token/pass\n"
+    "     reads as a candidate (the filter is the literal's own text, not its\n"
+    "     use); values over 200 chars are truncated at capture; a secret\n"
+    "     built from parts or read from an env var is invisible here. This\n"
+    "     is a candidate list, not a verdict.",
+    """SELECT s.name, sc.value AS candidate, sc.line,
+        f.path || ':' || sc.line AS at
+    FROM secret_candidates sc
+    JOIN symbols s ON s.id = sc.symbol_id
+    JOIN files f ON f.id = sc.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY length(sc.value) DESC LIMIT :lim"""),
 (
     "include-cycles",
     "User headers that include each other, directly or via a chain",
