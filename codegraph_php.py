@@ -2232,6 +2232,8 @@ class BodyStats:
     #: (callee_text, line, is_dynamic, in_loop)
     calls: list[tuple[str, int, bool, bool]] = dc_field(default_factory=list)
     literals: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
+    #: (value, line) -- G07 credential-shaped string literals
+    secrets: list[tuple[str, int]] = dc_field(default_factory=list)
 
     def bump(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -2459,6 +2461,7 @@ class TreeSitterAnalyzer(Analyzer):
                 continue
             self.add_pending(sid, rec.fid, rec.mid, text, line, "")
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_secrets(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -2578,6 +2581,7 @@ class TreeSitterAnalyzer(Analyzer):
             self.add_pending(sid, rec.fid, rec.mid, text, line,
                                  scope.type_name)
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_secrets(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -2960,6 +2964,12 @@ class TreeSitterAnalyzer(Analyzer):
     def emit_attributes(self, node: Any, rec: FileRec, sid: int,
                         bufs: Buffers) -> None:
         """Hook: annotations, decorators, derives, struct tags."""
+
+    def emit_secrets(self, stats: BodyStats, sid: int, rec: FileRec,
+                     bufs: Buffers) -> None:
+        for sval, sline in stats.secrets:
+            bufs.rows("secret_candidates").append(
+                (sid, rec.fid, sval, sline))
 
     def emit_hazards(self, stats: BodyStats, sid: int, rec: FileRec,
                      bufs: Buffers) -> None:
@@ -3403,6 +3413,14 @@ SQL_RE = re.compile(
     r'CREATE\s+TABLE|DROP\s+TABLE|ALTER\s+TABLE|TRUNCATE\s+TABLE|'
     r'UNION\s+(?:ALL\s+)?SELECT|FROM\s+\w+\s+WHERE)\b', re.I)
 
+#: G07: a string literal that names a credential (mirrors the other packs).
+SECRET_RE = re.compile(
+    r'(api[_-]?key|apikey|secret|password|passwd|pwd|token|bearer|'
+    r'access[_-]?key|private[_-]?key|client[_-]?secret|'
+    r'auth[_-]?token|jwt|credential|smtp[_-]?pass|db[_-]?pass|'
+    r'sk_live|rk_live|pk_live|ghp_|xoxb-|AKIA)', re.I)
+SECRET_MIN_LEN = 12
+
 PLACEHOLDER_RE = re.compile(r'(\?|:[a-zA-Z_]\w*)')
 
 STRICT_TYPES_RE = re.compile(r'declare\s*\(\s*strict_types\s*=\s*1\s*\)')
@@ -3702,6 +3720,10 @@ class PhpAnalyzer(TreeSitterAnalyzer):
     ("n_session_call", "INT NOT NULL DEFAULT 0"),
     ("n_move_uploaded", "INT NOT NULL DEFAULT 0"),
     ("n_serialize_call", "INT NOT NULL DEFAULT 0"),
+    # -- OWASP P2 pack: sinks for the input-surface family ---------------
+    ("n_xxe_parser", "INT NOT NULL DEFAULT 0"),          # G13 XML parsers
+    ("n_dynamic_open", "INT NOT NULL DEFAULT 0"),        # G12 fopen with var
+    ("n_log_call", "INT NOT NULL DEFAULT 0"),            # G14 error_log
     ("n_inarray_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_array_merge_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_count_in_loop", "INT NOT NULL DEFAULT 0"),
@@ -3803,6 +3825,14 @@ CREATE TABLE sql_sites(
     snippet TEXT NOT NULL DEFAULT ''
 ) STRICT;
 
+CREATE TABLE secret_candidates(
+    id INTEGER PRIMARY KEY,
+    symbol_id INT REFERENCES symbols(id),
+    file_id INT NOT NULL REFERENCES files(id),
+    value TEXT NOT NULL,
+    line INT NOT NULL
+) STRICT;
+
 CREATE TABLE property_hooks(
     id INTEGER PRIMARY KEY,
     symbol_id INT REFERENCES symbols(id),
@@ -3857,6 +3887,7 @@ CREATE INDEX idx_ns_name ON namespaces(name, file_id);
 CREATE INDEX idx_sg_sym ON superglobal_reads(symbol_id, var);
 CREATE INDEX idx_sg_var ON superglobal_reads(var, file_id);
 CREATE INDEX idx_sql_sym ON sql_sites(symbol_id, build_kind);
+CREATE INDEX idx_secret_sym ON secret_candidates(symbol_id);
 CREATE INDEX idx_sql_unsafe ON sql_sites(symbol_id)
     WHERE build_kind IN ('interp','concat','format') AND is_sanitized=0;
 CREATE INDEX idx_hook_class ON property_hooks(class_id, property);
@@ -4253,6 +4284,30 @@ UPDATE namespaces AS n SET n_classes = (
             st.bump("n_move_uploaded")
         if _b in ("serialize", "unserialize"):
             st.bump("n_serialize_call")
+        if _b in ("simplexml_load_file", "simplexml_load_string") or \
+                name.startswith(("new DOMDocument", "new XMLReader",
+                                 "new SimpleXMLElement")):
+            # G13: XML parser surface -- entity expansion is a config, not a
+            # name; this ranks where parsers are constructed.
+            st.bump("n_xxe_parser")
+        if _b in ("fopen", "file_get_contents", "readfile", "file") \
+                and name == _b:
+            # G12: free-function file reads with a non-literal path -- the
+            # traversal sink. Methods (->fopen) are excluded: they are
+            # framework wrappers, not the raw PHP shape. The first argument
+            # is an `argument` wrapper node, so the literal test is textual.
+            args = node.child_by_field_name("arguments")
+            first = args.named_children[0] if args is not None \
+                and args.named_children else None
+            if first is not None:
+                atxt = text_of(first, src).strip()
+                if not (atxt[:1] in ("'", '"')
+                        and atxt.endswith(atxt[:1])):
+                    st.bump("n_dynamic_open")
+        if _b == "error_log":
+            # G14: PHP's only native log call -- injection into the log line
+            # is the risk when the message contains user input.
+            st.bump("n_log_call")
         if loop_depth:
             if _b == "in_array":
                 st.bump("n_inarray_in_loop")
@@ -4267,6 +4322,9 @@ UPDATE namespaces AS n SET n_classes = (
 
     def on_string(self, node: Any, text: str, src: bytes, st: BodyStats,
                   loop_depth: int) -> None:
+        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+            # G07: credential-shaped literal -- candidate, not verdict
+            st.secrets.append((text[:200], node.start_point[0] + 1))
         if not SQL_RE.search(text):
             return
         st.bump("n_sql_literal")
@@ -4888,6 +4946,9 @@ UPDATE namespaces AS n SET n_classes = (
             ("dynamic_sites",
              "INSERT INTO dynamic_sites(symbol_id,file_id,kind,target,in_loop,"
              "line) VALUES(?,?,?,?,?,?)"),
+            ("secret_candidates",
+             "INSERT INTO secret_candidates(symbol_id,file_id,value,line) "
+             "VALUES(?,?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
             if rows:
@@ -5745,6 +5806,135 @@ PhpAnalyzer.QUERIES = [
     WHERE s.n_header_call > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.fan_in DESC, s.n_header_call DESC LIMIT :lim"""),
+(
+    "open-redirect-surface",
+    "header() redirects in functions that read superglobals (OWASP G26)",
+    "ANSWERS functions that call header() AND read a superglobal -- the shape\n"
+    "     of an unvalidated redirect: header(\"Location: \".$_GET['next']).\n"
+    "     The superglobal read is the attacker-controlled input candidate.\n"
+    "ACT validate the target against an allowlist; never forward a user-supplied\n"
+    "     URL, and call exit after the header.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the superglobal\n"
+    "     value may never reach the header, and a constant Location beside an\n"
+    "     unrelated $_GET read reads as a violation. The header text is not\n"
+    "     captured, so a fixed redirect cannot be told from an open one.\n"
+    "     setcookie/session_start share the category but are excluded by\n"
+    "     matching the bare header() pattern only.",
+    """SELECT s.name, h.n AS header_sites,
+        s.n_superglobal_reads AS superglobal_reads,
+        s.fan_in, s.is_controller AS controller,
+        f.path || ':' || s.line_start AS at
+    FROM hazards h
+    JOIN symbols s ON s.id = h.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE h.pattern = 'header' AND s.n_superglobal_reads > 0
+      AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, h.n DESC LIMIT :lim"""),
+(
+    "hardcoded-secret-candidates",
+    "Credential-shaped string literals (OWASP G07)",
+    "ANSWERS string literals at least 12 chars long whose text names a\n"
+    "     credential (password, token, api_key, secret, bearer, jwt, ...) --\n"
+    "     the literal that a committed secret looks like.\n"
+    "ACT rotate and move to a secret manager; never commit the literal.\n"
+    "MISLEADS a format string or test fixture containing the WORD token/pass\n"
+    "     reads as a candidate (the filter is the literal's own text, not its\n"
+    "     use); values over 200 chars are truncated at capture; a secret\n"
+    "     built from parts or read from an env var is invisible here.\n"
+    "     This is a candidate list, not a verdict.",
+    """SELECT s.name, sc.value AS candidate, sc.line,
+        f.path || ':' || sc.line AS at
+    FROM secret_candidates sc
+    JOIN symbols s ON s.id = sc.symbol_id
+    JOIN files f ON f.id = sc.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY length(sc.value) DESC LIMIT :lim"""),
+(
+    "xxe-parser-surface",
+    "XML parser construction sites (OWASP G13)",
+    "ANSWERS functions that touch simplexml / DOMDocument / XMLReader -- the\n"
+    "     surface where entity expansion is decided.\n"
+    "ACT disable external entity loading (LIBXML_NONET | LIBXML_NOENT off) or\n"
+    "     reject DTDs entirely.\n"
+    "MISLEADS the parser CONFIG is not modeled: a parser with entities\n"
+    "     disabled ranks the same as one without. The capture is the bare\n"
+    "     function/constructor name, so a wrapper around simplexml_load_string\n"
+    "     is invisible.",
+    """SELECT s.name, s.n_xxe_parser AS xml_parsers,
+        s.sloc, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_xxe_parser > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_xxe_parser DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "path-traversal-surface",
+    "fopen/file_get_contents with a non-literal path in superglobal functions (G12)",
+    "ANSWERS functions that call fopen/file_get_contents/readfile/file with a\n"
+    "     variable path AND read a superglobal -- the shape of path traversal:\n"
+    "     file_get_contents($_GET['f']).\n"
+    "ACT validate the resolved path stays under a configured root before\n"
+    "     opening.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the open, and a constant-open beside an unrelated\n"
+    "     superglobal read reads as a violation. The path is not analyzed: a\n"
+    "     variable path is assumed suspicious, a literal is not; framework\n"
+    "     wrappers (->fopen, Storage facade) are invisible to the free-function\n"
+    "     capture.",
+    """SELECT s.name, s.n_dynamic_open AS open_sites,
+        s.n_superglobal_reads AS superglobal_reads,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_dynamic_open > 0 AND s.n_superglobal_reads > 0
+      AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_dynamic_open DESC, s.n_superglobal_reads DESC LIMIT :lim"""),
+(
+    "unchecked-upload-surface",
+    "move_uploaded_file in functions that read $_FILES (OWASP G28)",
+    "ANSWERS functions that call move_uploaded_file AND read $_FILES -- the\n"
+    "     shape of an unchecked upload: move_uploaded_file($_FILES['f']\n"
+    "     ['tmp_name'], $dst).\n"
+    "ACT check extension, MIME and size against an allowlist before moving;\n"
+    "     store outside the web root.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the check may\n"
+    "     happen elsewhere in the function or be missing entirely; the graph\n"
+    "     sees the move, not the validation. An upload handled through a\n"
+    "     framework request object (Laravel's $request->file) is invisible to\n"
+    "     the $_FILES capture.",
+    """SELECT s.name, s.n_move_uploaded AS moves,
+        s.n_files_super AS files_reads,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_move_uploaded > 0 AND s.n_files_super > 0
+      AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_move_uploaded DESC, s.n_files_super DESC LIMIT :lim"""),
+(
+    "log-injection-surface",
+    "error_log calls in functions that read superglobals (OWASP G14)",
+    "ANSWERS functions that call error_log AND read a superglobal -- the\n"
+    "     shape of log forging: error_log($_GET['msg']).\n"
+    "ACT sanitize newlines and control characters in log messages; never log\n"
+    "     raw user input.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the log call, and a constant message beside an\n"
+    "     unrelated superglobal read reads as a violation. Framework loggers\n"
+    "     (Monolog, Log facade) are invisible to the bare error_log capture.",
+    """SELECT s.name, s.n_log_call AS log_calls,
+        s.n_superglobal_reads AS superglobal_reads,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_log_call > 0 AND s.n_superglobal_reads > 0
+      AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_log_call DESC, s.n_superglobal_reads DESC LIMIT :lim"""),
 (
     "session-fixation",
     "session_start without session_regenerate_id (PHPStan/Sonar)",
