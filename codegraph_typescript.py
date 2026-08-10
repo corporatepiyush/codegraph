@@ -3544,13 +3544,29 @@ CREATE TABLE suppressions(
  -- Dependencies declared in package.json files, for the unused-dependencies
  -- query: a declared name with no matching import target is config debt or
  -- a real dead weight (knip/machete territory).
- CREATE TABLE deps(
-     id INTEGER PRIMARY KEY,
-     name TEXT NOT NULL,
-     version TEXT NOT NULL DEFAULT '',
-     is_dev INT NOT NULL DEFAULT 0,
-     dir TEXT NOT NULL DEFAULT ''
- ) STRICT;
+  CREATE TABLE deps(
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      version TEXT NOT NULL DEFAULT '',
+      is_dev INT NOT NULL DEFAULT 0,
+      dir TEXT NOT NULL DEFAULT ''
+  ) STRICT;
+
+  -- Identifier tokens extracted from every symbol's signature at post_build.
+  -- `orphan-types` asks "does any OTHER signature contain this type name as a
+  -- standalone token" -- which is exactly "is the name in this table from
+  -- another symbol". Precomputing it turns the old O(types x symbols) GLOB
+  -- cross-product (443s on playwright) into an index lookup.
+  CREATE TABLE sig_tokens(
+      symbol_id INT NOT NULL REFERENCES symbols(id),
+      token TEXT NOT NULL,
+      PRIMARY KEY(symbol_id, token)
+  ) WITHOUT ROWID, STRICT;
+
+  -- token-leading index: orphan-types looks up names by token; without it
+  -- SQLite scans the (symbol_id, token) PK per candidate type.
+  CREATE INDEX idx_sig_token ON sig_tokens(token);
+
 
 
 CREATE TABLE type_defs(
@@ -4347,6 +4363,34 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
                   AND s.kind IN ('function','method','closure')
                 ORDER BY s.line_start DESC LIMIT 1)""")
 
+    def post_build(self, db: sqlite3.Connection) -> None:
+        """Tokenize every signature into `sig_tokens` for orphan-types.
+
+        The boundary-safe "is this name a standalone token in some other
+        signature" predicate was a correlated GLOB cross-product:
+        O(types x symbols) -- measured 443s on playwright. The token table
+        precomputes the same predicate once; the query becomes an index
+        lookup.
+        """
+        rows: list[tuple[int, str]] = []
+        for sid, sig in db.execute(
+                "SELECT id, signature FROM symbols "
+                "WHERE signature IS NOT NULL AND signature <> ''"):
+            if len(sig) > 4000:
+                sig = sig[:4000]
+            seen: set[str] = set()
+            for tok in SIG_TOKEN_RE.findall(sig):
+                if tok not in seen:
+                    seen.add(tok)
+                    rows.append((sid, tok[:120]))
+        if rows:
+            db.executemany(
+                "INSERT OR IGNORE INTO sig_tokens(symbol_id, token) "
+                "VALUES(?,?)", rows)
+
+#: Identifier tokens in signature text, for the sig_tokens post_build pass.
+SIG_TOKEN_RE = re.compile(r'[A-Za-z_$][A-Za-z0-9_$]*')
+
 _TYPE_COUNTERS: dict[str, str] = {
     "conditional_type": "n_conditional_type",
     "mapped_type_clause": "n_mapped_type",
@@ -5032,14 +5076,14 @@ TypeScriptAnalyzer.QUERIES = [
     "ACT grep the type name as a string before deleting: an ambient module,\n"
     "     a mapped type over it, or generic instantiation can keep it alive\n"
     "     without any signature match here.\n"
-    "MISLEADS signature-text matching is name-based and bounded; a type used\n"
-    "     only through generics (`Array<Foo>`, `Partial<Foo>`) matches only\n"
-    "     if the signature text contains the bare name, and an exported type\n"
-    "     consumed by an external package is invisible. The match is a\n"
-    "     boundary-safe identifier test (case-sensitive GLOB with an\n"
-    "     identifier-exclusion class), so `User` does NOT match inside\n"
-    "     `getUsers` or `UserView` -- subword-only appearances leave the\n"
-    "     type reported. This is a candidate list, not a deletion list.",
+    "MISLEADS the used-check is a precomputed token table (identifier tokens\n"
+    "     of every signature, built at post_build): a name counts as used iff\n"
+    "     it is a standalone token in some OTHER symbol's signature -- the\n"
+    "     boundary-safe predicate, linear instead of the old quadratic GLOB\n"
+    "     cross-product. A namespaced type (`ns.Foo`) whose simple name never\n"
+    "     appears bare is reported even when used as `ns.Foo`; an exported\n"
+    "     type consumed by an external package is invisible. This is a\n"
+    "     candidate list, not a deletion list.",
     """SELECT s.name, s.kind, t.n_members, t.n_extends, t.is_exported,
         (SELECT COUNT(*) FROM ts_exports e WHERE e.name=s.name
           AND e.is_type_only=1) AS type_exports,
@@ -5048,16 +5092,8 @@ TypeScriptAnalyzer.QUERIES = [
     JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.kind IN ('interface','type')
-      AND NOT EXISTS (SELECT 1 FROM symbols s2
-                      WHERE s2.id <> s.id
-                        AND (s2.signature = s.name
-                             OR s2.signature GLOB
-                                '*[^A-Za-z0-9_$]' || s.name
-                             OR s2.signature GLOB
-                                s.name || '[^A-Za-z0-9_$]*'
-                             OR s2.signature GLOB
-                                '*[^A-Za-z0-9_$]' || s.name
-                                || '[^A-Za-z0-9_$]*'))
+      AND NOT EXISTS (SELECT 1 FROM sig_tokens st
+                      WHERE st.token = s.name AND st.symbol_id <> s.id)
       AND (SELECT COUNT(*) FROM ts_exports e
            WHERE e.name=s.name AND e.is_type_only=1) = 0
       AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
