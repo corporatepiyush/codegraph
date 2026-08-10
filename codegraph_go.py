@@ -2902,6 +2902,10 @@ class TreeSitterAnalyzer(Analyzer):
             # G29: archive/zip access -- entry containment is a check, not a
             # name; this ranks where archives are opened.
             st.bump("n_zip_read")
+        if any(k in name.lower() for k in AUTH_MARKERS):
+            # G01: an auth-family call -- the marker that makes the
+            # unauthenticated-input surface query exclude this function.
+            st.bump("n_auth_call")
 
         # -- facts golangci-lint checks, recorded rather than judged ---------
         # Counters, never verdicts. `n_http_no_timeout` says the code built a
@@ -3321,6 +3325,10 @@ SECRET_RE = re.compile(
     r'sk_live|rk_live|pk_live|ghp_|xoxb-|AKIA)', re.I)
 SECRET_MIN_LEN = 12
 
+#: G01: auth-family markers (RequireAuth, CheckAuth, jwt, session, login).
+AUTH_MARKERS = ("auth", "authorize", "authenticate", "login", "jwt",
+                "session", "token")
+
 HAZARD_CALLS: dict[str, str] = {
     # goroutine / sync -- staticcheck SA2000, go vet waitgroup
     "sync.WaitGroup": "goroutine", "errgroup.Group": "goroutine",
@@ -3608,6 +3616,7 @@ class GoAnalyzer(TreeSitterAnalyzer):
     ("n_readall_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_env_read", "INT NOT NULL DEFAULT 0"),
     ("n_redirect", "INT NOT NULL DEFAULT 0"),            # G26 http.Redirect
+    ("n_auth_call", "INT NOT NULL DEFAULT 0"),           # G01 auth family
     # -- OWASP P2 pack: sinks for the input-surface family ---------------
     ("n_deserialize", "INT NOT NULL DEFAULT 0"),         # G19/G30 decode
     ("n_dynamic_open", "INT NOT NULL DEFAULT 0"),        # G12 os.* with var
@@ -5665,6 +5674,30 @@ WITH RECURSIVE down(root, sym, depth) AS (
       AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY s.n_deserialize DESC, body_reads DESC LIMIT :lim"""),
+(
+    "unauthenticated-input-surface",
+    "Request input read with no auth call in the function (OWASP G01)",
+    "ANSWERS functions that read request input and contain NO auth-family\n"
+    "     call (RequireAuth, CheckAuth, jwt, session, login) -- the surface\n"
+    "     where a handler may be missing its authorization check.\n"
+    "ACT add the auth middleware call; verify the route is in the protected\n"
+    "     group.\n"
+    "MISLEADS auth usually lives in MIDDLEWARE, not the handler -- this\n"
+    "     query sees the handler only, so a fully-protected mux still ranks\n"
+    "     every handler as open. A login or public endpoint legitimately has\n"
+    "     no auth. The markers are name-based substrings, so a wrapper\n"
+    "     around the auth call is invisible and counts as open.",
+    """SELECT s.name, COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE u.kind IS NOT NULL AND s.n_auth_call = 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY input_sites DESC, s.sloc DESC LIMIT :lim"""),
 (
     "deprecated-stdlib-calls",
     "Call sites of deprecated stdlib entry points (staticcheck SA1019)",
