@@ -3591,6 +3591,10 @@ XXE_ENTRY_BASES = frozenset(("newDocumentBuilder", "newSAXParser",
 #: filesystem path.
 ZIP_CTOR_PREFIX = ("new Zip", "new Jar")
 
+#: G01: auth-family markers (securityContext, isAuthenticated, login, jwt).
+AUTH_MARKERS = ("auth", "security", "login", "jwt", "token",
+                "isauthenticated", "hasrole")
+
 #: HttpServletRequest receivers and input-access method -> site kind.
 #: Receiver-name restricted: an unqualified getParameter() is a helper on
 #: some other object and not input by itself.
@@ -3797,6 +3801,7 @@ class JavaAnalyzer(TreeSitterAnalyzer):
     ("n_equals_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_weak_random", "INT NOT NULL DEFAULT 0"),
     ("n_redirect", "INT NOT NULL DEFAULT 0"),            # G26 sendRedirect
+    ("n_auth_call", "INT NOT NULL DEFAULT 0"),           # G01 auth family
     # -- OWASP P2 pack: sinks for the input-surface family ---------------
     ("n_xxe_parser", "INT NOT NULL DEFAULT 0"),          # G13 XML parsers
     ("n_zip_read", "INT NOT NULL DEFAULT 0"),            # G29 archive ctor
@@ -4298,6 +4303,10 @@ UPDATE symbols SET arity_rank = CASE
             # G29: archive construction -- entry containment is a check, not
             # a name; this ranks where archives are opened.
             st.bump("n_zip_read")
+        if any(k in full.lower() for k in AUTH_MARKERS):
+            # G01: an auth-family call -- the marker that makes the
+            # unauthenticated-input surface query exclude this method.
+            st.bump("n_auth_call")
         st.calls.append((full[:200], line, False, bool(loop_depth)))
 
         # -- per-call metric columns, keyed on the simple name --------------
@@ -6194,6 +6203,32 @@ WITH fld AS (
     WHERE s.n_zip_read > 0 AND f.is_test = 0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.n_zip_read DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "unauthenticated-input-surface",
+    "Request input read with no auth call in the method (OWASP G01)",
+    "ANSWERS methods that read HttpServletRequest input and contain NO\n"
+    "     auth-family call (securityContext, isAuthenticated, login, jwt) --\n"
+    "     the surface where a controller method may be missing its\n"
+    "     authorization check.\n"
+    "ACT add the security annotation or auth check; verify the route is in\n"
+    "     the protected group.\n"
+    "MISLEADS auth usually lives on a SECURITY FILTER, an @PreAuthorize\n"
+    "     annotation, or a base controller -- this query sees the method\n"
+    "     body only, so a fully-protected app still ranks every method as\n"
+    "     open. A login or public endpoint legitimately has no auth. The\n"
+    "     markers are name-based substrings; annotations are invisible.\n"
+    "     Resolution is name-based.",
+    """SELECT s.name, COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE u.kind IS NOT NULL AND s.n_auth_call = 0
+      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY input_sites DESC, s.sloc DESC LIMIT :lim"""),
 (
     "overridden-not-annotated",
     "Method overrides a parent but @Override annotation is missing (PMD/sonar)",
