@@ -3421,6 +3421,11 @@ SECRET_RE = re.compile(
     r'sk_live|rk_live|pk_live|ghp_|xoxb-|AKIA)', re.I)
 SECRET_MIN_LEN = 12
 
+#: G01: auth-family markers (session_start/regenerate_id, password_verify,
+#: hash_equals, login, auth).
+AUTH_MARKERS = ("auth", "login", "session", "password_verify", "hash_equals",
+                "jwt")
+
 PLACEHOLDER_RE = re.compile(r'(\?|:[a-zA-Z_]\w*)')
 
 STRICT_TYPES_RE = re.compile(r'declare\s*\(\s*strict_types\s*=\s*1\s*\)')
@@ -3724,6 +3729,7 @@ class PhpAnalyzer(TreeSitterAnalyzer):
     ("n_xxe_parser", "INT NOT NULL DEFAULT 0"),          # G13 XML parsers
     ("n_dynamic_open", "INT NOT NULL DEFAULT 0"),        # G12 fopen with var
     ("n_log_call", "INT NOT NULL DEFAULT 0"),            # G14 error_log
+    ("n_auth_call", "INT NOT NULL DEFAULT 0"),           # G01 auth family
     ("n_inarray_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_array_merge_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_count_in_loop", "INT NOT NULL DEFAULT 0"),
@@ -4308,6 +4314,10 @@ UPDATE namespaces AS n SET n_classes = (
             # G14: PHP's only native log call -- injection into the log line
             # is the risk when the message contains user input.
             st.bump("n_log_call")
+        if any(k in name.lower() for k in AUTH_MARKERS):
+            # G01: an auth-family call -- the marker that makes the
+            # unauthenticated-input surface query exclude this function.
+            st.bump("n_auth_call")
         if loop_depth:
             if _b == "in_array":
                 st.bump("n_inarray_in_loop")
@@ -5935,6 +5945,29 @@ PhpAnalyzer.QUERIES = [
       AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.n_log_call DESC, s.n_superglobal_reads DESC LIMIT :lim"""),
+(
+    "unauthenticated-input-surface",
+    "Superglobal reads with no auth call in the function (OWASP G01)",
+    "ANSWERS functions that read a superglobal and contain NO auth-family\n"
+    "     call (session_start/regenerate_id, password_verify, hash_equals,\n"
+    "     login, auth) -- the surface where a handler may be missing its\n"
+    "     authorization check.\n"
+    "ACT add the session/auth check; verify the route is in the protected\n"
+    "     group.\n"
+    "MISLEADS auth may live in middleware, a base controller, or an\n"
+    "     auth middleware class -- same-function co-occurrence only, so a\n"
+    "     protected handler whose check lives outside the body reads as\n"
+    "     open. A login or public endpoint legitimately has no auth. The\n"
+    "     markers are name-based substrings, so a wrapper around the auth\n"
+    "     call is invisible and counts as open.",
+    """SELECT s.name, s.n_superglobal_reads AS superglobal_reads,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_superglobal_reads > 0 AND s.n_auth_call = 0
+      AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_superglobal_reads DESC, s.sloc DESC LIMIT :lim"""),
 (
     "session-fixation",
     "session_start without session_regenerate_id (PHPStan/Sonar)",
