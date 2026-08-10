@@ -2319,6 +2319,47 @@ HAZARD_METHOD_SUFFIX: dict[str, str] = {
     "recv": "net", "send": "net", "connect": "net",
 }
 
+#: Web-framework request-input attribute -> site kind. `request.args` in
+#: Flask is a query string; Django spells the same shape request.GET. A
+#: member name absent from this map (e.g. request.method, request.foo) is
+#: skipped -- only mapped attributes record a row.
+REQ_INPUT_KINDS: dict[str, str] = {
+    "args": "query", "GET": "query",
+    "form": "form", "POST": "form", "files": "form", "FILES": "form",
+    "cookies": "cookie", "COOKIES": "cookie",
+    "headers": "header",
+    "get_json": "body",
+}
+
+#: G07: a string literal that names a credential. The value is recorded into
+#: `secret_candidates` when it is at least SECRET_MIN_LEN long -- short values
+#: (a one-word "password" flag) are configuration, not credentials.
+SECRET_RE = re.compile(
+    r'(api[_-]?key|apikey|secret|password|passwd|pwd|token|bearer|'
+    r'access[_-]?key|private[_-]?key|client[_-]?secret|'
+    r'auth[_-]?token|jwt|credential|smtp[_-]?pass|db[_-]?pass|'
+    r'sk_live|rk_live|pk_live|ghp_|xoxb-|AKIA)', re.I)
+SECRET_MIN_LEN = 12
+
+#: G14: logging level methods. Matched against the dotted call name so
+#: `logging.info` / `logger.info` / `self.log.info` all count.
+LOG_LEVELS = frozenset(("debug", "info", "warning", "warn", "error",
+                        "exception", "critical"))
+
+#: G27: HTTP client callers. `requests.` covers get/post/put/patch/delete;
+#: `urllib.request.urlopen` and `urllib.urlopen` are the stdlib shapes;
+#: `httpx.` and `http.client.` are the modern ones. A bare `s.get(...)` on
+#: an aiohttp session has no dotted name and is invisible to this set.
+FETCH_PREFIXES = ("requests.", "httpx.", "http.client.", "aiohttp.",
+                  "urllib.request.urlopen", "urllib.urlopen")
+
+#: G13: XML parsing entry points. defusedxml is deliberately absent -- it IS
+#: the fix.
+XXE_PREFIXES = ("xml.etree.", "lxml.", "xml.dom.", "xml.sax.")
+
+#: G29: zipfile module access (ZipFile/extractall/namelist/read).
+ZIP_PREFIX = "zipfile."
+
 HAZARD_IMPORTS: dict[str, str] = {
     "pickle": "deserialize", "cPickle": "deserialize", "dill": "deserialize",
     "marshal": "deserialize", "shelve": "deserialize",
@@ -2489,6 +2530,11 @@ class FunctionMetrics(ast.NodeVisitor):
         self.src_lines = src_lines
         self.fn = fn
         self._root = fn
+        #: (line, var, kind, in_loop) -- flushed by the caller into
+        #: `user_input_sites`; see REQ_INPUT_KINDS for the attr->kind map.
+        self.input_sites: list[tuple[int, str, str, int]] = []
+        #: (value, line) -- G07 credential-shaped string literals
+        self.secrets: list[tuple[str, int]] = []
         # `elif` is `If` inside the parent's `orelse`, so a flat 30-arm chain
         # looks 30 levels deep to a naive AST walk. Left uncorrected, every
         # dispatch table in the repo outranks every genuinely nested loop --
@@ -2659,6 +2705,22 @@ class FunctionMetrics(ast.NodeVisitor):
             self.bump("n_member_access")
             if isinstance(node.value, ast.Name) and node.value.id == "self":
                 self.bump("n_self_attr")
+            kind = REQ_INPUT_KINDS.get(node.attr)
+            if kind is not None:
+                base = node.value
+                if isinstance(base, ast.Name) and base.id == "request":
+                    var = "request." + node.attr
+                elif (isinstance(base, ast.Attribute)
+                      and base.attr == "request"
+                      and isinstance(base.value, ast.Name)
+                      and base.value.id == "self"):
+                    var = "self.request." + node.attr
+                else:
+                    base = None
+                if base is not None:
+                    self.input_sites.append(
+                        (node.lineno, var[:120], kind,
+                         int(bool(self.loop_depth))))
         elif t is ast.BinOp:
             if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div,
                                     ast.FloorDiv, ast.Mod, ast.Pow)):
@@ -2708,6 +2770,13 @@ class FunctionMetrics(ast.NodeVisitor):
                                       getattr(node, "lineno", 0), True))
         elif isinstance(v, float):
             self.bump("n_float_lit")
+        if isinstance(v, str) and len(v) >= SECRET_MIN_LEN \
+                and SECRET_RE.search(v):
+            # G07: keyword-named string of credential length. The value is
+            # kept whole (up to the 200-char truncation at flush) so the
+            # query can show the candidate without re-reading source.
+            self.secrets.append(
+                (v[:200], getattr(node, "lineno", 0)))
 
     def _string_build(self, node: ast.Assign) -> None:
         """`s = s + x` inside a loop is quadratic. So is `.join` misuse."""
@@ -2730,6 +2799,47 @@ class FunctionMetrics(ast.NodeVisitor):
 
         if name:
             base = name.split(".")[-1]
+        elif isinstance(node.func, ast.Attribute):
+            base = node.func.attr      # dotted() gave up (Subscript receiver)
+        else:
+            base = ""
+        if base == "save":
+            # G28: request.files['f'].save(...) / request.FILES['f'].save(...)
+            # -- dotted() cannot see through the Subscript, so walk the
+            # receiver chain. Lives OUTSIDE the `if name:` gate: a subscript
+            # receiver makes name == "".
+            seen_files = "files" in name or "FILES" in name
+            cur2 = node.func
+            while not seen_files and isinstance(
+                    cur2, (ast.Attribute, ast.Subscript)):
+                if isinstance(cur2, ast.Attribute):
+                    seen_files = cur2.attr in ("files", "FILES")
+                cur2 = cur2.value
+            if seen_files:
+                self.bump("n_upload_save")
+        if name:
+            if base in ("redirect", "redirect_to"):
+                # G26: flask/django redirect() -- the open-redirect sink
+                self.bump("n_redirect")
+            if base in ("urlopen",) or name.startswith(FETCH_PREFIXES):
+                # G27: SSRF sink -- fetch a URL that may come from the client
+                self.bump("n_fetch")
+            if name.startswith(XXE_PREFIXES):
+                # G13: XML parser surface -- entity expansion is a config,
+                # not a name; this ranks where parsers are constructed.
+                self.bump("n_xxe_parser")
+            if base == "open" and node.args \
+                    and not isinstance(node.args[0], ast.Constant):
+                # G12: open() with a non-literal path -- the traversal sink
+                self.bump("n_dynamic_open")
+            if name.startswith(ZIP_PREFIX):
+                # G29: zipfile access -- entry containment is a check, not a
+                # name; this ranks where archives are read.
+                self.bump("n_zip_read")
+            if base in LOG_LEVELS and ("logging." in name or "logger" in name):
+                # G14: a logging call -- injection into the log line is the
+                # risk when the message contains request input.
+                self.bump("n_log_call")
             if base == "raises" and name.startswith(("pytest.",)):
                 # bugbear B017: pytest.raises(Exception) -- a broad literal
                 # argument that will catch almost anything (and pass).
@@ -2932,6 +3042,14 @@ class PythonAnalyzer(Analyzer):
         ("n_open_no_encoding", "INT NOT NULL DEFAULT 0"),   # PLW1514
         ("n_naive_datetime", "INT NOT NULL DEFAULT 0"),     # DTZ003/DTZ005
         ("n_request_no_timeout", "INT NOT NULL DEFAULT 0"), # S113/ASYNC210
+        ("n_redirect", "INT NOT NULL DEFAULT 0"),            # G26 open redirect
+        # -- OWASP P2 pack: sinks for the input-surface family ---------------
+        ("n_fetch", "INT NOT NULL DEFAULT 0"),               # G27 SSRF sink
+        ("n_xxe_parser", "INT NOT NULL DEFAULT 0"),          # G13 XML parsers
+        ("n_dynamic_open", "INT NOT NULL DEFAULT 0"),        # G12 open with var
+        ("n_upload_save", "INT NOT NULL DEFAULT 0"),         # G28 save() on files
+        ("n_zip_read", "INT NOT NULL DEFAULT 0"),            # G29 zipfile access
+        ("n_log_call", "INT NOT NULL DEFAULT 0"),            # G14 logging calls
         ("n_assert_in_loop", "INT NOT NULL DEFAULT 0"),
         ("n_subprocess", "INT NOT NULL DEFAULT 0"),         # S603
         ("n_format_in_loop", "INT NOT NULL DEFAULT 0"),     # PERF
@@ -3037,6 +3155,24 @@ CREATE TABLE module_vars(
      name TEXT NOT NULL,
      line INT NOT NULL
  ) STRICT;
+
+ CREATE TABLE user_input_sites(
+     id INTEGER PRIMARY KEY,
+     symbol_id INT REFERENCES symbols(id),
+     file_id INT NOT NULL REFERENCES files(id),
+     var TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     line INT NOT NULL,
+     in_loop INT NOT NULL DEFAULT 0
+ ) STRICT;
+
+ CREATE TABLE secret_candidates(
+     id INTEGER PRIMARY KEY,
+     symbol_id INT REFERENCES symbols(id),
+     file_id INT NOT NULL REFERENCES files(id),
+     value TEXT NOT NULL,
+     line INT NOT NULL
+ ) STRICT;
  """
 
     INDEX_EXT = r"""
@@ -3047,6 +3183,8 @@ CREATE INDEX idx_hand_empty ON handlers(symbol_id) WHERE is_empty=1;
 CREATE INDEX idx_dyn_kind ON dynamic_sites(kind, symbol_id);
 CREATE INDEX idx_comp_sym ON comprehensions(symbol_id, kind);
 CREATE INDEX idx_mv_mutable ON module_vars(file_id) WHERE is_mutable_container=1;
+CREATE INDEX idx_uinput_kind ON user_input_sites(kind, symbol_id);
+CREATE INDEX idx_uinput_var ON user_input_sites(var);
 CREATE INDEX idx_fn_mutdef ON symbols(n_mutable_default DESC, name, file_id)
     WHERE n_mutable_default>0;
 CREATE INDEX idx_fn_bare ON symbols(n_bare_except DESC, name, file_id)
@@ -3403,6 +3541,12 @@ WHERE x.id = c.symbol_id;
         for lkind, lval, lline, lmagic in fm.literals:
             bufs.literals.append((sid, rec.fid, lkind, lval[:200],
                                   lline, int(lmagic)))
+        for rline, rvar, rkind, rloop in fm.input_sites:
+            bufs.rows("user_input_sites").append(
+                (sid, rec.fid, rvar, rkind, rline, rloop))
+        for sval, sline in fm.secrets:
+            bufs.rows("secret_candidates").append(
+                (sid, rec.fid, sval, sline))
 
         self.by_name.setdefault(name, []).append(
             (sid, rec.fid, rec.mid, class_stack[-1] if class_stack else ""))
@@ -3449,6 +3593,12 @@ WHERE x.id = c.symbol_id;
             "top-level statements of %s" % rec.rel, "", "", m)
         self._hazards_and_calls(fm, sid, rec, bufs)
         self._dynamic_sites(tree, sid, rec, bufs)
+        for rline, rvar, rkind, rloop in fm.input_sites:
+            bufs.rows("user_input_sites").append(
+                (sid, rec.fid, rvar, rkind, rline, rloop))
+        for sval, sline in fm.secrets:
+            bufs.rows("secret_candidates").append(
+                (sid, rec.fid, sval, sline))
         self.by_qual["%s:<module>" % rec.rel] = sid
 
     def _signature(self, node: ast.AST, name: str) -> str:
@@ -3924,6 +4074,12 @@ WHERE x.id = c.symbol_id;
              "VALUES(?,?,?,?,?,?,?,?,?)"),
             ("all_exports",
              "INSERT INTO all_exports(file_id,name,line) VALUES(?,?,?)"),
+            ("user_input_sites",
+             "INSERT INTO user_input_sites(symbol_id,file_id,var,kind,line,"
+             "in_loop) VALUES(?,?,?,?,?,?)"),
+            ("secret_candidates",
+             "INSERT INTO secret_candidates(symbol_id,file_id,value,line) "
+             "VALUES(?,?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
             if rows:
@@ -4728,10 +4884,10 @@ QUERIES: list[tuple[str, str, str, str]] = [
     """SELECT f.path,
         MAX(i.is_relative * (length(i.target) - length(ltrim(i.target, '.'))
                              )) AS max_depth,
-        SUM(CASE WHEN i.is_relative=1 THEN 1 ELSE 0 END) AS relative_imports,
-        SUM(CASE WHEN i.is_relative=1
-                 AND (length(i.target) - length(ltrim(i.target, '.'))) >= 2
-             THEN 1 ELSE 0 END) AS deep_imports
+        COUNT(*) FILTER (WHERE i.is_relative=1) AS relative_imports,
+        COUNT(*) FILTER (WHERE i.is_relative=1
+                 AND (length(i.target) - length(ltrim(i.target, '.'))) >= 2)
+            AS deep_imports
     FROM imports i JOIN files f ON f.id=i.file_id
     LEFT JOIN modules m ON m.id=f.module_id
     WHERE i.is_relative=1
@@ -4789,6 +4945,186 @@ QUERIES: list[tuple[str, str, str, str]] = [
       AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.fan_in DESC, s.n_request_no_timeout DESC
     LIMIT :lim"""),
+(
+    "open-redirect-surface",
+    "redirect() calls in functions that read request input (OWASP G26)",
+    "ANSWERS functions that call flask/django redirect() AND read request\n"
+    "     input (request.args / request.GET / cookies / headers) -- the shape\n"
+    "     of an unvalidated redirect: return redirect(request.args.get(\"next\")).\n"
+    "ACT validate the target against an allowlist; never forward a\n"
+    "     user-supplied URL.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the redirect, and a constant redirect beside an\n"
+    "     unrelated input read reads as a violation. The argument text is not\n"
+    "     captured, so a fixed target cannot be told from an open one; the\n"
+    "     redirect capture is the bare base name (redirect/redirect_to), so a\n"
+    "     wrapper around redirect is invisible to it.",
+    """SELECT s.name, s.n_redirect AS redirect_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_redirect > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.fan_in DESC, s.n_redirect DESC LIMIT :lim"""),
+(
+    "ssrf-fetch-surface",
+    "Fetch calls in functions that read request input (OWASP G27)",
+    "ANSWERS functions that fetch a URL (requests/httpx/urllib) AND read\n"
+    "     request input -- the shape of server-side request forgery:\n"
+    "     requests.get(request.args.get(\"url\")).\n"
+    "ACT validate the URL scheme and host against an allowlist; never fetch a\n"
+    "     user-supplied URL.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the fetch, and a constant URL beside an unrelated\n"
+    "     input read reads as a violation. The fetch capture is the dotted\n"
+    "     name only: an aiohttp session's bare s.get(...) has no dotted name\n"
+    "     and is invisible; a wrapper around requests is too.",
+    """SELECT s.name, s.n_fetch AS fetch_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_fetch > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_fetch DESC, input_sites DESC LIMIT :lim"""),
+(
+    "hardcoded-secret-candidates",
+    "Credential-shaped string literals (OWASP G07)",
+    "ANSWERS string literals at least 12 chars long whose text names a\n"
+    "     credential (password, token, api_key, secret, bearer, jwt, ...) --\n"
+    "     the literal that a committed secret looks like.\n"
+    "ACT rotate and move to a secret manager; never commit the literal.\n"
+    "MISLEADS a format string or test fixture containing the WORD token/pass\n"
+    "     reads as a candidate (the filter is the literal's own text, not its\n"
+    "     use); values over 200 chars are truncated at capture; a secret\n"
+    "     built from parts or read from an env var is invisible here.\n"
+    "     This is a candidate list, not a verdict.",
+    """SELECT s.name, sc.value AS candidate, sc.line,
+        s.fan_in, f.path || ':' || sc.line AS at
+    FROM secret_candidates sc
+    JOIN symbols s ON s.id = sc.symbol_id
+    JOIN files f ON f.id = sc.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY length(sc.value) DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "xxe-parser-surface",
+    "XML parser construction sites (OWASP G13)",
+    "ANSWERS functions that touch the stdlib XML parsers (xml.etree, lxml,\n"
+    "     xml.dom, xml.sax) -- the surface where entity expansion is decided.\n"
+    "ACT use defusedxml, or disable DTD/entity expansion on the parser.\n"
+    "MISLEADS the parser CONFIG is not modeled: a parser with entities\n"
+    "     disabled ranks the same as one without. The capture is the dotted\n"
+    "     module name, so from xml.etree import ElementTree and a bare\n"
+    "     fromstring() are invisible. defusedxml is deliberately absent.",
+    """SELECT s.name, s.n_xxe_parser AS xml_parsers,
+        s.sloc, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_xxe_parser > 0 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_xxe_parser DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "path-traversal-surface",
+    "open() with a non-literal path in input-reading functions (OWASP G12)",
+    "ANSWERS functions that call open() with a variable path AND read request\n"
+    "     input -- the shape of path traversal: open(request.args.get(\"f\")).\n"
+    "ACT validate the resolved path stays under a configured root; use\n"
+    "     Path.resolve() and a prefix check.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach open(), and a constant-open beside an unrelated\n"
+    "     input read reads as a violation. The path is not analyzed: a\n"
+    "     variable path is assumed suspicious, a literal is not.\n"
+    "     Path(\"x\").read_text and os.path.join shapes are invisible to the\n"
+    "     bare open() capture.",
+    """SELECT s.name, s.n_dynamic_open AS open_sites,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_dynamic_open > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_dynamic_open DESC, input_sites DESC LIMIT :lim"""),
+(
+    "unchecked-upload-surface",
+    "request.files save() with no visible size/type check (OWASP G28)",
+    "ANSWERS functions that save() an uploaded file (request.files[...]) --\n"
+    "     the shape of an unchecked upload: request.files['f'].save(dst).\n"
+    "ACT check extension, MIME and size against an allowlist before saving;\n"
+    "     store outside the web root.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the check may\n"
+    "     happen elsewhere in the function or be missing entirely; the graph\n"
+    "     sees the save, not the validation. A .filename read without a save\n"
+    "     is not flagged; a save on a non-request object whose receiver text\n"
+    "     contains 'files' is a false positive.",
+    """SELECT s.name, s.n_upload_save AS save_calls,
+        COUNT(DISTINCT u.id) AS form_reads,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id AND u.kind = 'form'
+    WHERE s.n_upload_save > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_upload_save DESC, form_reads DESC LIMIT :lim"""),
+(
+    "zip-slip-surface",
+    "zipfile access sites (OWASP G29)",
+    "ANSWERS functions that touch zipfile (ZipFile, extractall, namelist,\n"
+    "     read) -- the surface where an entry name becomes a filesystem path.\n"
+    "ACT validate every entry name against a containment check before\n"
+    "     extraction; reject ../ and absolute paths.\n"
+    "MISLEADS the containment check is not modeled: a function that checks\n"
+    "     each name before extractall ranks the same as one that does not.\n"
+    "     The capture is the dotted zipfile. name, so a bare ZipFile import\n"
+    "     alias is invisible.",
+    """SELECT s.name, s.n_zip_read AS zip_access,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_zip_read > 0 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, s.n_zip_read DESC LIMIT :lim"""),
+(
+    "log-injection-surface",
+    "Logging calls in functions that read request input (OWASP G14)",
+    "ANSWERS functions that call a logging level method (logging.info,\n"
+    "     logger.error, ...) AND read request input -- the shape of log\n"
+    "     forging: logger.info(request.headers.get(\"User-Agent\")).\n"
+    "ACT sanitize newlines and control characters in log messages; never log\n"
+    "     raw request input.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the log call, and a constant message beside an\n"
+    "     unrelated input read reads as a violation. The capture needs\n"
+    "     'logging' or 'logger' in the dotted call name, so a bare\n"
+    "     getLogger().info(...) chain and a different-named logger are\n"
+    "     invisible.",
+    """SELECT s.name, s.n_log_call AS log_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_log_call > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.fan_in DESC, s.n_log_call DESC LIMIT :lim"""),
 (
     "exception-in-loop",
     "try/except inside loop bodies (perflint PERF203)",
@@ -4958,12 +5294,12 @@ QUERIES: list[tuple[str, str, str, str]] = [
     "     ratio is per-file, so a small file with one noqa outranks a big\n"
     "     one with ten.",
     """SELECT f.path,
-        SUM(CASE WHEN mk.kind IN ('NOQA','TYPE: IGNORE',
-                                  'PRAGMA: NO COVER','PYRIGHT: IGNORE')
-                 THEN 1 ELSE 0 END) AS suppressions,
-        SUM(CASE WHEN mk.kind IN ('NOQA','TYPE: IGNORE',
-                                  'PRAGMA: NO COVER','PYRIGHT: IGNORE')
-                 THEN 0 ELSE 1 END) AS todos,
+        COUNT(*) FILTER (WHERE mk.kind IN ('NOQA','TYPE: IGNORE',
+                          'PRAGMA: NO COVER','PYRIGHT: IGNORE'))
+            AS suppressions,
+        COUNT(*) FILTER (WHERE mk.kind NOT IN ('NOQA','TYPE: IGNORE',
+                          'PRAGMA: NO COVER','PYRIGHT: IGNORE'))
+            AS todos,
         COUNT(*) AS markers
     FROM markers mk JOIN files f ON f.id=mk.file_id
     LEFT JOIN modules m ON m.id=f.module_id
