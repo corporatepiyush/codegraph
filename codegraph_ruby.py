@@ -3532,6 +3532,11 @@ SECRET_MIN_LEN = 12
 LOG_LEVELS = frozenset(("debug", "info", "warn", "warning", "error",
                         "fatal", "unknown"))
 
+#: G01: auth-family markers (authenticate_user!, current_user, signed_in,
+#: session access, login).
+AUTH_MARKERS = ("auth", "login", "signed_in", "logged_in", "current_user",
+                "session", "jwt")
+
 CONTROLLER_RE = re.compile(
     r'<\s*(?:\w+::)*(?:ApplicationController|ActionController::(?:Base|API|Metal)|'
     r'Devise::\w+Controller|InheritedResources::Base)\b')
@@ -3780,6 +3785,7 @@ class RubyAnalyzer(TreeSitterAnalyzer):
     ("n_weak_hash", "INT NOT NULL DEFAULT 0"),
     ("n_weak_random", "INT NOT NULL DEFAULT 0"),
     ("n_redirect", "INT NOT NULL DEFAULT 0"),            # G26 redirect_to
+    ("n_auth_call", "INT NOT NULL DEFAULT 0"),           # G01 auth family
     # -- OWASP P2 pack: sinks for the input-surface family ---------------
     ("n_fetch", "INT NOT NULL DEFAULT 0"),               # G27 SSRF sink
     ("n_xxe_parser", "INT NOT NULL DEFAULT 0"),          # G13 XML parsers
@@ -4347,6 +4353,10 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
             # G14: a logging call -- injection into the log line is the risk
             # when the message contains request input.
             st.bump("n_log_call")
+        if any(k in (full + " " + meth).lower() for k in AUTH_MARKERS):
+            # G01: an auth-family call -- the marker that makes the
+            # unauthenticated-input surface query exclude this method.
+            st.bump("n_auth_call")
         elif meth == "open":
             st.bump("n_open_call")
         elif meth == "sleep":
@@ -6410,6 +6420,33 @@ RubyAnalyzer.QUERIES = [
       AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY s.n_log_call DESC, input_sites DESC LIMIT :lim"""),
+(
+    "unauthenticated-input-surface",
+    "Request input read with no auth call in the method (OWASP G01)",
+    "ANSWERS methods that read request input (params, cookies, request) and\n"
+    "     contain NO auth-family call (authenticate_user!, current_user,\n"
+    "     signed_in?, session) -- the surface where a controller action may\n"
+    "     be missing its authorization check.\n"
+    "ACT add the before_action auth callback; verify the action is in the\n"
+    "     protected route group.\n"
+    "MISLEADS auth usually lives in a before_action or ApplicationController\n"
+    "     -- this query sees the action body only, so a fully-protected\n"
+    "     controller still ranks every action as open. A login or public\n"
+    "     action legitimately has no auth. The markers are name-based\n"
+    "     substrings, so a helper wrapping the auth call is invisible and\n"
+    "     counts as open.",
+    """SELECT s.name, COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE u.kind IS NOT NULL AND s.n_auth_call = 0
+      AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY input_sites DESC, s.sloc DESC LIMIT :lim"""),
 (
     "find-each-missed",
     "Model.all.each with a query inside the block",
