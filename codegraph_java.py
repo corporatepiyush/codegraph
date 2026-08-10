@@ -5793,7 +5793,7 @@ WITH fld AS (
     SELECT s.name, s.kind,
         COALESCE(eq.n, 0) AS has_equals,
         COALESCE(hc.n, 0) AS has_hashcode,
-        s.fan_in,
+        s.sloc,
         f.path || ':' || s.line_start AS at
     FROM symbols s
     JOIN files f ON f.id=s.file_id
@@ -5804,7 +5804,8 @@ WITH fld AS (
       AND COALESCE(m.name,'') LIKE :mod
       AND ((COALESCE(eq.n,0) > 0 AND COALESCE(hc.n,0) = 0)
         OR (COALESCE(eq.n,0) = 0 AND COALESCE(hc.n,0) > 0))
-    ORDER BY s.fan_in DESC LIMIT :lim"""),
+    ORDER BY COALESCE(eq.n,0) + COALESCE(hc.n,0) DESC, s.sloc DESC
+    LIMIT :lim"""),
 (
     "thread-sleep-in-lock",
     "Thread.sleep() in a synchronized method or block (SpotBugs SWL)",
@@ -6005,14 +6006,14 @@ WITH fld AS (
         COUNT(DISTINCT c.name) AS distinct_ancestors,
         (SELECT COUNT(*) FROM type_relations tr3
           WHERE tr3.child_id=s.id AND tr3.kind='extends') AS defs,
-        s.fan_in, f.path || ':' || s.line_start AS at
+        f.path || ':' || s.line_start AS at
     FROM chain c JOIN symbols s ON s.id=c.sym
     JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.kind='class' AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
-    ORDER BY depth DESC, s.fan_in DESC LIMIT :lim"""),
+    ORDER BY depth DESC, distinct_ancestors DESC LIMIT :lim"""),
 (
     "di-bottleneck",
     "Annotation-heavy classes with the most inbound dependents",
@@ -6275,7 +6276,7 @@ WITH fld AS (
         ('Runtime.halt','no shutdown hooks, no finally'),
         ('Unsafe.getUnsafe','deprecated memory access; use VarHandle'))
     SELECT f.path, s.name AS caller, h.pattern AS banned_api, banned.why,
-        h.n, s.fan_in
+        h.n
     FROM hazards h
     JOIN banned ON banned.name = h.pattern
     JOIN symbols s ON s.id = h.symbol_id
@@ -6283,7 +6284,7 @@ WITH fld AS (
     LEFT JOIN modules m ON m.id = s.module_id
     WHERE f.is_generated = 0 AND f.is_test = 0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.fan_in DESC
+    ORDER BY h.n DESC
     LIMIT :lim"""),
 (
     "lock-on-boxed",
@@ -6771,14 +6772,14 @@ JavaAnalyzer.METRICS = [
     "     implements Serializable, the contract expects one.",
     """SELECT s.name, s.kind,
         s.is_serializable, s.has_serial_uid,
-        s.fan_in,
+        s.sloc,
         f.path || ':' || s.line_start AS at
     FROM symbols s JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.is_serializable=1 AND s.has_serial_uid=0
       AND s.kind IN ('class','interface') AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.fan_in DESC LIMIT :lim"""),
+    ORDER BY s.sloc DESC LIMIT :lim"""),
 (
     "print-stacktrace-leak",
     "printStackTrace() instead of proper logging (PMD/sonar)",

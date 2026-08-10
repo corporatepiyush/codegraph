@@ -6077,14 +6077,14 @@ JavaScriptAnalyzer.QUERIES = [
     "     operand begins with window./globalThis./global.; `window[\"x\"]`\n"
     "     subscript form, `global.x` inside a worker where it is legitimate,\n"
     "     and assignments performed by CALLED code are all invisible.",
-    """SELECT s.name, s.n_global_write AS global_writes,
-        s.kind, s.sloc, s.fan_in,
+    """    SELECT s.name, s.n_global_write AS global_writes,
+        s.kind, s.sloc,
         f.path || ':' || s.line_start AS at
     FROM symbols s JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.n_global_write > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.n_global_write DESC, s.fan_in DESC LIMIT :lim"""),
+    ORDER BY s.n_global_write DESC, s.sloc DESC LIMIT :lim"""),
 (
     "reexport-propagation",
     "Barrel files re-exporting imported symbols",

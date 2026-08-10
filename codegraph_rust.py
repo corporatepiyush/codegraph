@@ -5925,14 +5925,14 @@ RustAnalyzer.QUERIES = [
     "     kept for support deserves a comment and a log target instead.\n"
     "MISLEADS name-based on the invocation capture: `eprintln!` is not dbg!\n"
     "     and does not appear; test files are excluded by is_test.",
-    """SELECT f.path, s.name AS fn, ma.line, s.fan_in
+    """    SELECT f.path, s.name AS fn, ma.line, s.sloc
     FROM macros ma
     JOIN symbols s ON s.id = ma.symbol_id
     JOIN files f ON f.id = ma.file_id
     LEFT JOIN modules m ON m.id = s.module_id
     WHERE ma.kind = 'invocation' AND ma.name = 'dbg'
       AND s.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.fan_in DESC
+    ORDER BY s.sloc DESC
     LIMIT :lim"""),
 (
     "unsafe-in-loop",

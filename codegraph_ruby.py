@@ -6128,8 +6128,8 @@ RubyAnalyzer.QUERIES = [
     "     (the flag looks at the literal argument, not data flow); a\n"
     "     controller that scopes first then finds is still reported if the\n"
     "     find call's own argument is params-derived.",
-    """SELECT f.path, s.name, aq.model, aq.api, aq.build_kind, aq.loop_depth,
-        s.fan_in
+    """    SELECT f.path, s.name, aq.model, aq.api, aq.build_kind,
+        aq.line
     FROM ar_queries aq
     JOIN symbols s ON s.id = aq.symbol_id
     JOIN files f ON f.id = aq.file_id
@@ -6137,7 +6137,7 @@ RubyAnalyzer.QUERIES = [
     WHERE aq.from_params = 1
       AND aq.api IN ('find','find_by','find_by!','first','last','take','where')
       AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.fan_in DESC
+    ORDER BY aq.api, aq.line
     LIMIT :lim"""),
 (
     "find-each-missed",
