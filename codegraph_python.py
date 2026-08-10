@@ -2346,6 +2346,11 @@ SECRET_MIN_LEN = 12
 LOG_LEVELS = frozenset(("debug", "info", "warning", "warn", "error",
                         "exception", "critical"))
 
+#: G01: auth-family markers. A function that reads request input with no
+#: marker in the same function is the unauthenticated-input surface.
+AUTH_MARKERS = ("login", "auth", "token", "jwt", "authenticate",
+                "authorize", "current_user", "session.get")
+
 #: G27: HTTP client callers. `requests.` covers get/post/put/patch/delete;
 #: `urllib.request.urlopen` and `urllib.urlopen` are the stdlib shapes;
 #: `httpx.` and `http.client.` are the modern ones. A bare `s.get(...)` on
@@ -2840,6 +2845,10 @@ class FunctionMetrics(ast.NodeVisitor):
                 # G14: a logging call -- injection into the log line is the
                 # risk when the message contains request input.
                 self.bump("n_log_call")
+            if any(k in name.lower() for k in AUTH_MARKERS):
+                # G01: an auth-family call -- the marker that makes the
+                # unauthenticated-input surface query exclude this function.
+                self.bump("n_auth_call")
             if base == "raises" and name.startswith(("pytest.",)):
                 # bugbear B017: pytest.raises(Exception) -- a broad literal
                 # argument that will catch almost anything (and pass).
@@ -3043,6 +3052,7 @@ class PythonAnalyzer(Analyzer):
         ("n_naive_datetime", "INT NOT NULL DEFAULT 0"),     # DTZ003/DTZ005
         ("n_request_no_timeout", "INT NOT NULL DEFAULT 0"), # S113/ASYNC210
         ("n_redirect", "INT NOT NULL DEFAULT 0"),            # G26 open redirect
+        ("n_auth_call", "INT NOT NULL DEFAULT 0"),           # G01 auth family
         # -- OWASP P2 pack: sinks for the input-surface family ---------------
         ("n_fetch", "INT NOT NULL DEFAULT 0"),               # G27 SSRF sink
         ("n_xxe_parser", "INT NOT NULL DEFAULT 0"),          # G13 XML parsers
@@ -5124,7 +5134,33 @@ QUERIES: list[tuple[str, str, str, str]] = [
     WHERE s.n_log_call > 0 AND u.kind IS NOT NULL
       AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
-    ORDER BY s.fan_in DESC, s.n_log_call DESC LIMIT :lim"""),
+    ORDER BY s.n_log_call DESC, input_sites DESC LIMIT :lim"""),
+(
+    "unauthenticated-input-surface",
+    "Request input read with no auth call in the function (OWASP G01)",
+    "ANSWERS functions that read request input and contain NO auth-family\n"
+    "     call (login_required, is_authenticated, current_user, session.get,\n"
+    "     jwt, token) -- the surface where a request handler may be missing\n"
+    "     its authorization check.\n"
+    "ACT add the auth/decorator check; verify the endpoint is in the\n"
+    "     protected route group.\n"
+    "MISLEADS auth may live on a DECORATOR, a base view class, or a\n"
+    "     middleware -- same-function co-occurrence only, so a protected\n"
+    "     handler whose check lives outside the body reads as open. A login\n"
+    "     or registration endpoint legitimately has no auth. The markers are\n"
+    "     name-based substrings, so a helper wrapping the auth call is\n"
+    "     invisible and counts as open.",
+    """SELECT s.name, COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE u.kind IS NOT NULL AND s.n_auth_call = 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY input_sites DESC, s.sloc DESC LIMIT :lim"""),
 (
     "exception-in-loop",
     "try/except inside loop bodies (perflint PERF203)",
