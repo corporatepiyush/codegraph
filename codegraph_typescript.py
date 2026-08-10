@@ -2925,6 +2925,10 @@ class TreeSitterAnalyzer(Analyzer):
             # G21: a console call -- sensitive data in logs is the risk when
             # the message contains request input.
             st.bump("n_console_log")
+        if any(k in name.lower() for k in AUTH_MARKERS):
+            # G01: an auth-family call -- the marker that makes the
+            # unauthenticated-input surface query exclude this function.
+            st.bump("n_auth_call")
         if _b in ("readFileSync", "writeFileSync", "existsSync"):
             st.bump("n_fs_sync")
         if _b in ("push", "concat", "unshift") and loop_depth:
@@ -3394,6 +3398,10 @@ SECRET_MIN_LEN = 12
 LOG_LEVELS = frozenset(("debug", "info", "warn", "warning", "error",
                         "fatal", "trace", "log"))
 
+#: G01: auth-family markers (passport, isAuthenticated, jwt, login).
+AUTH_MARKERS = ("auth", "login", "jwt", "isauthenticated", "passport",
+                "session")
+
 class TypeScriptAnalyzer(TreeSitterAnalyzer):
     LANG = "typescript"
     TARGET = "TypeScript 7.0 (own parser; tsc has no public API before 7.1)"
@@ -3559,6 +3567,7 @@ class TypeScriptAnalyzer(TreeSitterAnalyzer):
         ("dom_in_loop", "INT NOT NULL DEFAULT 0"),
         ("n_child_process", "INT NOT NULL DEFAULT 0"),
         ("n_redirect", "INT NOT NULL DEFAULT 0"),          # G26 location.href
+        ("n_auth_call", "INT NOT NULL DEFAULT 0"),         # G01 auth family
         # -- OWASP P2 pack: sinks for the input-surface family ---------------
         ("n_fetch", "INT NOT NULL DEFAULT 0"),             # G27 SSRF sink
         ("n_dynamic_open", "INT NOT NULL DEFAULT 0"),      # G12 fs with var
@@ -5825,7 +5834,31 @@ TypeScriptAnalyzer.QUERIES = [
     WHERE s.n_console_log > 0 AND u.kind IS NOT NULL
       AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
-    ORDER BY s.n_console_log DESC, input_sites DESC LIMIT :lim""")
+    ORDER BY s.n_console_log DESC, input_sites DESC LIMIT :lim"""),
+(
+    "unauthenticated-input-surface",
+    "Request input read with no auth call in the function (OWASP G01)",
+    "ANSWERS functions that read request input and contain NO auth-family\n"
+    "     call (passport, isAuthenticated, jwt, login) -- the surface where\n"
+    "     a handler may be missing its authorization check.\n"
+    "ACT add the auth middleware call; verify the route is in the protected\n"
+    "     group.\n"
+    "MISLEADS auth usually lives in MIDDLEWARE or a router guard -- this\n"
+    "     query sees the handler only, so a fully-protected app still ranks\n"
+    "     every handler as open. A login or public endpoint legitimately has\n"
+    "     no auth. The markers are name-based substrings, so a wrapper\n"
+    "     around the auth call is invisible and counts as open.",
+    """SELECT s.name, COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE u.kind IS NOT NULL AND s.n_auth_call = 0
+      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY input_sites DESC, s.sloc DESC LIMIT :lim""")
 ]
 
 TypeScriptAnalyzer.METRICS = [
