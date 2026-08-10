@@ -2239,6 +2239,10 @@ class BodyStats:
     #: (callee_text, line, is_dynamic, in_loop)
     calls: list[tuple[str, int, bool, bool]] = dc_field(default_factory=list)
     literals: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
+    #: (var_text, kind, line, in_loop) -- HttpServletRequest input reads
+    input_sites: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
+    #: (value, line) -- G07 credential-shaped string literals
+    secrets: list[tuple[str, int]] = dc_field(default_factory=list)
 
     def bump(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -2466,6 +2470,7 @@ class TreeSitterAnalyzer(Analyzer):
                 continue
             self.add_pending(sid, rec.fid, rec.mid, text, line, "")
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_input_sites(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -2585,6 +2590,7 @@ class TreeSitterAnalyzer(Analyzer):
             self.add_pending(sid, rec.fid, rec.mid, text, line,
                                  scope.type_name)
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_input_sites(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -2985,6 +2991,15 @@ class TreeSitterAnalyzer(Analyzer):
                 e[1] += 1
         for pattern, (category, n, line) in seen.items():
             bufs.add_hazard(sid, pattern[:120], category, n, line)
+
+    def emit_input_sites(self, stats: BodyStats, sid: int, rec: FileRec,
+                         bufs: Buffers) -> None:
+        for var, kind, line, in_loop in stats.input_sites:
+            bufs.rows("user_input_sites").append(
+                (sid, rec.fid, var, kind, line, int(in_loop)))
+        for sval, sline in stats.secrets:
+            bufs.rows("secret_candidates").append(
+                (sid, rec.fid, sval, sline))
 
     def hazard_of(self, callee: str) -> Optional[tuple[str, str]]:
         """(pattern, category) for a call, or None. Languages override."""
@@ -3558,6 +3573,38 @@ identifier this super field_access scoped_identifier type_identifier
 scoped_type_identifier generic_type
 """.split())
 
+#: G07: a string literal that names a credential (mirrors the other packs).
+SECRET_RE = re.compile(
+    r'(api[_-]?key|apikey|secret|password|passwd|pwd|token|bearer|'
+    r'access[_-]?key|private[_-]?key|client[_-]?secret|'
+    r'auth[_-]?token|jwt|credential|smtp[_-]?pass|db[_-]?pass|'
+    r'sk_live|rk_live|pk_live|ghp_|xoxb-|AKIA)', re.I)
+SECRET_MIN_LEN = 12
+
+#: G13: XML parser entry points -- the surface where entity expansion is
+#: decided. Configuration is the query's question, not this counter's.
+XXE_ENTRY_BASES = frozenset(("newDocumentBuilder", "newSAXParser",
+                             "newXMLReader", "createXMLStreamReader",
+                             "createSAXParser"))
+
+#: G29: archive constructors -- the surface where an entry name becomes a
+#: filesystem path.
+ZIP_CTOR_PREFIX = ("new Zip", "new Jar")
+
+#: HttpServletRequest receivers and input-access method -> site kind.
+#: Receiver-name restricted: an unqualified getParameter() is a helper on
+#: some other object and not input by itself.
+JAVA_REQ_RECEIVERS = frozenset(
+    ("request", "req", "httpRequest", "servletRequest"))
+JAVA_INPUT_KINDS = {
+    "getParameter": "query", "getParameterMap": "query",
+    "getParameterValues": "query",
+    "getHeader": "header", "getHeaders": "header",
+    "getCookies": "cookie",
+    "getPart": "form", "getParts": "form",
+    "getInputStream": "body", "getReader": "body",
+}
+
 BROAD_EXCEPTIONS = frozenset(
     "Exception Throwable RuntimeException Error".split())
 
@@ -3749,6 +3796,10 @@ class JavaAnalyzer(TreeSitterAnalyzer):
     ("n_parse_no_radix", "INT NOT NULL DEFAULT 0"),
     ("n_equals_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_weak_random", "INT NOT NULL DEFAULT 0"),
+    ("n_redirect", "INT NOT NULL DEFAULT 0"),            # G26 sendRedirect
+    # -- OWASP P2 pack: sinks for the input-surface family ---------------
+    ("n_xxe_parser", "INT NOT NULL DEFAULT 0"),          # G13 XML parsers
+    ("n_zip_read", "INT NOT NULL DEFAULT 0"),            # G29 archive ctor
     ("n_timeout_set", "INT NOT NULL DEFAULT 0"),
     ("n_executor_create", "INT NOT NULL DEFAULT 0"),
     ("n_submit_in_loop", "INT NOT NULL DEFAULT 0"),
@@ -3861,10 +3912,31 @@ CREATE TABLE jpms_directives(
     is_static INT NOT NULL DEFAULT 0,
     line INT NOT NULL DEFAULT 0
 ) STRICT;
+
+CREATE TABLE user_input_sites(
+    id INTEGER PRIMARY KEY,
+    symbol_id INT REFERENCES symbols(id),
+    file_id INT NOT NULL REFERENCES files(id),
+    var TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    line INT NOT NULL,
+    in_loop INT NOT NULL DEFAULT 0
+) STRICT;
+
+CREATE TABLE secret_candidates(
+    id INTEGER PRIMARY KEY,
+    symbol_id INT REFERENCES symbols(id),
+    file_id INT NOT NULL REFERENCES files(id),
+    value TEXT NOT NULL,
+    line INT NOT NULL
+) STRICT;
 """
 
     INDEX_EXT = r"""
 CREATE INDEX idx_tr_parent ON type_relations(parent_name, kind);
+CREATE INDEX idx_uis_sym ON user_input_sites(symbol_id, kind);
+CREATE INDEX idx_uis_var ON user_input_sites(var);
+CREATE INDEX idx_secret_sym ON secret_candidates(symbol_id);
 CREATE INDEX idx_tr_child ON type_relations(child_name);
 CREATE INDEX idx_tr_sym ON type_relations(child_id);
 CREATE INDEX idx_ovr_name ON overrides(method_name, owner_type);
@@ -4123,6 +4195,10 @@ UPDATE symbols SET arity_rank = CASE
                 st.bump("n_dynamic_calls")
                 return
             st.calls.append(("new " + tname, line, False, bool(loop_depth)))
+            if tname.startswith("Zip") or tname.startswith("Jar"):
+                # G29: archive construction -- entry containment is a check,
+                # not a name; this ranks where archives are opened.
+                st.bump("n_zip_read")
             if loop_depth:
                 st.bump("alloc_in_loop")
                 if tname in ("Integer", "Long", "Double", "Float", "Boolean",
@@ -4207,6 +4283,21 @@ UPDATE symbols SET arity_rank = CASE
             st.bump("n_read_object")             # OBJECT_DESERIALIZATION
         if _b in ("loadLibrary", "load") and "System" in full:
             st.bump("n_load_library")
+        if recv in JAVA_REQ_RECEIVERS:
+            kind = JAVA_INPUT_KINDS.get(base)
+            if kind is not None:
+                st.input_sites.append(
+                    (full[:120], kind, line, bool(loop_depth)))
+        if base == "sendRedirect":
+            st.bump("n_redirect")                 # G26 open-redirect sink
+        if base in XXE_ENTRY_BASES:
+            # G13: XML parser construction -- entity expansion is a config,
+            # not a name; this ranks where parsers are built.
+            st.bump("n_xxe_parser")
+        if full.startswith(ZIP_CTOR_PREFIX):
+            # G29: archive construction -- entry containment is a check, not
+            # a name; this ranks where archives are opened.
+            st.bump("n_zip_read")
         st.calls.append((full[:200], line, False, bool(loop_depth)))
 
         # -- per-call metric columns, keyed on the simple name --------------
@@ -4306,6 +4397,9 @@ UPDATE symbols SET arity_rank = CASE
                   loop_depth: int) -> None:
         if node.type == "character_literal":
             return
+        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+            # G07: credential-shaped literal -- candidate, not verdict
+            st.secrets.append((text[:200], node.start_point[0] + 1))
         if node.type == "string_literal" and text.startswith('"""'):
             # modern-idiom-candidates: a text block.
             st.bump("n_modern_idioms")
@@ -5049,6 +5143,12 @@ UPDATE symbols SET arity_rank = CASE
             ("jpms_directives",
              "INSERT INTO jpms_directives(file_id,kind,module_name,target,"
              "is_transitive,is_static,line) VALUES(?,?,?,?,?,?,?)"),
+            ("user_input_sites",
+             "INSERT INTO user_input_sites(symbol_id,file_id,var,kind,line,"
+             "in_loop) VALUES(?,?,?,?,?,?)"),
+            ("secret_candidates",
+             "INSERT INTO secret_candidates(symbol_id,file_id,value,line) "
+             "VALUES(?,?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
             if rows:
@@ -5619,6 +5719,33 @@ WITH statics AS (
     ORDER BY cal.max_loop_depth DESC, cle.n_query_calls DESC,
         cal.fan_in DESC LIMIT :lim"""),
 (
+    "sql-concat-surface",
+    "SQL activity beside string-built query text (OWASP G09)",
+    "ANSWERS functions that both execute SQL (a sql-category hazard call) and\n"
+    "     carry query activity -- the surface where a query is assembled by\n"
+    "     concatenation instead of parameters.\n"
+    "ACT use PreparedStatement placeholders; never splice a variable into a\n"
+    "     query string.\n"
+    "MISLEADS n_query_calls is ONE counter for two shapes: query-method calls\n"
+    "     AND string literals with SQL text whose parent is a concatenation.\n"
+    "     The concat bump cannot be isolated in SQL, so a function with only\n"
+    "     constant queries ranks the same as one building them -- same-function\n"
+    "     co-occurrence, NOT data flow. Bare execute/flush are absent from the\n"
+    "     sql hazards by design (Executor.execute / Channel.flush in\n"
+    "     event-driven code would flood the rows). Resolution is name-based.",
+    """SELECT s.name, h.pattern AS sink, h.n AS sql_hazards,
+        s.n_query_calls AS query_calls,
+        s.query_in_loop AS query_loops,
+        s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN hazards h ON h.symbol_id = s.id AND h.category = 'sql'
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_query_calls > 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, h.n DESC LIMIT :lim"""),
+(
     "false-sharing-and-escape",
     "Contended counters on one cache line, and allocations that escape",
     "ANSWERS two things the JIT cannot fix for you. False sharing: several\n"
@@ -5639,9 +5766,8 @@ WITH statics AS (
 WITH fld AS (
         SELECT symbol_id AS tid,
                COUNT(DISTINCT ordinal) AS mutable_fields,
-               SUM(CASE WHEN type IN ('int','long','boolean','short','byte',
-                                      'char','float','double')
-                        THEN 1 ELSE 0 END) AS primitive_fields
+               COUNT(*) FILTER (WHERE type IN ('int','long','boolean','short',
+                        'byte','char','float','double')) AS primitive_fields
         FROM fields
         WHERE is_const=0 AND is_static=0
         GROUP BY symbol_id
@@ -5959,6 +6085,115 @@ WITH fld AS (
     WHERE s.n_weak_random > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.fan_in DESC, s.n_weak_random DESC LIMIT :lim"""),
+(
+    "weak-random-surface",
+    "new Random() / Math.random construction sites (OWASP G06)",
+    "ANSWERS the constructor-level use of predictable randomness: new Random()\n"
+    "     or Math.random() -- the sites where a token, ID or key could be\n"
+    "     predicted. The companion weak-random query ranks the method-call\n"
+    "     surface; this one ranks the construction surface.\n"
+    "ACT replace with SecureRandom for anything security-sensitive.\n"
+    "MISLEADS the graph sees the call, not its purpose: Random for simulation,\n"
+    "     testing or load balancing is correct. \"Security-adjacent\" context is\n"
+    "     NOT modeled -- this is a surface, not a verdict. new SecureRandom is\n"
+    "     excluded (it IS the fix). n_weak_random additionally counts\n"
+    "     Random.nextInt/nextLong/Math.random calls AND falsely flags\n"
+    "     SecureRandom.getInstance (a find-sec-bugs PREDICTABLE_RANDOM\n"
+    "     heuristic), which is why this query reads the hazards table instead.",
+    """SELECT s.name, h.n AS random_sites,
+        s.n_weak_random AS random_calls,
+        s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN hazards h ON h.symbol_id = s.id
+       AND h.pattern IN ('new Random','Math.random')
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, h.n DESC LIMIT :lim"""),
+(
+    "open-redirect-surface",
+    "sendRedirect calls in methods that read request input (OWASP G26)",
+    "ANSWERS methods that call response.sendRedirect AND read HttpServletRequest\n"
+    "     input (getParameter / getHeader / getCookies) -- the shape of an\n"
+    "     unvalidated redirect: sendRedirect(request.getParameter(\"next\")).\n"
+    "ACT validate the target against an allowlist; never forward a\n"
+    "     user-supplied URL.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the redirect, and a constant redirect beside an\n"
+    "     unrelated input read reads as a violation. The argument text is not\n"
+    "     captured, so a fixed target cannot be told from an open one. The\n"
+    "     sink is the bare sendRedirect base name, and the source is the\n"
+    "     receiver set {request, req, httpRequest, servletRequest} -- an\n"
+    "     input flow through a derived variable is invisible to both.",
+    """SELECT s.name, s.n_redirect AS redirect_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_redirect > 0 AND u.kind IS NOT NULL
+      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.fan_in DESC, s.n_redirect DESC LIMIT :lim"""),
+(
+    "hardcoded-secret-candidates",
+    "Credential-shaped string literals (OWASP G07)",
+    "ANSWERS string literals at least 12 chars long whose text names a\n"
+    "     credential (password, token, api_key, secret, bearer, jwt, ...) --\n"
+    "     the literal that a committed secret looks like.\n"
+    "ACT rotate and move to a secret manager; never commit the literal.\n"
+    "MISLEADS a format string or test fixture containing the WORD token/pass\n"
+    "     reads as a candidate (the filter is the literal's own text, not its\n"
+    "     use); values over 200 chars are truncated at capture; a secret\n"
+    "     built from parts or read from an env var is invisible here.\n"
+    "     This is a candidate list, not a verdict.",
+    """SELECT s.name, sc.value AS candidate, sc.line,
+        f.path || ':' || sc.line AS at
+    FROM secret_candidates sc
+    JOIN symbols s ON s.id = sc.symbol_id
+    JOIN files f ON f.id = sc.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY length(sc.value) DESC LIMIT :lim"""),
+(
+    "xxe-parser-surface",
+    "XML parser construction sites (OWASP G13)",
+    "ANSWERS methods that construct a parser (DocumentBuilderFactory,\n"
+    "     SAXParserFactory, XMLReader, XMLInputFactory) -- the surface where\n"
+    "     entity expansion is decided.\n"
+    "ACT disable external entities and DTDs (FEATURE_SECURE_PROCESSING,\n"
+    "     disallow-doctype-decl) on every parser.\n"
+    "MISLEADS the parser CONFIG is not modeled: a parser with entities\n"
+    "     disabled ranks the same as one without. The capture is the bare\n"
+    "     entry method name, so a factory wrapped in a helper is invisible.",
+    """SELECT s.name, s.n_xxe_parser AS xml_parsers,
+        s.sloc, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_xxe_parser > 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_xxe_parser DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "zip-slip-surface",
+    "Archive construction sites (OWASP G29)",
+    "ANSWERS methods that construct ZipFile / ZipInputStream / JarFile -- the\n"
+    "     surface where an entry name becomes a filesystem path.\n"
+    "ACT validate every entry name against a containment check before\n"
+    "     extraction; reject ../ and absolute paths.\n"
+    "MISLEADS the containment check is not modeled: a method that checks each\n"
+    "     name before extraction ranks the same as one that does not. The\n"
+    "     capture is the constructor name, so a zip helper wrapped in another\n"
+    "     class is invisible.",
+    """SELECT s.name, s.n_zip_read AS zip_access,
+        s.sloc, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_zip_read > 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_zip_read DESC, s.sloc DESC LIMIT :lim"""),
 (
     "overridden-not-annotated",
     "Method overrides a parent but @Override annotation is missing (PMD/sonar)",
