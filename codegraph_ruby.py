@@ -2237,6 +2237,10 @@ class BodyStats:
     #: (callee_text, line, is_dynamic, in_loop)
     calls: list[tuple[str, int, bool, bool]] = dc_field(default_factory=list)
     literals: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
+    #: (var_text, kind, line, in_loop) -- params/cookies/request reads
+    input_sites: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
+    #: (value, line) -- G07 credential-shaped string literals
+    secrets: list[tuple[str, int]] = dc_field(default_factory=list)
 
     def bump(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -2464,6 +2468,7 @@ class TreeSitterAnalyzer(Analyzer):
                 continue
             self.add_pending(sid, rec.fid, rec.mid, text, line, "")
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_input_sites(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -2583,6 +2588,7 @@ class TreeSitterAnalyzer(Analyzer):
             self.add_pending(sid, rec.fid, rec.mid, text, line,
                                  scope.type_name)
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_input_sites(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -2983,6 +2989,15 @@ class TreeSitterAnalyzer(Analyzer):
                 e[1] += 1
         for pattern, (category, n, line) in seen.items():
             bufs.add_hazard(sid, pattern[:120], category, n, line)
+
+    def emit_input_sites(self, stats: BodyStats, sid: int, rec: FileRec,
+                         bufs: Buffers) -> None:
+        for var, kind, line, in_loop in stats.input_sites:
+            bufs.rows("user_input_sites").append(
+                (sid, rec.fid, var, kind, line, int(in_loop)))
+        for sval, sline in stats.secrets:
+            bufs.rows("secret_candidates").append(
+                (sid, rec.fid, sval, sline))
 
     def hazard_of(self, callee: str) -> Optional[tuple[str, str]]:
         """(pattern, category) for a call, or None. Languages override."""
@@ -3498,6 +3513,25 @@ SQL_RE = re.compile(
     r'WHERE\s|JOIN\s|ORDER\s+BY|GROUP\s+BY|HAVING\s|UNION\s|'
     r'CREATE\s+TABLE|DROP\s+TABLE|ALTER\s+TABLE|TRUNCATE\s)', re.I)
 
+#: Rails request-input member -> site kind for user_input_sites. Keys are
+#: the object text of an element_reference (`params[:id]`) or the member
+#: after `request.` (`request.headers['X']`).
+REQ_INDEX_KINDS = {"params": "query", "cookies": "cookie"}
+REQ_MEMBER_KINDS = {"headers": "header", "query_parameters": "query",
+                    "request_parameters": "body"}
+
+#: G07: a string literal that names a credential (mirrors the Python pack).
+SECRET_RE = re.compile(
+    r'(api[_-]?key|apikey|secret|password|passwd|pwd|token|bearer|'
+    r'access[_-]?key|private[_-]?key|client[_-]?secret|'
+    r'auth[_-]?token|jwt|credential|smtp[_-]?pass|db[_-]?pass|'
+    r'sk_live|rk_live|pk_live|ghp_|xoxb-|AKIA)', re.I)
+SECRET_MIN_LEN = 12
+
+#: G14: logger level methods (Rails.logger.info / logger.error / ...).
+LOG_LEVELS = frozenset(("debug", "info", "warn", "warning", "error",
+                        "fatal", "unknown"))
+
 CONTROLLER_RE = re.compile(
     r'<\s*(?:\w+::)*(?:ApplicationController|ActionController::(?:Base|API|Metal)|'
     r'Devise::\w+Controller|InheritedResources::Base)\b')
@@ -3745,6 +3779,13 @@ class RubyAnalyzer(TreeSitterAnalyzer):
     ("n_raw_sql", "INT NOT NULL DEFAULT 0"),
     ("n_weak_hash", "INT NOT NULL DEFAULT 0"),
     ("n_weak_random", "INT NOT NULL DEFAULT 0"),
+    ("n_redirect", "INT NOT NULL DEFAULT 0"),            # G26 redirect_to
+    # -- OWASP P2 pack: sinks for the input-surface family ---------------
+    ("n_fetch", "INT NOT NULL DEFAULT 0"),               # G27 SSRF sink
+    ("n_xxe_parser", "INT NOT NULL DEFAULT 0"),          # G13 XML parsers
+    ("n_dynamic_open", "INT NOT NULL DEFAULT 0"),        # G12 File.open with var
+    ("n_zip_read", "INT NOT NULL DEFAULT 0"),            # G29 Zip:: access
+    ("n_log_call", "INT NOT NULL DEFAULT 0"),            # G14 logger calls
     ("n_open_call", "INT NOT NULL DEFAULT 0"),
     ("n_sleep_call", "INT NOT NULL DEFAULT 0"),
     ("n_include_in_loop", "INT NOT NULL DEFAULT 0"),
@@ -3875,6 +3916,24 @@ CREATE TABLE monkey_patches(
     is_singleton INT NOT NULL DEFAULT 0,
     line INT NOT NULL
 ) STRICT;
+
+CREATE TABLE user_input_sites(
+    id INTEGER PRIMARY KEY,
+    symbol_id INT REFERENCES symbols(id),
+    file_id INT NOT NULL REFERENCES files(id),
+    var TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    line INT NOT NULL,
+    in_loop INT NOT NULL DEFAULT 0
+) STRICT;
+
+CREATE TABLE secret_candidates(
+    id INTEGER PRIMARY KEY,
+    symbol_id INT REFERENCES symbols(id),
+    file_id INT NOT NULL REFERENCES files(id),
+    value TEXT NOT NULL,
+    line INT NOT NULL
+) STRICT;
 """
 
     INDEX_EXT = r"""
@@ -3892,6 +3951,9 @@ CREATE INDEX idx_arq_interp ON ar_queries(api) WHERE has_interpolation=1;
 CREATE INDEX idx_cb_host ON ar_callbacks(host, hook);
 CREATE INDEX idx_cb_query ON ar_callbacks(method) WHERE issues_query=1;
 CREATE INDEX idx_mp_class ON monkey_patches(core_class, method);
+CREATE INDEX idx_uinput_sym ON user_input_sites(symbol_id, kind);
+CREATE INDEX idx_uinput_var ON user_input_sites(var);
+CREATE INDEX idx_secret_sym ON secret_candidates(symbol_id);
 CREATE INDEX idx_rm_concern ON ruby_modules(is_concern, name);
 CREATE INDEX idx_fn_meta ON symbols(n_metaprogram_total DESC, name)
     WHERE n_metaprogram_total > 0;
@@ -4249,6 +4311,8 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
         # Recorded as counts; the verdict is a join away, not a rule here.
         if meth in ("system", "exec", "spawn", "syscall"):
             st.bump("n_system_call")
+        elif meth == "redirect_to":
+            st.bump("n_redirect")               # G26 open-redirect sink
         elif meth in ("constantize", "safe_constantize"):
             st.bump("n_constantize")
         elif meth in ("html_safe", "raw"):
@@ -4259,6 +4323,30 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
             st.bump("n_weak_hash")
         elif meth in ("rand", "srand"):
             st.bump("n_weak_random")
+        if full.startswith(("Net::HTTP.", "HTTParty.", "Faraday.",
+                            "RestClient.", "OpenURI.")):
+            # G27: SSRF sink -- fetch a URL that may come from the client
+            st.bump("n_fetch")
+        if full.startswith(("Nokogiri.", "REXML::")):
+            # G13: XML parser surface -- `Nokogiri::XML(x)` parses as
+            # receiver Nokogiri + method XML, so full is "Nokogiri.XML".
+            # Entity expansion is a config, not a name; this ranks where
+            # parsers are constructed.
+            st.bump("n_xxe_parser")
+        if meth in ("open", "read", "binread") and full.startswith("File."):
+            # G12: File.open/read with a non-literal path -- traversal sink
+            args = node.child_by_field_name("arguments")
+            first = args.named_children[0] if args is not None \
+                and args.named_children else None
+            if first is not None and first.type not in ("string",):
+                st.bump("n_dynamic_open")
+        if full.startswith("Zip::"):
+            # G29: rubyzip access -- entry containment is a check, not a name
+            st.bump("n_zip_read")
+        if meth in LOG_LEVELS and "logger" in full.lower():
+            # G14: a logging call -- injection into the log line is the risk
+            # when the message contains request input.
+            st.bump("n_log_call")
         elif meth == "open":
             st.bump("n_open_call")
         elif meth == "sleep":
@@ -4344,6 +4432,9 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
         # this signal found 55 sites in a codebase that has thousands. The
         # count lives in `_scan_body`, which tracks BLOCK depth, because in
         # Ruby the loop is the block.
+        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+            # G07: credential-shaped literal -- candidate, not verdict
+            st.secrets.append((text[:200], node.start_point[0] + 1))
         if not SQL_RE.search(text):
             return
         st.bump("n_sql_literal")
@@ -4381,6 +4472,15 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
             obj = node.child_by_field_name("object")
             if obj is not None and text_of(obj, src) == "params":
                 st.bump("n_params_read")
+            if obj is not None:
+                o = text_of(obj, src)
+                kind = REQ_INDEX_KINDS.get(o)
+                if kind is None and o.startswith("request."):
+                    kind = REQ_MEMBER_KINDS.get(o[len("request."):])
+                if kind is not None:
+                    st.input_sites.append(
+                        (text_of(node, src)[:120], kind,
+                         node.start_point[0] + 1, bool(loop_depth)))
         elif t == "identifier":
             if node.end_byte - node.start_byte <= 6:
                 txt = text_of(node, src)
@@ -4969,6 +5069,12 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
              "INSERT INTO monkey_patches(symbol_id,method_id,file_id,"
              "core_class,method,is_operator,is_singleton,line) "
              "VALUES(?,?,?,?,?,?,?,?)"),
+            ("user_input_sites",
+             "INSERT INTO user_input_sites(symbol_id,file_id,var,kind,line,"
+             "in_loop) VALUES(?,?,?,?,?,?)"),
+            ("secret_candidates",
+             "INSERT INTO secret_candidates(symbol_id,file_id,value,line) "
+             "VALUES(?,?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
             if rows:
@@ -6140,6 +6246,170 @@ RubyAnalyzer.QUERIES = [
       AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
     ORDER BY aq.api, aq.line
     LIMIT :lim"""),
+(
+    "open-redirect-surface",
+    "redirect_to calls in methods that read params/cookies (OWASP G26)",
+    "ANSWERS methods that call redirect_to AND read request input (params, "
+    "cookies, request headers) -- the shape of an unvalidated redirect: "
+    "redirect_to params[:next].\n"
+    "ACT validate the target against an allowlist; never forward a\n"
+    "     user-supplied URL.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the redirect, and a constant redirect beside an\n"
+    "     unrelated params read reads as a violation. The argument text is not\n"
+    "     captured, so a fixed target cannot be told from an open one. The\n"
+    "     source capture is shape-based: a LOCAL variable named params or\n"
+    "     cookies reads as request input (Rails' params cannot be shadowed,"
+    "     but plain Ruby can).",
+    """SELECT s.name, s.n_redirect AS redirect_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_redirect > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_redirect DESC, input_sites DESC LIMIT :lim"""),
+(
+    "ssrf-fetch-surface",
+    "HTTP client calls in methods that read params/cookies (OWASP G27)",
+    "ANSWERS methods that fetch a URL (Net::HTTP, HTTParty, Faraday,\n"
+    "     RestClient, open-uri) AND read request input -- the shape of\n"
+    "     server-side request forgery: Net::HTTP.get(URI(params[:url])).\n"
+    "ACT validate the URL scheme and host against an allowlist; never fetch a\n"
+    "     user-supplied URL.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the fetch, and a constant URL beside an unrelated\n"
+    "     params read reads as a violation. The capture is the dotted\n"
+    "     receiver: a client assigned to a variable (client = Net::HTTP.new)\n"
+    "     and used via client.get is invisible; a wrapper around the client\n"
+    "     is too.",
+    """SELECT s.name, s.n_fetch AS fetch_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_fetch > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_fetch DESC, input_sites DESC LIMIT :lim"""),
+(
+    "hardcoded-secret-candidates",
+    "Credential-shaped string literals (OWASP G07)",
+    "ANSWERS string literals at least 12 chars long whose text names a\n"
+    "     credential (password, token, api_key, secret, bearer, jwt, ...) --\n"
+    "     the literal that a committed secret looks like.\n"
+    "ACT rotate and move to a secret manager; never commit the literal.\n"
+    "MISLEADS a format string or test fixture containing the WORD token/pass\n"
+    "     reads as a candidate (the filter is the literal's own text, not its\n"
+    "     use); values over 200 chars are truncated at capture; a secret\n"
+    "     built from parts or read from an env var is invisible here.\n"
+    "     This is a candidate list, not a verdict.",
+    """SELECT s.name, sc.value AS candidate, sc.line,
+        f.path || ':' || sc.line AS at
+    FROM secret_candidates sc
+    JOIN symbols s ON s.id = sc.symbol_id
+    JOIN files f ON f.id = sc.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY length(sc.value) DESC LIMIT :lim"""),
+(
+    "xxe-parser-surface",
+    "XML parser construction sites (OWASP G13)",
+    "ANSWERS methods that touch Nokogiri::XML or REXML -- the surface where\n"
+    "     entity expansion is decided.\n"
+    "ACT use Nokogiri::XML::ParseOptions::NOENT off and reject DTDs; prefer\n"
+    "     safe parsing configurations.\n"
+    "MISLEADS the parser CONFIG is not modeled: a parser with entities\n"
+    "     disabled ranks the same as one without. The capture is the dotted\n"
+    "     receiver, so Nokogiri::XML::Document.parse assigned to a local and\n"
+    "     called bare is invisible.",
+    """SELECT s.name, s.n_xxe_parser AS xml_parsers,
+        s.sloc, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_xxe_parser > 0 AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_xxe_parser DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "path-traversal-surface",
+    "File.open/read with a non-literal path in input-reading methods (G12)",
+    "ANSWERS methods that call File.open/read with a variable path AND read\n"
+    "     request input -- the shape of path traversal: File.read(params[:f]).\n"
+    "ACT validate the resolved path stays under a configured root; use\n"
+    "     File.expand_path and a prefix check.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the open, and a constant-open beside an unrelated\n"
+    "     params read reads as a violation. The path is not analyzed: a\n"
+    "     variable path is assumed suspicious, a literal is not; IO.read,\n"
+    "     Pathname and rails' send_file shapes are invisible to the\n"
+    "     File. capture.",
+    """SELECT s.name, s.n_dynamic_open AS open_sites,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_dynamic_open > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_dynamic_open DESC, input_sites DESC LIMIT :lim"""),
+(
+    "zip-slip-surface",
+    "rubyzip access sites (OWASP G29)",
+    "ANSWERS methods that touch Zip::File and friends -- the surface where an\n"
+    "     entry name becomes a filesystem path.\n"
+    "ACT validate every entry name against a containment check before\n"
+    "     extraction; reject ../ and absolute paths.\n"
+    "MISLEADS the containment check is not modeled: a method that checks each\n"
+    "     name before extraction ranks the same as one that does not. The\n"
+    "     capture is the dotted Zip:: receiver; a bare alias of the library\n"
+    "     is invisible.",
+    """SELECT s.name, s.n_zip_read AS zip_access,
+        s.sloc, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_zip_read > 0 AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_zip_read DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "log-injection-surface",
+    "Logger calls in methods that read params/cookies (OWASP G14)",
+    "ANSWERS methods that call a logger level method (Rails.logger.info,\n"
+    "     logger.error, ...) AND read request input -- the shape of log\n"
+    "     forging: Rails.logger.info(params[:msg]).\n"
+    "ACT sanitize newlines and control characters in log messages; never log\n"
+    "     raw request input.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the log call, and a constant message beside an\n"
+    "     unrelated params read reads as a violation. The capture needs the\n"
+    "     word logger in the dotted call, so a differently-named logger is\n"
+    "     invisible.",
+    """SELECT s.name, s.n_log_call AS log_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_log_call > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_log_call DESC, input_sites DESC LIMIT :lim"""),
 (
     "find-each-missed",
     "Model.all.each with a query inside the block",
