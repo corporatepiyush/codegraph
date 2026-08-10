@@ -2564,6 +2564,18 @@ FUNC_SCAN = re.compile(r'[{}]|\b([A-Za-z_]\w*)\s*\(')
 
 FNPTR_CALL_RE = re.compile(r'\(\s*\*\s*\w+\s*\)\s*\(')
 
+#: `(T*)name` -- a cast to a pointer type applied to an identifier. Feeds the
+#: const-cast-away capture (the name must be const-declared to count).
+CAST_RE = re.compile(r'\(\s*[^()]*\*\s*\)\s*([A-Za-z_]\w*)')
+
+#: access(X) / open(X) with a variable argument: the TOCTOU pair shape.
+TOCTOU_ACCESS_RE = re.compile(r'\baccess\s*\(\s*([A-Za-z_]\w*)')
+TOCTOU_OPEN_RE = re.compile(r'\bopen\s*\(\s*([A-Za-z_]\w*)')
+
+#: `&fn` -- address-of an identifier in a body. A name whose address is taken
+#: is used even when no direct call edge exists.
+ADDR_TAKEN_RE = re.compile(r'&\s*([A-Za-z_]\w*)')
+
 MEMBER_CALL_RE = re.compile(r'(?:->|(?<![.\d])\.)\s*\w+\s*\(')
 
 MAKE_RULE_RE = re.compile(r'^([A-Za-z0-9_./$()%-]+)\s*:[^=]')
@@ -3214,6 +3226,9 @@ class CAnalyzer(Analyzer):
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
         ("n_extern_decl_calls", "INT NOT NULL DEFAULT 0"),
         ("n_free", "INT NOT NULL DEFAULT 0"),
+        # -- P2 pack: const-cast, toctou ------------------------------------
+        ("n_const_cast", "INT NOT NULL DEFAULT 0"),
+        ("n_toctou", "INT NOT NULL DEFAULT 0"),
     )
 
     SCHEMA_EXT = r"""
@@ -3235,15 +3250,36 @@ CREATE TABLE layout(
     PRIMARY KEY(symbol_id, ordinal)
 ) WITHOUT ROWID, STRICT;
 
-CREATE TABLE struct_size(
-    symbol_id INT NOT NULL PRIMARY KEY REFERENCES symbols(id),
-    total_size INT NOT NULL,
-    tail_pad INT NOT NULL,
-    total_pad INT NOT NULL,
-    max_align INT NOT NULL,
-    exact INT NOT NULL,
-    n_lines_64 INT NOT NULL       -- 64-byte cache lines this object spans
-) WITHOUT ROWID, STRICT;
+ CREATE TABLE struct_size(
+     symbol_id INT NOT NULL PRIMARY KEY REFERENCES symbols(id),
+     total_size INT NOT NULL,
+     tail_pad INT NOT NULL,
+     total_pad INT NOT NULL,
+     max_align INT NOT NULL,
+     exact INT NOT NULL,
+     n_lines_64 INT NOT NULL       -- 64-byte cache lines this object spans
+ ) WITHOUT ROWID, STRICT;
+
+ -- Prototypes and extern declarations: names promised in this file but not
+ -- (necessarily) defined anywhere in the tree. Feeds extern-symbol-asymmetry.
+ CREATE TABLE declarations(
+     id INTEGER PRIMARY KEY,
+     file_id INT NOT NULL REFERENCES files(id),
+     name TEXT NOT NULL,
+     line INT NOT NULL DEFAULT 0
+ ) STRICT;
+
+ -- `&fn` expressions: addresses taken of in-tree functions. A function whose
+ -- only uses are address-taken is invisible to the call graph (the call goes
+ -- through a pointer) -- fnptr-blindspot-callers ranks exactly those.
+ CREATE TABLE addr_taken(
+     id INTEGER PRIMARY KEY,
+     symbol_id INT REFERENCES symbols(id),
+     file_id INT NOT NULL REFERENCES files(id),
+     name TEXT NOT NULL,
+     line INT NOT NULL DEFAULT 0
+ ) STRICT;
+
 
 -- The bodies the call graph cannot see into. `n_uses` is filled in during call
 -- resolution, so "which macro is doing the most work" is answerable.
@@ -3285,6 +3321,15 @@ CREATE TABLE config_blocks(
     is_config INT NOT NULL DEFAULT 0
 ) STRICT;
 
+-- Transitive caller counts computed in Python after resolve_calls (the call
+-- graph is a DAG-plus-cycles, so SQL recursion would re-expand per path).
+-- `n_transitive` is the number of DISTINCT functions that can reach the
+-- symbol through resolved edges at any depth.
+CREATE TABLE reach(
+    symbol_id INT NOT NULL PRIMARY KEY REFERENCES symbols(id),
+    n_transitive INT NOT NULL DEFAULT 0
+) WITHOUT ROWID, STRICT;
+
 CREATE TABLE makefile_rules(
     id INTEGER PRIMARY KEY,
     path TEXT NOT NULL,
@@ -3307,6 +3352,9 @@ CREATE INDEX idx_glob_shared ON globals(module_id) WHERE is_static=1 AND is_cons
 CREATE INDEX idx_glob_name ON globals(name);
 CREATE INDEX idx_symbols_concurrency ON symbols(module_id) WHERE n_concurrency>0;
 CREATE INDEX idx_cfg_expr ON config_blocks(expr) WHERE is_config=1;
+CREATE INDEX idx_reach_fan ON reach(n_transitive DESC) WHERE n_transitive>0;
+CREATE INDEX idx_decl_name ON declarations(name);
+CREATE INDEX idx_addrtaken ON addr_taken(name);
 CREATE INDEX idx_mk_rule ON makefile_rules(n_objs DESC, n_srcs DESC);
 CREATE INDEX idx_fn_fnptr ON symbols(n_fnptr_calls DESC, name, file_id) WHERE n_fnptr_calls>0;
 CREATE INDEX idx_fn_extern ON symbols(n_external_calls DESC, name, file_id) WHERE n_external_calls>0;
@@ -3446,7 +3494,7 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
             idx = bisect.bisect_right(starts, ln) - 1
             return idx >= 0 and ln <= ends[idx]
 
-        self._prototypes(blank, in_function)
+        self._prototypes(rec, blank, in_function, bufs)
         self._globals(rec, blank, db, in_function)
         self._functions(rec, raw, blank, funcs, db, bufs)
 
@@ -3568,11 +3616,14 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                              (em.group(2) or "").strip()[:60] or None, 0))
 
     # -- prototypes and globals -------------------------------------------
-    def _prototypes(self, blank: str, in_function) -> None:
+    def _prototypes(self, rec: FileRec, blank: str, in_function,
+                    bufs: Buffers) -> None:
         """Names declared here but possibly defined outside the tree.
 
         A call to one of these is a boundary, not a blind spot: the definition
         exists, it is simply in a library or a directory this run skipped.
+        Each declaration is also recorded (extern-symbol-asymmetry asks which
+        of them has NO definition anywhere in the tree).
         """
         for m in PROTO_RE.finditer(blank):
             if in_function(line_of(blank, m.start())):
@@ -3580,6 +3631,8 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
             nm = m.group(1)
             if nm not in KEYWORDS:
                 self.declared.add(nm)
+                bufs.rows("declarations").append(
+                    (rec.fid, nm, line_of(blank, m.start())))
 
     def _globals(self, rec: FileRec, blank: str, db: sqlite3.Connection,
                  in_function) -> None:
@@ -3641,6 +3694,26 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                     if not _is_ok_magic(m.group(1))]
             calls, n_calls, fnptr = self._scan_calls(body, boff, raw)
 
+            # -- P2 pack ----------------------------------------------------
+            # const-cast-away (CERT EXP05-C): a `(T*)` cast applied to a
+            # const-declared local or const parameter drops the const.
+            const_names = {l[1] for l in locs if l[4]}
+            const_names |= {p[2] for p in ps if p[2] and p[5]}
+            n_const_cast = 0
+            for cm in CAST_RE.finditer(body):
+                if cm.group(1) in const_names:
+                    n_const_cast += 1
+            # toctou-access-open: access(X) and open(X) in the same function
+            # with a shared variable name -- the check and the use race.
+            acc_vars = {m.group(1) for m in TOCTOU_ACCESS_RE.finditer(body)}
+            opn_vars = {m.group(1) for m in TOCTOU_OPEN_RE.finditer(body)}
+            n_toctou = len(acc_vars & opn_vars)
+            # addr_taken: `&fn` in this body -- a use the call graph cannot
+            # see; fnptr-blindspot-callers joins these against fan_in=0.
+            # sid is assigned below; buffer the pairs until it exists.
+            addr_rows = [(am.group(1), line_of(body, am.start()) + ls - 1)
+                         for am in ADDR_TAKEN_RE.finditer(body)]
+
             m: dict[str, Any] = {}
             m.update(mt)
             m.update({k: v for k, v in la.items()})
@@ -3666,11 +3739,17 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
             m["n_calls"] = n_calls
             m["n_fnptr_calls"] = fnptr
             m["n_dynamic_calls"] = fnptr
+            m["n_const_cast"] = n_const_cast
+            m["n_toctou"] = n_toctou
 
             qual = ("%s:%s" % (rec.rel, name)) if st else name
             sid = self._insert_symbol(
                 db, rec, name, "function", ls, le, qual, sig,
                 return_type_of(sig, name), "static" if st else "extern", m)
+
+            for tname, tline in addr_rows:
+                bufs.rows("addr_taken").append(
+                    (sid, rec.fid, tname, tline))
 
             for l in locs:
                 bufs.locals.append((sid,) + l[:10])
@@ -3883,6 +3962,11 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
             ("struct_size",
              "INSERT OR IGNORE INTO struct_size(symbol_id,total_size,tail_pad,"
              "total_pad,max_align,exact,n_lines_64) VALUES(?,?,?,?,?,?,?)"),
+            ("declarations",
+             "INSERT INTO declarations(file_id,name,line) VALUES(?,?,?)"),
+            ("addr_taken",
+             "INSERT INTO addr_taken(symbol_id,file_id,name,line) "
+             "VALUES(?,?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
             if rows:
@@ -3953,6 +4037,42 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
         db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                    ("layout_model", "LP64: pointer 8/8, long 8, int 4; "
                                     "sizes reported only where exact=1"))
+        self._transitive_fan(db)
+
+    def _transitive_fan(self, db: sqlite3.Connection) -> None:
+        """Count distinct callers that can reach each symbol through resolved
+        edges, at any depth.
+
+        The call graph is a DAG with cycles, so a SQL walk over edges would
+        re-expand every path; a traversal of the REVERSE adjacency in Python
+        is O(V+E) per node and exact on the resolved edges: each symbol gets
+        the set of distinct callers (fan-in) that can reach it. Results feed
+        `blast-radius`, whose answer is the transitive CALLER set.
+        """
+        edges = db.execute(
+            "SELECT caller_id, callee_id FROM edges").fetchall()
+        if not edges:
+            return
+        callers: dict[int, list[int]] = {}
+        symbols = {c for c, _ in edges} | {k for _, k in edges}
+        for caller, callee in edges:
+            callers.setdefault(callee, []).append(caller)
+        rows: list[tuple[int, int]] = []
+        for sym in symbols:
+            seen: set[int] = set()
+            stack = [sym]
+            while stack:
+                cur = stack.pop()
+                for nxt in callers.get(cur, ()):
+                    if nxt not in seen and nxt != sym:
+                        seen.add(nxt)
+                        stack.append(nxt)
+            if seen:
+                rows.append((sym, len(seen)))
+        if rows:
+            db.executemany(
+                "INSERT OR REPLACE INTO reach(symbol_id, n_transitive) "
+                "VALUES(?,?)", rows)
 
 def _is_ok_magic(tok: str) -> bool:
     """Integers nobody should be asked to name."""
@@ -4423,8 +4543,9 @@ QUERIES: list[tuple[str, str, str, str]] = [
             'fread','fwrite','malloc','strdup')
     JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
-    WHERE (s.name LIKE '%sig%' OR s.name LIKE '%handler%'
-           OR s.name LIKE '%signal%')
+    WHERE (instr(lower(s.name), 'sig') > 0
+           OR instr(lower(s.name), 'handler') > 0
+           OR instr(lower(s.name), 'signal') > 0)
       AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY n_unsafe_patterns DESC, s.fan_in DESC LIMIT :lim"""),
@@ -4481,7 +4602,428 @@ QUERIES: list[tuple[str, str, str, str]] = [
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.kind='macro' AND s.fan_in > 3 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.fan_in DESC LIMIT :lim""")
+    ORDER BY s.fan_in DESC LIMIT :lim"""),
+(
+    "vtable-risk",
+    "Functions reached through function pointers or dynamic member calls",
+    "ANSWERS where runtime target ambiguity is densest: the reads through\n"
+    "     `ops->`-style members and `(*fp)()` calls that a static call graph\n"
+    "     cannot resolve. Every one is a site whose callee is decided at runtime.\n"
+    "ACT audit the dispatch site: is the function-pointer slot ever written with\n"
+    "     something other than the one obvious initializer? If so, the edge here\n"
+    "     is a security boundary, not an abstraction.\n"
+    "MISLEADS counts CALL SITES, not distinct targets, and the brace scanner\n"
+    "     sees the `->`-shaped member call syntax only; a struct passed around\n"
+    "     and invoked through a local alias (`ops->read` copied into a local\n"
+    "     `fp`) shows up as the alias's direct call instead.",
+    """SELECT s.name, s.n_fnptr_calls AS fnptr_calls,
+        s.n_dynamic_calls AS dyn_calls,
+        MAX(s.n_calls - s.n_fnptr_calls - s.n_dynamic_calls, 0) AS direct_calls,
+        s.fan_in, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_fnptr_calls + s.n_dynamic_calls) > 0
+      AND s.kind='function' AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_fnptr_calls + s.n_dynamic_calls) DESC LIMIT :lim"""),
+(
+    "header-scope-ratio",
+    "User-header vs system-header include ratio per file",
+    "ANSWERS which files lean almost entirely on system headers (<...>) and so\n"
+    "     carry little project-local coupling -- and which pull in mostly user\n"
+    "     headers (\"...\"), marking them as tightly coupled to the tree.\n"
+    "ACT a file at ~0%% user headers is often a portability shim; a file at\n"
+    "     100%% user headers that is itself widely included deserves a look for\n"
+    "     layering violations.\n"
+    "MISLEADS a `<system>` include that RESOLVES inside the tree is counted as\n"
+    "     user here (the analyzer treats project headers on the include path as\n"
+    "     internal), so the ratio is about the include SPELLING, not about where\n"
+    "     the file actually lives.",
+    """SELECT f.path,
+        SUM(CASE WHEN i.is_relative=1 THEN 1 ELSE 0 END) AS user_headers,
+        SUM(CASE WHEN i.is_relative=0 THEN 1 ELSE 0 END) AS sys_headers,
+        CAST(100.0 * SUM(CASE WHEN i.is_relative=1 THEN 1 ELSE 0 END)
+             / NULLIF(COUNT(*), 0) AS INT) AS pct_user,
+        f.sloc
+    FROM imports i JOIN files f ON f.id=i.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE i.kind='include' AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY f.id
+    ORDER BY pct_user ASC, COUNT(*) DESC LIMIT :lim"""),
+(
+    "recursion-loops",
+    "Mutually recursive function pairs (a calls b, b calls a)",
+    "ANSWERS the call pairs that can recurse unboundedly even though no single\n"
+    "     function calls itself. Each row is a 2-cycle in the resolved edge set.\n"
+    "ACT add a depth cap or an iteration guard on the LOWER-LEVEL member of the\n"
+    "     pair; the higher one is where the recursion is entered.\n"
+    "MISLEADS finds direct 2-cycles only. Cycles of length >= 3 (a->b->c->a)\n"
+    "     need a full SCC walk and do NOT appear; self-recursion is covered by\n"
+    "     `stack-exhaustion`, not here. Edges are name-resolved, so two functions\n"
+    "     that share one name are conflated.",
+    """SELECT a.name AS fn_a, b.name AS fn_b,
+        fa.path || ':' || a.line_start AS at_a,
+        fb.path || ':' || b.line_start AS at_b,
+        ea.n_calls AS a_calls_b, eb.n_calls AS b_calls_a
+    FROM edges ea
+    JOIN edges eb ON ea.caller_id=eb.callee_id
+                AND ea.callee_id=eb.caller_id
+    JOIN symbols a ON a.id=ea.caller_id
+    JOIN symbols b ON b.id=ea.callee_id
+    JOIN files fa ON fa.id=a.file_id
+    JOIN files fb ON fb.id=b.file_id
+    LEFT JOIN modules m ON m.id=a.module_id
+    WHERE ea.caller_id < ea.callee_id
+      AND ea.caller_id <> ea.callee_id
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (ea.n_calls + eb.n_calls) DESC LIMIT :lim"""),
+(
+    "global-state-mutation",
+    "Non-static, non-const globals: the state every translation unit shares",
+    "ANSWERS the file-scope objects without internal linkage (no `static`), so\n"
+    "     any translation unit that declares them extern can mutate them. Where\n"
+    "     `race-surface` asks which mutable globals two THREADS could clobber\n"
+    "     (it includes statics and singles out non-atomic ones), this asks\n"
+    "     which globals merely EXIST as cross-TU seams -- the ones that make a\n"
+    "     function untestable in isolation and a refactor a hunt through every\n"
+    "     declaring file.\n"
+    "ACT make them static and route access through one setter, or move them\n"
+    "     into a context struct passed explicitly.\n"
+    "MISLEADS the brace scanner cannot see WHICH functions write the global,\n"
+    "     only that it exists and is shared (`race-surface` is the same data\n"
+    "     through a thread-race lens); `has_init` being 0 does not prove there\n"
+    "     is no initializer (a forward-declared extern has none by\n"
+    "     construction). Config-style `extern const` tables are correctly\n"
+    "     excluded (is_const). The scanner records every file-scope declarator\n"
+    "     including function parameters of that shape, so private locals and\n"
+    "     pointer parameters can surface as rows; shared mutable file-scope\n"
+    "     objects are the rows that matter.",
+    """SELECT f.path, g.name, g.type, g.line,
+        g.has_init, g.is_volatile, g.is_atomic, g.ptr_depth
+    FROM globals g JOIN files f ON f.id=g.file_id
+    LEFT JOIN modules m ON m.id=g.module_id
+    WHERE g.is_static=0 AND g.is_const=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY g.is_atomic DESC, g.is_volatile DESC, f.path, g.line LIMIT :lim"""),
+(
+    "unreferenced-includes",
+    "Headers included but none of their functions are ever called",
+    "ANSWERS the #include lines whose target file's functions have zero\n"
+    "     resolved callers anywhere in the tree -- the include-graph shape that\n"
+    "     slows rebuilds without contributing edges.\n"
+    "ACT drop the include if the header only carried types you no longer use;\n"
+    "     otherwise expect one of the covered-by-macro / config-gated cases.\n"
+    "MISLEADS a header used ONLY for types, macros, or constants looks dead\n"
+    "     here by construction (the scanner sees function calls only); a header\n"
+    "     whose functions are CALLED THROUGH POINTERS is also invisible. This is\n"
+    "     a candidate list, not a delete list.",
+    """SELECT f.path AS header, f.sloc,
+        (SELECT COUNT(*) FROM symbols s WHERE s.file_id=f.id) AS n_syms,
+        (SELECT COUNT(*) FROM symbols s
+          WHERE s.file_id=f.id AND s.kind='function') AS n_fns,
+        (SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id=e.callee_id
+          WHERE s.file_id=f.id) AS inbound_calls,
+        COUNT(DISTINCT i.file_id) AS included_by
+    FROM files f
+    JOIN imports i ON i.target_id=f.id AND i.kind='include'
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE f.n_symbols > 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY f.id
+    HAVING inbound_calls = 0 AND n_fns > 0
+    ORDER BY included_by DESC, f.sloc DESC LIMIT :lim"""),
+(
+    "blast-radius",
+    "Symbols with the largest transitive caller sets",
+    "ANSWERS which functions, if changed, can disturb the most of the tree:\n"
+    "     the count of DISTINCT functions that can reach this symbol through\n"
+    "     resolved edges at any depth.\n"
+    "ACT treat the top rows as API changes requiring a caller sweep: every\n"
+    "     row's callers are the blast zone. For a public entry point the number\n"
+    "     is meaningless by design -- see MISLEADS.\n"
+    "MISLEADS `n_transitive` counts callers THROUGH RESOLVED EDGES ONLY; a\n"
+    "     symbol called dynamically (function pointer) or across a name\n"
+    "     collision undercounts, and a widely-included header's inline helpers\n"
+    "     are undercounted for the same reason. The pass is a per-symbol\n"
+    "     traversal over the reverse adjacency: O(V*(V+E)) in total, which is\n"
+    "     fine at redis scale and slow on very large C corpora -- it is exact\n"
+    "     on the edges that exist, not memoised.",
+    """SELECT s.name, r.n_transitive AS transitive_callers,
+        s.fan_in, s.n_calls, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM reach r JOIN symbols s ON s.id=r.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY r.n_transitive DESC LIMIT :lim"""),
+(
+    "cross-file-struct-coupling",
+    "Struct types that span translation units via layout surface",
+    "ANSWERS the struct definitions whose shape (size, pointer fields, padding)\n"
+    "     makes them load-bearing across files: a struct this large or this\n"
+    "     pointer-heavy, defined once, is almost certainly passed between\n"
+    "     translation units and is a compatibility surface.\n"
+    "ACT treat layout changes (field reorder, pointer widening) as ABI changes\n"
+    "     for every included_by file; the pad columns show where the wasted\n"
+    "     bytes are.\n"
+    "MISLEADS the brace scanner cannot see WHERE a struct is instantiated; this\n"
+    "     ranks by DEFINED shape, not by measured usage, so a huge struct that\n"
+    "     never leaves its file appears here too. `exact=0` sizes (unknown field\n"
+    "     types) are excluded rather than guessed.",
+    """SELECT s.name, ss.total_size, ss.tail_pad, ss.total_pad,
+        ss.n_lines_64, ss.exact,
+        (SELECT COUNT(*) FROM layout l WHERE l.symbol_id=ss.symbol_id
+          AND l.depth=0) AS n_fields,
+        (SELECT COUNT(*) FROM layout l WHERE l.symbol_id=ss.symbol_id
+          AND l.ptr_depth>0) AS n_ptr_fields,
+        f.path || ':' || s.line_start AS at
+    FROM struct_size ss JOIN symbols s ON s.id=ss.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE ss.exact=1 AND ss.total_size >= 64
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY ss.total_size DESC, ss.total_pad DESC LIMIT :lim"""),
+(
+    "extern-linkage-density",
+    "Translation units leaning on extern declarations",
+    "ANSWERS where file boundaries are load-bearing on bare extern promises:\n"
+    "     the count of extern-declared globals a file relies on, and the volume\n"
+    "     of calls resolved only because a prototype declared the callee (no\n"
+    "     definition in this unit).\n"
+    "ACT high extern + low definition density is where a symbol rename or a\n"
+    "     signature change breaks the tree without the compiler naming every\n"
+    "     victim; consider moving the shared declarations into a header.\n"
+    "MISLEADS n_external_calls counts calls whose callee was declared but not\n"
+    "     defined in the unit -- libc and POSIX calls dominate any realistic\n"
+    "     file, so compare DENSITY across files, not the raw number.",
+    """SELECT f.path,
+        (SELECT COUNT(*) FROM globals g WHERE g.file_id=f.id
+          AND g.is_static=0 AND g.is_const=0) AS extern_globals,
+        (SELECT COALESCE(SUM(s.n_external_calls),0) FROM symbols s
+          WHERE s.file_id=f.id AND s.kind='function') AS extern_calls,
+        (SELECT COALESCE(SUM(s.n_calls),0) FROM symbols s
+          WHERE s.file_id=f.id AND s.kind='function') AS total_calls,
+        CAST(100.0 * (SELECT COALESCE(SUM(s.n_external_calls),0) FROM symbols s
+             WHERE s.file_id=f.id AND s.kind='function')
+             / NULLIF((SELECT COALESCE(SUM(s.n_calls),0) FROM symbols s
+               WHERE s.file_id=f.id AND s.kind='function'), 0) AS INT)
+            AS pct_external
+    FROM files f
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE (SELECT COUNT(*) FROM symbols s WHERE s.file_id=f.id) > 0
+      AND ((SELECT COALESCE(SUM(s.n_external_calls),0) FROM symbols s
+            WHERE s.file_id=f.id AND s.kind='function') > 0
+           OR (SELECT COUNT(*) FROM globals g WHERE g.file_id=f.id
+               AND g.is_static=0 AND g.is_const=0) > 0)
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY extern_calls DESC LIMIT :lim"""),
+(
+    "cross-tu-signature-drift",
+    "One function name, two different definitions across TUs",
+    "ANSWERS function names defined with >= 2 different signatures across\n"
+    "     translation units: UB per C99 6.2.7 (MISRA 8.3). The linker picks\n"
+    "     one definition and every caller of the other shape is miscompiled.\n"
+    "ACT pick one signature; rename or delete the other definition. The row\n"
+    "     names every file involved.\n"
+    "MISLEADS typedef-equivalent types compare different textually, so a\n"
+    "     benign `int foo(int)` vs `int foo(int32_t)` pair is reported;\n"
+    "     K&R definitions yield empty signature text and are excluded, and a\n"
+    "     static fn in one file plus an extern fn of the same name in another\n"
+    "     is NOT a link conflict yet still reads as drift here.",
+    """SELECT s.name,
+        COUNT(DISTINCT s.signature) AS n_sigs,
+        COUNT(DISTINCT s.file_id)   AS n_files,
+        GROUP_CONCAT(DISTINCT f.path) AS where_defined
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.kind = 'function' AND s.signature IS NOT NULL AND s.signature != ''
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.name
+    HAVING n_sigs > 1
+    ORDER BY n_files DESC, n_sigs DESC
+    LIMIT :lim"""),
+(
+    "linkage-scope-mismatch",
+    "External-linkage functions whose callers all live in one TU",
+    "ANSWERS non-static functions whose resolved callers all sit in one\n"
+    "     translation unit: they should be static (MISRA 8.7, cppcheck). An\n"
+    "     external-linkage symbol is a coupling surface for the whole\n"
+    "     binary; a one-TU usage pattern says the author forgot the keyword.\n"
+    "ACT make it static; if fan_in is also 0, `dead-code` owns the deletion\n"
+    "     question instead.\n"
+    "MISLEADS name-based resolution undercounts callers, so a function used\n"
+    "     from a second TU through a macro or a function pointer reads as\n"
+    "     one-TU here; fnptr-dispatched users are invisible; a header inline\n"
+    "     absorbed elsewhere never appears. When in doubt, the compiler's\n"
+    "     own -Wmissing-prototypes is the tiebreaker.",
+    """SELECT s.name, f.path, s.line_start, s.fan_in,
+        COUNT(DISTINCT cf.id) AS n_caller_files
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN edges e ON e.callee_id = s.id
+    LEFT JOIN symbols cs ON cs.id = e.caller_id
+    LEFT JOIN files cf ON cf.id = cs.file_id
+    WHERE s.kind = 'function' AND s.is_static = 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    HAVING s.fan_in > 0 AND n_caller_files <= 1
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "risky-process-apis",
+    "Sites of dangerous process/temp APIs (CERT ENV33-C, flawfinder)",
+    "ANSWERS reachable sites of the dangerous process and temp-file API set:\n"
+    "     system/popen/exec for process boundaries, mktemp/tmpnam/tempnam for\n"
+    "     race-prone temp files, access for TOCTOU-prone checks.\n"
+    "ACT replace mktemp with mkstemp; interrogate every system/popen -- each\n"
+    "     is a command-injection review item when the argument is not a\n"
+    "     constant; prefer execve with an explicit argv over execl/execvp\n"
+    "     when the argument list is built at runtime.\n"
+    "MISLEADS the capture is the call scanner, independent of resolution, so\n"
+    "     libc calls that would otherwise classify as external still appear;\n"
+    "     the denylist is the fixed set above -- rand/setenv are NOT captured\n"
+    "     and are absent by design (their risk is caller-context, which this\n"
+    "     query does not model); errno-checking callers are not distinguished.",
+    """SELECT f.path, s.name AS caller, h.pattern AS api, h.category, h.n AS sites,
+        h.first_line, s.fan_in
+    FROM hazards h
+    JOIN symbols s ON s.id=h.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE h.pattern IN ('system','popen','execve','execl','execlp','execvp',
+                        'execv','fork','posix_spawn','posix_spawnp','vfork',
+                        'wordexp','dlopen','dlmopen','mktemp','tmpnam',
+                        'tempnam','access')
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, h.n DESC
+    LIMIT :lim"""),
+(
+    "include-cycles",
+    "User headers that include each other, directly or via a chain",
+    "ANSWERS user headers that include each other: the include graph is a\n"
+    "     DAG in any well-formed project, so a cycle means the headers are\n"
+    "     mutually dependent and the build order is an accident of include\n"
+    "     guards.\n"
+    "ACT break the cycle with a forward declaration or by shrinking one\n"
+    "     header; rows name both endpoints and the cycle length.\n"
+    "MISLEADS include guards make cycles harmless at compile time, so this\n"
+    "     is a maintainability smell, not a defect; depth is capped at 8;\n"
+    "     is_relative=1 means user \"...\" includes, and a `<...>` include\n"
+    "     that happens to resolve in-tree is treated as system-style and\n"
+    "     excluded from the walk.",
+    """WITH RECURSIVE walk(root, dep, depth, path) AS (
+        SELECT i.file_id, i.target_id, 1,
+               '>' || i.file_id || '>' || i.target_id || '>'
+        FROM imports i
+        WHERE i.target_id IS NOT NULL AND i.is_relative = 1
+          AND i.kind='include'
+        UNION
+        SELECT w.root, i.target_id, w.depth + 1, w.path || i.target_id || '>'
+        FROM walk w
+        JOIN imports i ON i.file_id = w.dep
+        WHERE i.target_id IS NOT NULL AND i.is_relative = 1
+          AND i.kind='include'
+          AND w.depth < 8
+          AND (i.target_id = w.root
+               OR instr(w.path, '>' || i.target_id || '>') = 0)
+    )
+    SELECT DISTINCT f1.path AS header, f3.path AS partner, w.depth
+    FROM walk w
+    JOIN files f1 ON f1.id = w.root
+    JOIN imports i0 ON i0.file_id = w.root AND i0.target_id IS NOT NULL
+         AND i0.is_relative = 1 AND i0.kind = 'include'
+    JOIN files f3 ON f3.id = i0.target_id
+    WHERE w.dep = w.root
+    ORDER BY w.depth, header
+    LIMIT :lim"""),
+(
+    "const-cast-away",
+    "Casts that drop const from const-declared names (CERT EXP05-C)",
+    "ANSWERS `(T*)name` casts applied to a name declared const: the\n"
+    "     const-qualified promise is stripped by the cast, and any write\n"
+    "     through the result is UB in the caller's face.\n"
+    "ACT remove the cast, or drop const from the declaration if the\n"
+    "     function genuinely mutates (and say why).\n"
+    "MISLEADS the const test is against the local/param declaration in the\n"
+    "     SAME function: a const GLOBAL or a const from another translation\n"
+    "     unit is invisible here; `(void*)` casts and casts of expressions\n"
+    "     (not bare names) are not counted; a cast of a name that is NOT\n"
+    "     const-declared reads clean by construction.",
+    """SELECT s.name, s.n_const_cast AS const_casts, s.n_cast AS casts_total,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_const_cast > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_const_cast DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "fnptr-blindspot-callers",
+    "Functions used only through &fn -- invisible to the call graph",
+    "ANSWERS functions with fan_in 0 whose address is taken somewhere:\n"
+    "     they ARE used, but every call goes through a function pointer, so\n"
+    "     dead-code and every fan-in-based number understate them.\n"
+    "ACT read these as live API surface; a fnptr-dispatched function is a\n"
+    "     plugin point or a table-driven dispatch entry.\n"
+    "MISLEADS &fn text capture catches address-takes in function bodies; an\n"
+    "     address taken in a struct initializer at file scope (the dominant\n"
+    "     dispatch-table pattern) is NOT captured -- the table rows are a\n"
+    "     floor, and `linkage-scope-mismatch` and dead-code must be read\n"
+    "     with this page open.",
+    """SELECT s.name, f.path, s.line_start, s.sloc,
+        (SELECT COUNT(*) FROM addr_taken a WHERE a.name=s.name) AS addr_taken
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND s.fan_in=0 AND s.is_test=0
+      AND EXISTS (SELECT 1 FROM addr_taken a WHERE a.name=s.name)
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY addr_taken DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "extern-symbol-asymmetry",
+    "Declared in a prototype, never defined in the tree",
+    "ANSWERS names with a prototype/extern declaration but no definition\n"
+    "     anywhere in the tree: either the definition lives in a library\n"
+    "     this run skipped (fine), or the symbol is promised but missing\n"
+    "     (a link error waiting for the first caller).\n"
+    "ACT for each row decide: library boundary (ignore) or genuinely\n"
+    "     missing (define or delete the prototype).\n"
+    "MISLEADS a definition behind `#ifdef` that the scan excluded reads as\n"
+    "     missing; static functions are excluded from the definition side\n"
+    "     only when their name matches -- a same-named static in one file\n"
+    "     does NOT satisfy an extern promise in another; libc prototypes in\n"
+    "     system headers are not scanned (only this tree's files are).",
+    """SELECT d.name, f.path, d.line,
+        (SELECT COUNT(*) FROM symbols s
+          WHERE s.name = d.name AND s.kind='function') AS defined_count
+    FROM declarations d JOIN files f ON f.id=d.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE (SELECT COUNT(*) FROM symbols s
+            WHERE s.name = d.name AND s.kind='function') = 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY d.name, f.path
+    LIMIT :lim"""),
+(
+    "toctou-access-open",
+    "access(X) then open(X) on the same variable (CERT POS01-C)",
+    "ANSWERS functions that both access(X) and open(X) with the same\n"
+    "     variable: the permission check and the use are two system calls,\n"
+    "     and the file can be swapped between them. The window is the whole\n"
+    "     race.\n"
+    "ACT open first, then fstat the descriptor; never trust access for\n"
+    "     security decisions.\n"
+    "MISLEADS same-function variable-name pairing, not data flow: access on\n"
+    "     a path built from a different variable than the open is missed,\n"
+    "     and access+open on a CONSTANT path (no race on most filesystems\n"
+    "     in practice) reads the same as the race; `faccessat` with\n"
+    "     AT_EACCESS is a different capture and is absent.",
+    """SELECT s.name, s.n_toctou AS pairs, s.n_io AS io_calls, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_toctou > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_toctou DESC, s.fan_in DESC LIMIT :lim""")
 ]
 
 METRICS = [
@@ -4557,7 +5099,8 @@ METRICS = [
         GROUP BY caller_id, callee_id),
     direct(sym, n) AS (
         SELECT symbol_id, SUM(n) FROM hazards
-        WHERE category='alloc' AND pattern<>'free' AND pattern NOT LIKE '%free'
+        WHERE category='alloc' AND pattern<>'free'
+          AND lower(substr(pattern, -4))<>'free'
         GROUP BY symbol_id),
     walk(root, sym, depth, mult) AS (
         SELECT s.id, s.id, 0, 1 FROM symbols s WHERE s.kind='function'

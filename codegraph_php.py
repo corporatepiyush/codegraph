@@ -3711,6 +3711,9 @@ class PhpAnalyzer(TreeSitterAnalyzer):
         ("class_name", "TEXT NOT NULL DEFAULT ''"),
         ("is_controller", "INT NOT NULL DEFAULT 0"),
         ("is_model", "INT NOT NULL DEFAULT 0"),
+        # -- P2 pack: catch breadth, dynamic property writes -----------------
+        ("n_broad_catch", "INT NOT NULL DEFAULT 0"),
+        ("n_dynamic_prop_write", "INT NOT NULL DEFAULT 0"),
     )
 
     SCHEMA_EXT = r"""
@@ -4081,6 +4084,14 @@ UPDATE namespaces AS n SET n_classes = (
                     or (name in ("handle", "__invoke", "execute", "run", "main")
                         and cls.endswith(("Command", "Job", "Middleware",
                                           "Listener", "Handler", "Controller"))))
+        # `#[Deprecated]` OR a @deprecated docblock above the method.
+        _dprv = node.prev_sibling
+        _doc_dep = 0
+        while _dprv is not None and _dprv.type in self.COMMENT_NODES:
+            if "@deprecated" in text_of(_dprv, src):
+                _doc_dep = 1
+                break
+            _dprv = _dprv.prev_sibling
         return dict(
             n_params=n_params,
             n_optional_params=n_opt,
@@ -4098,7 +4109,7 @@ UPDATE namespaces AS n SET n_classes = (
             is_override=int(any(a.rsplit("\\", 1)[-1] == "Override"
                                 for a in attrs)),
             is_deprecated=int(any(a.rsplit("\\", 1)[-1] == "Deprecated"
-                                  for a in attrs)),
+                                  for a in attrs)) or _doc_dep,
             is_test=int(name.startswith("test")
                         or any(a.rsplit("\\", 1)[-1] in ("Test", "DataProvider")
                                for a in attrs)),
@@ -4327,6 +4338,15 @@ UPDATE namespaces AS n SET n_classes = (
             kids = [c for c in node.named_children]
             if kids and kids[0].type not in ("string",):
                 st.bump("n_dynamic_include")
+        elif t == "assignment_expression":
+            left = node.child_by_field_name("left")
+            if left is not None and left.type == "member_access_expression":
+                nm = left.child_by_field_name("name")
+                if nm is not None and nm.type == "variable_name":
+                    # $obj->$name = v -- a dynamic property write
+                    # (deprecated by default in PHP 8.2 for classes without
+                    # __set).
+                    st.bump("n_dynamic_prop_write")
         elif t == "variable_name":
             if _txt(node, src) in SUPERGLOBALS:
                 st.bump("n_superglobal_reads")
@@ -5843,7 +5863,409 @@ PhpAnalyzer.QUERIES = [
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.is_controller=1 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.fan_in DESC, s.n_superglobal_reads DESC LIMIT :lim""")
+    ORDER BY s.fan_in DESC, s.n_superglobal_reads DESC LIMIT :lim"""),
+(
+    "trait-adoption",
+    "Traits by how many classes ingest them",
+    "ANSWERS which traits spread methods across the widest class set -- the\n"
+    "     first candidates for refactoring into a shared service or a value\n"
+    "     object, because every use site is a copy of the same behavior.\n"
+    "ACT a trait adopted by many classes is either a service hiding in a copy\n"
+    "     (inject it instead) or a genuinely shared slice (good -- but then\n"
+    "     test it once and document the contract).\n"
+    "MISLEADS `used_by` counts classes that `use` the trait by simple name;\n"
+    "     an interface or abstract class adopting it is not counted, and a\n"
+    "     trait used only inside a closure/conditional may not be tracked.",
+    """SELECT t.name AS trait, t.namespace, t.used_by AS adopted_by,
+        t.n_methods AS methods, t.n_props AS props,
+        t.n_abstract_methods AS abstract_methods,
+        f.path || ':' || t.line AS at
+    FROM traits t JOIN files f ON f.id=t.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE t.used_by > 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY t.used_by DESC, t.n_methods DESC LIMIT :lim"""),
+(
+    "namespace-instability",
+    "Afferent vs efferent coupling per namespace",
+    "ANSWERS the namespace-level dependency balance: incoming distinct\n"
+    "     classes that call INTO this namespace versus outgoing distinct\n"
+    "     classes this namespace calls. `instability` is efferent/(aff+eff),\n"
+    "     0 = consumed by everything, 1 = depends on everything.\n"
+    "ACT a namespace near 1.0 with high afferent is a hub that should be\n"
+    "     stable; a namespace near 0 that nothing imports (low afferent) is a\n"
+    "     leaf worth keeping free of infrastructure imports.\n"
+    "MISLEADS attribution is via the calling function's class; a function in\n"
+    "     a namespace with no class (plain function) has no home and is not\n"
+    "     counted, so namespace-level numbers undercount plain-function code.",
+    """WITH ce AS (
+        SELECT ca.namespace AS caller_ns, cb.namespace AS callee_ns
+        FROM edges e
+        JOIN symbols sa ON sa.id=e.caller_id
+        JOIN symbols sb ON sb.id=e.callee_id
+        JOIN classes ca ON ca.name=sa.class_name AND sa.class_name <> ''
+        JOIN classes cb ON cb.name=sb.class_name AND sb.class_name <> ''),
+    aff AS (
+        SELECT callee_ns AS ns, COUNT(DISTINCT caller_ns) AS n
+        FROM ce WHERE caller_ns <> callee_ns GROUP BY callee_ns),
+    eff AS (
+        SELECT caller_ns AS ns, COUNT(DISTINCT callee_ns) AS n
+        FROM ce WHERE caller_ns <> callee_ns GROUP BY caller_ns)
+    SELECT COALESCE(a.ns, e.ns) AS namespace_,
+        COALESCE(a.n, 0) AS afferent, COALESCE(e.n, 0) AS efferent,
+        COALESCE(e.n, 0) + COALESCE(a.n, 0) AS total_deps,
+        CAST(100.0 * COALESCE(e.n, 0)
+             / NULLIF(COALESCE(e.n, 0) + COALESCE(a.n, 0), 0) AS INT)
+            AS pct_instability
+    FROM aff a FULL OUTER JOIN eff e ON e.ns=a.ns
+    WHERE (COALESCE(a.ns, e.ns)) LIKE :mod
+    ORDER BY total_deps DESC, pct_instability DESC LIMIT :lim"""),
+(
+    "lsb-hotspots",
+    "Classes dense in scoped self/parent/static calls",
+    "ANSWERS which classes lean hardest on scoped calls (`self::`,\n"
+    "     `parent::`, `static::`). Scoped calls are where late static binding\n"
+    "     surprises live: `static::` resolves at the runtime caller's class,\n"
+    "     `self::` at the definition site, and a copied method body between\n"
+    "     the two is how an override silently gets bypassed.\n"
+    "ACT review each scoped call for whether `static::` is what the author\n"
+    "     needs (usually it is) and whether the callee survived a move\n"
+    "     between parent and child.\n"
+    "MISLEADS the graph counts ALL scoped calls in one counter and CANNOT\n"
+    "     tell self:: from static:: apart -- that needs lexing the receiver.\n"
+    "     Rows are therefore hotspots to audit by eye, not confirmed LSB bugs.\n"
+    "     Calls through a variable (`$this->`), plain method calls, and\n"
+    "     constructor-promotion aliases are excluded.",
+    """SELECT s.name, s.class_name AS class_, s.n_static_calls AS scoped_calls,
+        s.n_dynamic_method AS dyn_methods, s.sloc, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_static_calls > 0 AND s.kind IN ('method','function')
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_static_calls DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "psr4-violations",
+    "Classes whose namespace does not match a composer psr-4 root",
+    "ANSWERS classes whose namespace lacks any prefix declared in\n"
+    "     composer.json autoload.psr-4. When the namespace matches no root,\n"
+    "     the autoloader falls back to file scanning or classmap, and moving\n"
+    "     the file breaks the lookup.\n"
+    "ACT add the namespace root to psr-4, or move the class to the matching\n"
+    "     directory; a class under App\\ should sit under src/App/ or the\n"
+    "     root that maps to it.\n"
+    "MISLEADS composer.json is read only for its psr-4 ROOTS (up to 400\n"
+    "     chars), and a namespace is judged \"covered\" if it STARTS WITH a\n"
+    "     root; overlapping roots, `classmap` entries, and per-file\n"
+    "     configurations all evade this. A bare root like App\\\\ with no\n"
+    "     directory equivalent is reported even where hand-loaded manually.",
+    """SELECT c.fqn, c.kind, m.name AS module,
+        (SELECT value FROM meta WHERE key='psr4_roots') AS psr4_roots,
+        f.path || ':' || c.line AS at
+    FROM classes c JOIN files f ON f.id=c.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE c.namespace <> ''
+      AND (SELECT value FROM meta WHERE key='psr4_roots')
+           NOT LIKE '%' || substr(c.namespace, 1,
+             CASE WHEN instr((SELECT value FROM meta
+                              WHERE key='psr4_roots'), '\\\\')
+                       > 0 THEN instr((SELECT value FROM meta
+                                       WHERE key='psr4_roots'), '\\\\') - 1
+                  ELSE 0 END) || '%'
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY c.namespace, c.name LIMIT :lim"""),
+(
+    "magic-fallback-risk",
+    "Classes whose magic methods can absorb calls no method implements",
+    "ANSWERS classes declaring __call/__callStatic/__get/__invoke in the\n"
+    "     same FILE that also contains calls no method implements -- the\n"
+    "     shape where a misspelled or removed method silently reroutes to\n"
+    "     the magic handler instead of failing loudly.\n"
+    "ACT add real methods for the names actually called; a magic method\n"
+    "     should be a deliberate proxy API, not a crash mat for typos.\n"
+    "MISLEADS attribution is FILE-SCOPED, not edge-scoped: the analyzer\n"
+    "     cannot resolve `$obj->missing()` to the class, so the query counts\n"
+    "     unresolved calls in the class's file and the mismatch can point at\n"
+    "     a DIFFERENT class in the same file. A deliberate proxy (every call\n"
+    "     routed through __call) is exactly this shape and correct.",
+    """SELECT c.name AS class_, c.has_call, c.has_get, c.has_invoke,
+        c.n_magic AS magic_methods,
+        (SELECT COUNT(*) FROM unresolved_calls u
+          JOIN symbols sm ON sm.id=u.caller_id AND sm.file_id=c.file_id)
+            AS unresolved_in_file,
+        f.path || ':' || c.line AS at
+    FROM classes c JOIN files f ON f.id=c.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE (c.has_call=1 OR c.has_callstatic=1 OR c.has_get=1
+           OR c.has_invoke=1)
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+      AND (SELECT COUNT(*) FROM unresolved_calls u
+           JOIN symbols sm ON sm.id=u.caller_id AND sm.file_id=c.file_id) > 0
+    ORDER BY unresolved_in_file DESC, c.n_magic DESC LIMIT :lim"""),
+(
+    "iface-coverage",
+    "Interfaces by number of classes that declare them",
+    "ANSWERS how many classes name each interface in their implements\n"
+    "     clause -- the declared implementation breadth of every contract.\n"
+    "     Rows with implementors=0 are the contracts nothing honors in-tree.\n"
+    "ACT a high-breadth interface is a stable-seam candidate; a\n"
+    "     zero-implementor one is dead abstraction, or a seam satisfied\n"
+    "     entirely by code outside the tree.\n"
+    "MISLEADS implements is a comma-joined declared-name list per class and\n"
+    "     matching is by exact name against that list, so aliased or\n"
+    "     namespaced spellings undercount; satisfaction via duck typing\n"
+    "     (PHP does not require `implements`) has no row at all; and a\n"
+    "     class that declares the interface but never uses it is counted\n"
+    "     the same as one fully implementing it.",
+    """SELECT i.name AS iface, i.namespace,
+        (SELECT COUNT(*) FROM classes c
+          WHERE instr(',' || c.implements || ',', ',' || i.name || ',') > 0
+            OR instr(',' || c.implements || ',',
+                     ',' || substr(i.fqn, 2) || ',') > 0)
+            AS implementors,
+        i.n_methods AS iface_methods,
+        f.path || ':' || i.line AS at
+    FROM classes i JOIN files f ON f.id=i.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE i.kind='interface' AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY implementors DESC, i.n_methods DESC LIMIT :lim"""),
+(
+    "abstract-hooks",
+    "Abstract methods awaiting implementations in concrete subclasses",
+    "ANSWERS the hooks each abstract class declares and how many concrete\n"
+    "     subclasses exist to implement them -- the interface a change to the\n"
+    "     abstract breaks across. Abstract classes with zero concrete\n"
+    "     subclasses in-tree are either templates consumed elsewhere or\n"
+    "     dead scaffolding.\n"
+    "ACT an abstract skeleton with one concrete subclass is often better\n"
+    "     off as a plain interface; with many, it is a template-method\n"
+    "     pattern worth documenting.\n"
+    "MISLEADS subclass lookup is by the extends TEXT column with name\n"
+    "     boundaries, so anonymous classes, string-built class names, and\n"
+    "     namespaced aliases of the parent can undercount; a concrete\n"
+    "     subclass that never overrides a given abstract method is counted\n"
+    "     as a potential implementor, not a proven one.",
+    """SELECT c.name AS abstract_class, c.namespace,
+        c.is_final AS final_,
+        (SELECT COUNT(*) FROM classes k
+          WHERE instr(',' || k.extends || ',', ',' || c.name || ',') > 0
+             OR instr(',' || k.extends || ',',
+                      ',' || substr(c.fqn, 2) || ',') > 0)
+            AS concrete_subclasses,
+        f.path || ':' || c.line AS at
+    FROM classes c JOIN files f ON f.id=c.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE c.is_abstract=1 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY concrete_subclasses ASC, c.n_methods DESC LIMIT :lim"""),
+(
+    "unprepared-sql-hotspots",
+    "SQL built by interpolation, never prepared, in a loop",
+    "ANSWERS SQL built by interpolation/concat/format, never prepared, paid\n"
+    "     per iteration when the site sits in a loop: the perf + injection\n"
+    "     double hit. `superglobal-to-sql` owns the TAINT ranking; this owns\n"
+    "     the BUILD-SHAPE ranking and deliberately includes rows with no\n"
+    "     superglobal in sight.\n"
+    "ACT prepare once outside the loop and parameterise the values; every\n"
+    "     interpolation is an injection site the moment the string is not a\n"
+    "     constant.\n"
+    "MISLEADS is_sanitized is a textual scan and a wrapper defeats it\n"
+    "     silently; build_kind 'variable' (a whole query in one variable) is\n"
+    "     excluded by construction -- the variable was built elsewhere and\n"
+    "     its construction site is where the real question lives.",
+    """SELECT f.path, s.name AS fn, ss.callee, ss.driver, ss.build_kind,
+        ss.in_loop, s.fan_in
+    FROM sql_sites ss
+    JOIN symbols s ON s.id = ss.symbol_id
+    JOIN files f ON f.id = ss.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE ss.is_prepared = 0 AND ss.build_kind IN ('interp','concat','format')
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY ss.in_loop DESC, s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "ssrf-frontier",
+    "Tainted superglobal read + remote fetch in the same function",
+    "ANSWERS functions that BOTH read a psalm-tainted superglobal AND call a\n"
+    "     remote-fetch sink: the SSRF review list. The URL host may be the\n"
+    "     internal network, and the function is the exact place a firewall\n"
+    "     bypass would ship.\n"
+    "ACT allowlist the URL host/scheme; never fetch raw user input. The\n"
+    "     superglobal key is in the row -- it tells you the input field.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the URL may be\n"
+    "     constant despite the read (the row names both so you can see); a\n"
+    "     validation wrapper between read and fetch is invisible (false\n"
+    "     negative class); the sink list is the hazard capture and is\n"
+    "     name-based. `remote-fetch-ssrf` is the coarser per-symbol counter;\n"
+    "     this is the same-function join.",
+    """SELECT DISTINCT f.path, s.name AS fn, s.fan_in,
+        sr.var AS reads, h.pattern AS fetch_sink
+    FROM symbols s
+    JOIN superglobal_reads sr ON sr.symbol_id = s.id AND sr.is_psalm_tainted = 1
+    JOIN hazards h ON h.symbol_id = s.id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE h.pattern IN ('curl_exec','curl_multi_exec','file_get_contents',
+                        'fopen','fsockopen')
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "implicit-nullable-params",
+    "Typed parameters with default null (PHP 8.4 deprecation)",
+    "ANSWERS parameters typed T with default null: implicitly nullable,\n"
+    "     deprecated in PHP 8.4. Every call site that relied on the implicit\n"
+    "     nullability keeps working -- the deprecation is a contract smell,\n"
+    "     not a break.\n"
+    "ACT spell it ?T; behaviour identical, deprecation gone.\n"
+    "MISLEADS only a deprecation when the repo targets PHP >= 8.4 -- check\n"
+    "     the runtime pin before acting; untyped and variadic params are\n"
+    "     excluded by construction; an explicit `?T = null` is the control\n"
+    "     and does not appear.",
+    """SELECT f.path, s.name AS fn, p.name AS param, p.type, s.fan_in
+    FROM params p
+    JOIN symbols s ON s.id = p.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+     WHERE p.default_value = 'null' AND p.type != ''
+       AND substr(p.type,1,1) != '?' AND p.is_nullable = 0
+       AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+     ORDER BY s.fan_in DESC
+     LIMIT :lim"""),
+(
+    "deprecated-api-frontier",
+    "@deprecated / #[Deprecated] methods still being called",
+    "ANSWERS deprecated methods with in-tree callers: the migration list.\n"
+    "     Each row is a caller that will keep working for a while and then\n"
+    "     silently break on a major release.\n"
+    "ACT migrate the callers top-down; the deprecation message says where.\n"
+    "MISLEADS is_deprecated comes from the #[Deprecated] attribute OR a\n"
+    "     @deprecated docblock directly above the method -- a docblock\n"
+    "     separated by a comment reads as clean; a deprecated method called\n"
+    "     only through call_user_func or a variable is invisible; public-API\n"
+    "     deprecation is deliberate, so the rows are the migration list, not\n"
+    "     violations.",
+    """SELECT s.name AS fn, s.class_name AS class_, COUNT(DISTINCT e.caller_id)
+            AS n_callers,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN edges e ON e.callee_id = s.id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.is_deprecated = 1 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY n_callers DESC
+    LIMIT :lim"""),
+(
+    "broad-catch-surface",
+    "catch (\\Throwable) / catch (Exception) handlers",
+    "ANSWERS handlers catching the widest exceptions: \\Throwable catches\n"
+    "     TypeError, ValueError, Error and every user exception -- the\n"
+    "     catch-all that turns programming errors into silent nulls.\n"
+    "ACT catch the specific exception the path can produce; a top-level\n"
+    "     boundary handler is the legitimate row.\n"
+    "MISLEADS n_catch_broad counts catch clauses whose type text contains\n"
+    "     Throwable or equals Exception: `catch (RuntimeException)` is\n"
+    "     correctly absent, and a handler that rethrows is not\n"
+    "     distinguished from one that swallows.",
+    """SELECT f.path, s.name AS fn, s.n_catch_broad AS broad_catches,
+        s.n_catch AS catches_total, s.fan_in
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_catch_broad > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_catch_broad DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "dynamic-property-writes",
+    "$obj->$name = v dynamic property writes (PHP 8.2 deprecation)",
+    "ANSWERS dynamic property writes: deprecated since 8.2 for classes\n"
+    "     without #[AllowDynamicProperties] or __set, and a shape-hiding\n"
+    "     sink -- the property is invisible to every static reader.\n"
+    "ACT declare the property, or use an explicit array/allowlist; if the\n"
+    "     class is a data bag, #[AllowDynamicProperties] with a comment.\n"
+    "MISLEADS classes defining __get/__set are excluded by the magic-method\n"
+    "     check; a dynamic property READ is a different capture and is\n"
+    "     absent; `$obj->fixed = v` (a literal property name) is not a\n"
+    "     dynamic write and does not appear.",
+    """SELECT f.path, s.name AS fn, s.class_name AS class_,
+        s.n_dynamic_prop_write AS dyn_writes, s.fan_in
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    LEFT JOIN symbols pc ON pc.id=s.parent_id
+    WHERE s.n_dynamic_prop_write > 0 AND f.is_test=0
+      AND NOT EXISTS (SELECT 1 FROM magic_methods mm
+                       WHERE mm.class_id = s.parent_id
+                         AND mm.method IN ('__get','__set'))
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_dynamic_prop_write DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "bool-flag-methods",
+    "Boolean flag parameters at the end of the parameter list",
+    "ANSWERS methods whose LAST parameter is a boolean with a default: the\n"
+    "     boolean-flag anti-pattern. Callers read `sendMail($to, $b, true)`\n"
+    "     and cannot tell the flag from the content.\n"
+    "ACT split into two methods, or replace the flag with an enum/options\n"
+    "     array; a boolean default of false in a rarely-called hook is the\n"
+    "     legitimate row.\n"
+    "MISLEADS the flag must be the LAST param with a literal false default;\n"
+    "     `$flag = false` earlier in the list or a true default is missed;\n"
+    "     fan_in weights the migration cost, and methods with no in-tree\n"
+    "     callers are excluded.",
+    """SELECT f.path, s.name AS fn, p.name AS param, s.fan_in
+    FROM params p
+    JOIN symbols s ON s.id = p.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE p.default_value = 'false' AND s.kind IN ('function','method')
+      AND p.pos = (SELECT MAX(pos) FROM params p2
+                    WHERE p2.symbol_id = p.symbol_id)
+      AND s.fan_in > 0 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "npath-explosion",
+    "Functions whose decision tree is exponential (PHPMD NPath)",
+    "ANSWERS the NPath estimate -- the product of branch counts, capped at\n"
+    "     2^cyclomatic: every added if doubles the paths the next reader\n"
+    "     must trace. Rows are the functions where one more branch is the\n"
+    "     difference between testable and untestable.\n"
+    "ACT split on the axis with the fewest paths; extract the decision\n"
+    "     table into data.\n"
+    "MISLEADS the estimate is 2^cyclomatic, not PHPMD's exact product: a\n"
+    "     switch of 10 cases reads as 2^cyclomatic instead of 10x, and a\n"
+    "     loop containing a branch reads the same as a branch containing a\n"
+    "     loop; the cap keeps the ranking honest beyond 2^20.",
+    """SELECT s.name, s.cyclomatic AS cyclo, s.sloc,
+        MIN(CAST(POWER(2, MIN(s.cyclomatic, 20)) AS INT)) AS npath_est,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND s.cyclomatic >= 8 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY npath_est DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "maintainability-index-worst",
+    "Lowest maintainability scores (Halstead + cyclomatic + LOC)",
+    "ANSWERS the functions the Halstead-based maintainability index ranks\n"
+    "     worst: dense operators, many tokens, high complexity. The score\n"
+    "     is this analyzer's materialized MI (0-100), the same family as\n"
+    "     PhpMetrics'.\n"
+    "ACT the bottom rows are where a refactor pays the most per line;\n"
+    "     decompose the operand-dense core first.\n"
+    "MISLEADS MI is a formula, not a verdict: a long flat data-formatter\n"
+    "     ranks badly and may be perfectly clear; the exact PhpMetrics MI\n"
+    "     needs unique-operator counting this analyzer approximates.",
+    """SELECT s.name, s.maintainability AS mi, s.cyclomatic AS cyclo,
+        s.halstead_volume AS volume, s.sloc, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND s.maintainability > 0
+      AND s.sloc >= 10 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.maintainability ASC
+    LIMIT :lim""")
 ]
 
 PhpAnalyzer.METRICS = [

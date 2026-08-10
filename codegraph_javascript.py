@@ -2817,6 +2817,19 @@ class TreeSitterAnalyzer(Analyzer):
             key = counters.get(t)
             if key is not None:
                 st.bump(key)
+            if named and t == "assignment_expression":
+                # window.x = ... / globalThis.x = ... / global.x = ... :
+                # assigning onto the ambient object is scope pollution and the
+                # one shape no linter here catches (n_global_write feeds
+                # `global-pollution`). Subscript form window["x"] is rarer and
+                # left unread deliberately; text_of is cheap (one subtree).
+                _left = node.child_by_field_name("left")
+                if _left is not None:
+                    _lt = text_of(_left, src)[:80]
+                    if (_lt.startswith("window.")
+                            or _lt.startswith("globalThis.")
+                            or _lt.startswith("global.")):
+                        st.bump("n_global_write")
             fkey = flags.get(t)
             if fkey is not None:
                 st.counts[fkey] = 1
@@ -3625,6 +3638,8 @@ class JavaScriptAnalyzer(TreeSitterAnalyzer):
         ("n_arguments", "INT NOT NULL DEFAULT 0"),
         ("n_with_stmt", "INT NOT NULL DEFAULT 0"),
         ("n_proto_write", "INT NOT NULL DEFAULT 0"),
+        # -- global scope pollution -----------------------------------------
+        ("n_global_write", "INT NOT NULL DEFAULT 0"),
         # -- regex ---------------------------------------------------------
         ("n_regex_redos", "INT NOT NULL DEFAULT 0"),
         # -- retention: the two things no linter checks --------------------
@@ -3663,6 +3678,7 @@ class JavaScriptAnalyzer(TreeSitterAnalyzer):
         ("n_child_process", "INT NOT NULL DEFAULT 0"),
     ("n_fs_sync", "INT NOT NULL DEFAULT 0"),
     ("n_assign_in_loop", "INT NOT NULL DEFAULT 0"),
+    ("n_dup_cond", "INT NOT NULL DEFAULT 0"),
     ("n_json_parse_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_array_grow_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_search_in_loop", "INT NOT NULL DEFAULT 0"),
@@ -3783,6 +3799,16 @@ CREATE TABLE module_caches(
     n_size_checks INT NOT NULL DEFAULT 0,
     has_max INT NOT NULL DEFAULT 0,
     writer_fns TEXT NOT NULL DEFAULT ''
+) STRICT;
+
+-- Dependencies declared in package.json, for unused-dependencies: a
+-- declared name with no matching import target is dead weight or config debt.
+CREATE TABLE deps(
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '',
+    is_dev INT NOT NULL DEFAULT 0,
+    dir TEXT NOT NULL DEFAULT ''
 ) STRICT;
 
 CREATE TABLE jsx_components(
@@ -4331,6 +4357,24 @@ UPDATE exports AS e SET symbol_id = x.id FROM
                 p = text_of(prop, src) if prop is not None else ""
                 if p in ("innerHTML", "outerHTML", "srcdoc"):
                     st.bump("n_innerhtml")
+        elif t == "if_statement":
+            # duplicate-branch-conditions: `if (a) ... else if (a)` -- the
+            # second condition can never be reached when the first failed.
+            cond = node.child_by_field_name("condition")
+            alt = node.child_by_field_name("alternative")
+            if cond is not None and alt is not None:
+                if alt.type == "if_statement":
+                    c2 = alt.child_by_field_name("condition")
+                elif alt.type == "else_clause":
+                    inner = alt.named_children[0] \
+                        if alt.named_children else None
+                    c2 = inner.child_by_field_name("condition") \
+                        if inner is not None and inner.type == "if_statement" \
+                        else None
+                else:
+                    c2 = None
+                if c2 is not None and text_of(cond, src) == text_of(c2, src):
+                    st.bump("n_dup_cond")
         elif t == "object" or t == "array":
             if loop_depth:
                 st.bump("alloc_in_loop")
@@ -4959,6 +5003,17 @@ UPDATE exports AS e SET symbol_id = x.id FROM
         deps = data.get("dependencies") or {}
         dev = data.get("devDependencies") or {}
         engines = data.get("engines") or {}
+        dep_rows = []
+        for sect, is_dev in (("dependencies", 0), ("devDependencies", 1)):
+            got = data.get(sect) or {}
+            if not isinstance(got, dict):
+                continue
+            for name, ver in got.items():
+                dep_rows.append((str(name)[:120], str(ver)[:40], is_dev, "."))
+        if dep_rows:
+            db.executemany(
+                "INSERT INTO deps(name,version,is_dev,dir) VALUES(?,?,?,?)",
+                dep_rows)
         db.executemany(
             "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
             (
@@ -5935,7 +5990,263 @@ JavaScriptAnalyzer.QUERIES = [
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.n_require_dynamic > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.fan_in DESC, s.n_require_dynamic DESC LIMIT :lim""")
+    ORDER BY s.fan_in DESC, s.n_require_dynamic DESC LIMIT :lim"""),
+(
+    "anon-callback-depth",
+    "Anonymous callbacks per file: the accidental-callback-hell meter",
+    "ANSWERS where a single file accumulates anonymous closures -- the shape\n"
+    "     that becomes un-nameable state and un-testable behavior. High counts\n"
+    "     in one file mean reads nest but the file also does the most work\n"
+    "     through closures.\n"
+    "ACT name the callbacks that carry real logic; leave only trivial\n"
+    "     adapters anonymous.\n"
+    "MISLEADS counts symbols named `(anonymous)` only; an arrow assigned to a\n"
+    "     const is named and invisible here, so this UNDERcounts closures and\n"
+    "     says nothing about nesting depth, which `deep-nesting` measures.",
+    """SELECT f.path,
+        COUNT(CASE WHEN s.name='(anonymous)'
+                   AND s.kind IN ('function','closure') THEN 1 END)
+            AS anon_closures,
+        COUNT(DISTINCT s.name) AS distinct_names,
+        f.sloc
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY f.id
+    HAVING anon_closures > 0
+    ORDER BY anon_closures DESC, f.sloc DESC LIMIT :lim"""),
+(
+    "destructured-vs-default",
+    "Destructured imports vs default imports per file",
+    "ANSWERS how each file prefers to take module surfaces: named\n"
+    "     destructuring (import_names.alias set) versus default imports\n"
+    "     (is_default). The ratio says whether the module's API is consumed\n"
+    "     by name or funneled through one default.\n"
+    "ACT a file at 0% named is likely importing CJS-style `require(x).default`\n"
+    "     chains or a barrel; a file at 100% named is depending on the export\n"
+    "     names being STABLE across upgrades.\n"
+    "MISLEADS counts import SPECIFIERS, not symbols: `import {a, b}` is two\n"
+    "     rows; `import x from` is one. Namespace imports (import_names\n"
+    "     is_namespace) are excluded from both buckets.",
+    """SELECT f.path,
+        COUNT(CASE WHEN i.is_default=1 THEN 1 END) AS default_imports,
+        COUNT(CASE WHEN i.is_namespace=1 THEN 1 END) AS ns_imports,
+        COUNT(CASE WHEN i.is_default=0 AND i.is_namespace=0 THEN 1 END)
+            AS named_imports,
+        CAST(100.0 * COUNT(CASE WHEN i.is_default=0 AND i.is_namespace=0
+                                THEN 1 END)
+             / NULLIF(COUNT(*), 0) AS INT) AS pct_named
+    FROM import_names i JOIN files f ON f.id=i.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY f.id
+    ORDER BY pct_named DESC, named_imports DESC LIMIT :lim"""),
+(
+    "relative-import-depth",
+    "Files reaching up more than one directory with ../",
+    "ANSWERS which files climb the tree with `../` -- every level is a\n"
+    "     directory rename away from breaking, and the depth is the\n"
+    "     encapsulation cost of the layout. Long relative chains are the\n"
+    "     shape a path-alias or a test helper move fixes.\n"
+    "ACT replace chains of depth >= 2 with a package alias or a shared file\n"
+    "     closer to the root; a depth-1 `../` is normal package structure.\n"
+    "MISLEADS counts `../` SEGMENTS in the specifier string, so a path alias\n"
+    "     doing the same work is invisible and a deeply nested module hugging\n"
+    "     its config (../ 2x but inside the same package) is over-reported.",
+    """SELECT f.path,
+        MAX((length(i.target) - length(replace(i.target, '../', '')))
+            / 3) AS max_up,
+        SUM(CASE WHEN instr(i.target, '../') > 0 THEN 1 ELSE 0 END)
+            AS deep_imports
+    FROM imports i JOIN files f ON f.id=i.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE (length(i.target) - length(replace(i.target, '../', ''))) / 3 > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY f.id
+    ORDER BY max_up DESC, deep_imports DESC LIMIT :lim"""),
+(
+    "global-pollution",
+    "Direct assignments onto window / globalThis / global",
+    "ANSWERS where a file writes onto the ambient object instead of exporting\n"
+    "     -- the assignments that collide across bundles, make tests bleed\n"
+    "     into each other, and hide dependencies.\n"
+    "ACT replace with explicit exports, or a namespace object imported by\n"
+    "     name; if the assignment is a deliberate polyfill, say so in a\n"
+    "     comment and expect this row forever.\n"
+    "MISLEADS counts `window.x = ...`-style member assignments whose left\n"
+    "     operand begins with window./globalThis./global.; `window[\"x\"]`\n"
+    "     subscript form, `global.x` inside a worker where it is legitimate,\n"
+    "     and assignments performed by CALLED code are all invisible.",
+    """SELECT s.name, s.n_global_write AS global_writes,
+        s.kind, s.sloc, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_global_write > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_global_write DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "reexport-propagation",
+    "Barrel files re-exporting imported symbols",
+    "ANSWERS the files that re-export what they import (index.js barrels and\n"
+    "     CJS `module.exports = {...}` passthroughs). Each row is a symbol\n"
+    "     whose true definition lives ANOTHER file deep, which makes the\n"
+    "     module graph shallower at the cost of the barrel's indirection.\n"
+    "ACT keep barrels to one level; a barrel re-exporting a re-export buries\n"
+    "     the source of truth two edits away.\n"
+    "MISLEADS relies on exports.is_reexport/source_id being populated for the\n"
+    "     import-then-export shape; a barrel that assigns `module.exports.x =\n"
+    "     importedModule.x` is not flagged unless it routes through the\n"
+    "     exporter visitor, and STAR exports of namespaces read as one row.",
+    """SELECT b.path AS barrel, COUNT(*) AS n_reexports,
+        COUNT(DISTINCT e.source_id) AS from_files,
+        GROUP_CONCAT(DISTINCT e.name) AS symbols_, MIN(e.line) AS first_line
+    FROM exports e JOIN files b ON b.id=e.file_id
+    LEFT JOIN modules m ON m.id=b.module_id
+    WHERE e.is_reexport=1 AND b.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY b.id
+    ORDER BY n_reexports DESC, from_files DESC LIMIT :lim"""),
+(
+    "then-without-catch",
+    "Functions that .then() and never .catch()/.finally(): floating rejections",
+    "ANSWERS functions whose bodies chain .then() and never attach a\n"
+    "     .catch() or .finally() to any promise: an unhandled-rejection\n"
+    "     candidate every time the chain's input rejects.\n"
+    "ACT attach a rejection handler, or convert to await inside a try/catch.\n"
+    "     Returning the promise for the CALLER to catch is fine -- and this\n"
+    "     query will still flag it, because the counter is per-function-body.\n"
+    "MISLEADS n_then counts every .then in the body and n_catch_handler every\n"
+    "     .catch/.finally, WITHOUT pairing them: a function with two chains,\n"
+    "     one caught and one not, is NOT flagged (counter-balance), and a\n"
+    "     chain handed back to a caller that catches it IS flagged\n"
+    "     (false positive by design -- the rows are the review list).\n"
+    "     await-style callers never .then and are absent; a bare `then(fn)`\n"
+    "     identifier (no dot) also counts, which is a rare name collision.",
+    """SELECT f.path, s.name, s.n_then AS then_sites,
+        s.n_catch_handler AS handlers, s.fan_in,
+        s.is_async AS async_fn, s.sloc
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+     WHERE s.n_then > 0 AND s.n_catch_handler = 0
+       AND f.is_generated = 0 AND f.is_test = 0
+       AND COALESCE(m.name,'') LIKE :mod
+     ORDER BY s.n_then DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "includes-in-loop",
+    "includes/indexOf/find inside loop bodies (the accidental O(n^2))",
+    "ANSWERS functions that scan a collection from inside a loop: every\n"
+    "     iteration walks the collection again, and the loop is quadratic\n"
+    "     in the product of the sizes. This is the dominant hot-path\n"
+    "     surprise in JavaScript.\n"
+    "ACT use a Set/Map for membership, or restructure so the scan happens\n"
+    "     once.\n"
+    "MISLEADS the counter counts sites in loop bodies only: a scan that is\n"
+    "     itself the loop's iteration (for..of over a Set) is absent, and a\n"
+    "     small fixed-size inner loop (e.g. 3 elements) pays little -- this\n"
+    "     ranks review order, not measured cost.",
+    """SELECT f.path, s.name, s.n_search_in_loop AS searches_in_loop,
+        s.n_loops AS loops, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_search_in_loop > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_search_in_loop DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "object-injection-surface",
+    "Dynamic bracket writes: obj[computedKey] = v",
+    "ANSWERS assignments whose target key is computed at run time: the\n"
+    "     object-injection sink (eslint-security\n"
+    "     detect-object-injection). When the key comes from request data,\n"
+    "     the write can land on __proto__/constructor or on a property the\n"
+    "     author never meant to expose.\n"
+    "ACT validate the key against an allowlist, or use a Map; never write\n"
+    "     with an unvalidated request-derived key.\n"
+    "MISLEADS n_dynamic_prop counts ALL computed-key writes: a constant-\n"
+    "     derived key (a local variable) is indistinguishable from a\n"
+    "     request-derived one at the syntax level, so the rows are the\n"
+    "     review surface; reads through a computed key are a different\n"
+    "     counter and are absent.",
+    """SELECT f.path, s.name, s.n_dynamic_prop AS dynamic_writes,
+        s.n_proto_write AS proto_writes, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_dynamic_prop > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_dynamic_prop DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "duplicate-branch-conditions",
+    "if (a) ... else if (a): the second branch can never run (sonarjs)",
+    "ANSWERS if/else-if chains where a later condition repeats an earlier\n"
+    "     one: the repeated branch is dead code and its body hides a\n"
+    "     mistake -- the author meant a different condition.\n"
+    "ACT change the second condition, or merge the branches.\n"
+    "MISLEADS text equality only: `a === 1` vs `a == 1` or a re-ordered\n"
+    "     expression are NOT detected; an if inside an if (nesting, not an\n"
+    "     else-if chain) is not compared.",
+    """SELECT f.path, s.name, s.n_dup_cond AS dup_conds, s.cyclomatic AS cyclo,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_dup_cond > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_dup_cond DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "unused-dependencies",
+    "package.json dependencies never imported (knip/machete territory)",
+    "ANSWERS declared dependencies no import in the tree references: dead\n"
+    "     weight in install time and lockfile surface, or a module used only\n"
+    "     through a global/plugin the importer cannot see.\n"
+    "ACT remove the dependency, or import it where it is actually used; a\n"
+    "     dependency used only by a build script or a global side effect\n"
+    "     shows as unused here -- check before deleting.\n"
+    "MISLEADS matching is target-basename: `import x from 'lodash/merge'`\n"
+    "     counts as using lodash; a dependency used only via a package\n"
+    "     internal (no import statement) reads as unused; devDependencies\n"
+    "     used only by scripts (no source import) are the dominant\n"
+    "     legitimate row.",
+    """SELECT d.name, d.version, d.is_dev,
+        (SELECT COUNT(*) FROM imports i
+          WHERE i.target = d.name
+             OR substr(i.target, 1, length(d.name) + 1) = d.name || '/')
+            AS used
+    FROM deps d
+    WHERE (SELECT COUNT(*) FROM imports i
+            WHERE i.target = d.name
+               OR substr(i.target, 1, length(d.name) + 1) = d.name || '/') = 0
+    ORDER BY d.is_dev, d.name
+    LIMIT :lim"""),
+(
+    "layer-crossings",
+    "routes/views/pages files importing db/api/server files",
+    "ANSWERS the layer crossings in the conventional web stack: a route or\n"
+    "     page module importing a data-access module. The fix is the same\n"
+    "     as in every layering rule -- route through a service/interface --\n"
+    "     but the directory convention is the cheapest detector there is.\n"
+    "ACT move the data access behind a service module, or accept the\n"
+    "     crossing deliberately and say why in a comment.\n"
+    "MISLEADS pure directory-name convention: a `routes/` dir that is not a\n"
+    "     web layer (e.g. a routing library) misreads, and a `db/` helper\n"
+    "     that is really a pure utility is flagged; a crossing through a\n"
+    "     barrel (routes/ importing api/index) is matched on the barrel's\n"
+    "     dir.",
+    """SELECT fc.path AS from_file, ft.path AS to_file, i.line, i.target
+    FROM imports i
+    JOIN files fc ON fc.id = i.file_id
+    JOIN files ft ON ft.id = i.target_id
+    LEFT JOIN modules m ON m.id = fc.module_id
+    WHERE (instr('/' || fc.dir || '/', '/routes/') > 0
+           OR instr('/' || fc.dir || '/', '/views/') > 0
+           OR instr('/' || fc.dir || '/', '/pages/') > 0)
+      AND (instr('/' || ft.dir || '/', '/db/') > 0
+           OR instr('/' || ft.dir || '/', '/api/') > 0
+           OR instr('/' || ft.dir || '/', '/server/') > 0)
+      AND fc.id <> ft.id
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY fc.path, i.line
+    LIMIT :lim""")
 ]
 
 JavaScriptAnalyzer.METRICS = [

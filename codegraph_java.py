@@ -3759,6 +3759,13 @@ class JavaAnalyzer(TreeSitterAnalyzer):
     ("n_load_library", "INT NOT NULL DEFAULT 0"),
     ("n_elif", "INT NOT NULL DEFAULT 0"),
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
+        # -- P2 pack: correctness discipline --------------------------------
+        ("n_ref_eq", "INT NOT NULL DEFAULT 0"),
+        ("n_narrow_calc", "INT NOT NULL DEFAULT 0"),
+        ("n_dead_exception", "INT NOT NULL DEFAULT 0"),
+        ("n_super_calls", "INT NOT NULL DEFAULT 0"),
+        ("n_static_write_ctor", "INT NOT NULL DEFAULT 0"),
+        ("n_modern_idioms", "INT NOT NULL DEFAULT 0"),
     )
 
     SCHEMA_EXT = r"""
@@ -4298,6 +4305,9 @@ UPDATE symbols SET arity_rank = CASE
                   loop_depth: int) -> None:
         if node.type == "character_literal":
             return
+        if node.type == "string_literal" and text.startswith('"""'):
+            # modern-idiom-candidates: a text block.
+            st.bump("n_modern_idioms")
         if SQL_RE.search(text):
             parent = node.parent
             if parent is not None and parent.type == "binary_expression":
@@ -4339,6 +4349,18 @@ UPDATE symbols SET arity_rank = CASE
                 if (right is not None and right.type == "null_literal") or (
                         left is not None and left.type == "null_literal"):
                     st.bump("n_null_check")
+                if o in ("==", "!=") and right is not None and \
+                        left is not None and right.type not in (
+                            "decimal_integer_literal",
+                            "decimal_floating_point_literal",
+                            "null_literal", "string_literal") and \
+                        left.type not in ("decimal_integer_literal",
+                                          "decimal_floating_point_literal",
+                                          "null_literal", "string_literal"):
+                    # Error Prone ReferenceEquality: == on two non-literals.
+                    # The boxed-typed operands are a type question the query
+                    # cross-references via n_boxing_sites.
+                    st.bump("n_ref_eq")
             elif o in ("&", "|", "^"):
                 st.bump("n_bitop")
             elif o in ("<<", ">>", ">>>"):
@@ -4352,6 +4374,19 @@ UPDATE symbols SET arity_rank = CASE
                     st.bump("n_arith")
             elif o in ("-", "*", "/", "%"):
                 st.bump("n_arith")
+                # Error Prone NarrowCalculation: an arithmetic product
+                # assigned to a long without widening -- `long x = a * b`
+                # with int a, b overflows before the assignment. The type
+                # field lives on the enclosing local_variable_declaration,
+                # not the declarator.
+                par = node.parent
+                if par is not None and par.type == "variable_declarator":
+                    ty = par.child_by_field_name("type")
+                    if ty is None and par.parent is not None:
+                        ty = par.parent.child_by_field_name("type")
+                    if ty is not None and \
+                            _txt(ty, src).lstrip().startswith("long"):
+                        st.bump("n_narrow_calc")
         elif t == "assignment_expression":
             op = _field_child(node, "operator")
             if op is not None and _txt(op, src) != "=":
@@ -4360,6 +4395,14 @@ UPDATE symbols SET arity_rank = CASE
                     st.bump("n_string_concat")
                     if loop_depth:
                         st.bump("concat_in_loop")
+            left = node.child_by_field_name("left")
+            if left is not None and left.type == "field_access":
+                obj = left.child_by_field_name("object")
+                ot = _txt(obj, src) if obj is not None else ""
+                if ot and ot != "this":
+                    # Class.staticField = v -- the ctor-time static write
+                    # shape; this.x is an instance write and is excluded.
+                    st.bump("n_static_write_ctor")
         elif t == "cast_expression":
             ty = node.child_by_field_name("type")
             if ty is not None and ty.type in ("generic_type",):
@@ -4388,6 +4431,16 @@ UPDATE symbols SET arity_rank = CASE
                              and p.child_by_field_name("left").type
                              == "field_access"))):
                 st.bump("n_escaping_allocs")
+            if p is not None and p.type == "expression_statement":
+                # `new IOException(...);` alone -- created, never thrown,
+                # never assigned. The statement does nothing.
+                ty = node.child_by_field_name("type")
+                tname = ""
+                if ty is not None:
+                    tname = _simple_type(_txt(ty, src))
+                if any(k in tname for k in ("Exception", "Error",
+                                            "Throwable")):
+                    st.bump("n_dead_exception")
         elif t == "synchronized_statement" and loop_depth:
             st.bump("lock_in_loop")
         elif t == "method_invocation" and loop_depth:
@@ -4395,6 +4448,20 @@ UPDATE symbols SET arity_rank = CASE
             if nm is not None and _txt(nm, src) in ("lock", "tryLock",
                                                     "lockInterruptibly"):
                 st.bump("lock_in_loop")
+        elif t == "method_invocation":
+            obj = node.child_by_field_name("object")
+            if obj is not None and _txt(obj, src) == "super":
+                # missing-super-call: framework hooks that forget super.
+                st.bump("n_super_calls")
+        elif t in ("switch_expression", "switch_statement"):
+            if "->" in _txt(node, src)[:2000]:
+                # modern-idiom-candidates: an arrow switch expression.
+                st.bump("n_modern_idioms")
+        elif t == "instanceof_expression":
+            if node.child_by_field_name("name") is not None:
+                # modern-idiom-candidates: pattern matching instanceof -- the
+                # pattern variable is the `name` field of the expression.
+                st.bump("n_modern_idioms")
 
     # -- hazards -----------------------------------------------------------
     def hazard_of(self, callee: str) -> Optional[tuple[str, str]]:
@@ -5909,7 +5976,462 @@ WITH fld AS (
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE o.is_annotated=0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.fan_in DESC LIMIT :lim""")
+    ORDER BY s.fan_in DESC LIMIT :lim"""),
+(
+    "hierarchy-depth",
+    "Inheritance depth per class: the fragile-base-class meter",
+    "ANSWERS how many extends-hops sit between each class and its root\n"
+    "     ancestor. Deep hierarchies are where a base-class change ripples\n"
+    "     widest, and each level adds indirection that refactoring tools must\n"
+    "     walk.\n"
+    "ACT prefer composition over inheritance above depth ~4; at minimum,\n"
+    "     the deep rows are the ones to watch when the base changes.\n"
+    "MISLEADS resolution of type_relations is by simple NAME, so two classes\n"
+    "     sharing a name in different packages are conflated; depth is capped\n"
+    "     at 10 hops (the bound in the recursion) and anything cycling through\n"
+    "     a name loop stops there. Interface `extends` is excluded -- only\n"
+    "     class extends is walked, matching what the compiler enforces.",
+    """WITH RECURSIVE chain(sym, name, depth) AS (
+        SELECT tr.child_id, tr.parent_name, 1
+        FROM type_relations tr
+        WHERE tr.kind='extends'
+        UNION
+        SELECT c.sym, tr2.parent_name, c.depth + 1
+        FROM chain c
+        JOIN symbols sc ON sc.name = c.name AND sc.kind='class'
+        JOIN type_relations tr2 ON tr2.child_id = sc.id
+        WHERE tr2.kind='extends' AND c.depth < 10)
+    SELECT s.name AS class_, MAX(c.depth) AS depth,
+        COUNT(DISTINCT c.name) AS distinct_ancestors,
+        (SELECT COUNT(*) FROM type_relations tr3
+          WHERE tr3.child_id=s.id AND tr3.kind='extends') AS defs,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM chain c JOIN symbols s ON s.id=c.sym
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='class' AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY depth DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "di-bottleneck",
+    "Annotation-heavy classes with the most inbound dependents",
+    "ANSWERS the classes a framework wire-up (annotations) AND the call graph\n"
+    "     agree on as central: annotated types that also receive the most\n"
+    "     calls. These are the beans a rename or signature change breaks across\n"
+    "     the whole injection graph.\n"
+    "ACT before changing such a class, sweep its callers with git log; the\n"
+    "     annotation count is the framework-lock-in half, fan_in the\n"
+    "     compile-time half.\n"
+    "MISLEADS annotation count is a lock-in PROXY: a class with three\n"
+    "     unrelated annotations ranks as if framework-coupled. inbound_callers\n"
+    "     counts distinct callers of any method the class owns, and a bean\n"
+    "     reached purely through a container (reflection, proxied lookup) has\n"
+    "     no edge and is invisible here.",
+    """SELECT s.name, s.kind, s.n_annotations AS annotations,
+        (SELECT COUNT(DISTINCT e.caller_id) FROM edges e
+         JOIN symbols mth ON mth.id=e.callee_id
+         WHERE mth.parent_id=s.id) AS inbound_callers,
+        s.cyclomatic AS cyclo, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('class','interface') AND s.n_annotations > 0
+      AND (SELECT COUNT(DISTINCT e.caller_id) FROM edges e
+           JOIN symbols mth ON mth.id=e.callee_id
+           WHERE mth.parent_id=s.id) > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY inbound_callers DESC, s.n_annotations DESC LIMIT :lim"""),
+(
+    "overload-density",
+    "Types with the most methods sharing one name",
+    "ANSWERS where overloading is densest: many same-named methods per owner.\n"
+    "     Each overload is a call-distribution hazard -- the analyzer resolves\n"
+    "     calls by simple name and cannot tell them apart, so ambiguity grows\n"
+    "     with the count.\n"
+    "ACT if a name has many overloads, the callers deserve a look: a\n"
+    "     re-ordered parameter list across overloads is how a call silently\n"
+    "     binds to the wrong one.\n"
+    "MISLEADS n_overloads counts (name, owner) collisions minus one; two\n"
+    "     same-named methods in DIFFERENT owners each report n_overloads=0,\n"
+    "     which is correct for dispatch but understates name noise.",
+    """SELECT pc.name AS owner, s.name, MAX(s.n_overloads) AS overloads,
+        (SELECT COUNT(*) FROM symbols s2
+          WHERE s2.name=s.name AND s2.parent_id=s.parent_id) AS total_defs,
+        MIN(s.sloc) AS sloc, MAX(s.fan_in) AS fan_in,
+        f.path || ':' || MIN(s.line_start) AS at
+    FROM symbols s JOIN symbols pc ON pc.id=s.parent_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='method' AND s.n_overloads > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY pc.id, s.name
+    ORDER BY overloads DESC LIMIT :lim"""),
+(
+    "iface-impl-ratio",
+    "Interfaces by implementation breadth",
+    "ANSWERS the interface contracts with the most concrete implementors.\n"
+    "     High breadth is a stable-seam signal; low breadth (with megamorphic-\n"
+    "     callsites) is the dead-abstraction end.\n"
+    "ACT high-breadth rows are the interfaces to version carefully and\n"
+    "     conformance-test; every new implementor multiplies the blast radius\n"
+    "     of a signature change.\n"
+    "MISLEADS n_impl_targets counts by simple-name matching against the\n"
+    "     type_relations implementors list, so generics collapse and two\n"
+    "     same-named types merge; only in-tree implementations are visible.",
+    """SELECT s.name AS iface, s.kind, s.n_impl_targets AS implementors,
+        (SELECT COUNT(*) FROM overrides o WHERE o.parent_type=s.name)
+            AS overriders,
+        (SELECT COUNT(*) FROM symbols m
+          WHERE m.parent_id=s.id AND m.kind='method') AS methods,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('interface','class') AND s.n_impl_targets > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY implementors DESC, methods DESC LIMIT :lim"""),
+(
+    "package-cycle",
+    "Mutual file imports: the 2-cycle of the dependency graph",
+    "ANSWERS pairs of files that import each other. Two files can never be\n"
+    "     loaded lazily this way, and the pair is where a cycle longer than 2\n"
+    "     usually starts growing.\n"
+    "ACT break the cycle by moving the shared interface into a third file.\n"
+    "MISLEADS finds 2-cycles of FILES only (imports.target_id), not packages\n"
+    "     and not cycles of length >= 3 -- a longer cycle needs an SCC walk and\n"
+    "     does not appear here. Java import statements name PACKAGES, so the\n"
+    "     shared resolver matches ~0 imports on real corpora (documented in\n"
+    "     CLAUDE.md as the correct answer, not a bug): this query returns rows\n"
+    "     only where an in-tree FILE import happens (e.g. two files in the\n"
+    "     same package importing each other's simple names), so on a real\n"
+    "     Java corpus it is a true negative -- the fixture pair proves the\n"
+    "     query is live, not dead. Simple-name import resolution means\n"
+    "     same-named files in different packages can pair spuriously.",
+    """SELECT fa.path AS file_a, fbi.path AS file_b,
+        ia.line AS a_line, ib.line AS b_line
+    FROM imports ia
+    JOIN imports ib ON ia.target_id=ib.file_id AND ib.target_id=ia.file_id
+    JOIN files fa ON fa.id=ia.file_id
+    JOIN files fbi ON fbi.id=ib.file_id
+    WHERE ia.file_id < ib.file_id AND fa.path LIKE :mod
+    ORDER BY fa.path, fbi.path LIMIT :lim"""),
+(
+    "annotation-coupling",
+    "Classes by annotation density: framework lock-in heat map",
+    "ANSWERS which classes carry the most annotations relative to their own\n"
+    "     size -- the files most locked to whatever framework supplies those\n"
+    "     annotations, and the hardest to port or mock.\n"
+    "ACT review whether the single-heavy file is doing one job through many\n"
+    "     annotations (a god-class symptom) or is a legitimately framework-\n"
+    "     bound adapter.\n"
+    "MISLEADS n_annotations counts annotation SITES, so a file of ten\n"
+    "     `@SuppressWarnings` ranks ahead of a service with one `@Service`;\n"
+    "     density per sloc is the adjustment, and built-in markers like\n"
+    "     @Override are counted as annotations too.",
+    """SELECT s.name, s.kind, s.n_annotations AS annotations,
+        s.sloc, CAST(1000.0*s.n_annotations/NULLIF(s.sloc,0) AS INT)
+            AS per_kloc,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_annotations >= 2 AND s.kind IN ('class','interface')
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY annotations DESC, per_kloc DESC LIMIT :lim"""),
+(
+    "abstract-fanout",
+    "Abstract methods with the most override implementations",
+    "ANSWERS the contract points every subclass must implement or inherit:\n"
+    "     abstract methods whose override count is highest are the change\n"
+    "     points that force edits across the widest subclass set.\n"
+    "ACT a change to an abstract method here is a change to every subclass\n"
+    "     below it -- treat the top rows as breaking changes.\n"
+    "MISLEADS override rows are matched by simple NAME to parent_type, so an\n"
+    "     overloaded parent method merges its implementations; only in-tree\n"
+    "     overrides count, and a method marked abstract by a supertype outside\n"
+    "     the tree has no record here.",
+    """SELECT o.parent_type AS parent, o.method_name AS method,
+        COUNT(*) AS override_impls, COUNT(DISTINCT o.owner_type)
+            AS distinct_owners,
+        GROUP_CONCAT(DISTINCT o.owner_type) AS owners,
+        f.path || ':' || MIN(o.line) AS at_any
+    FROM overrides o
+    JOIN files f ON f.id=o.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE COALESCE(m.name,'') LIKE :mod
+    GROUP BY o.parent_type, o.method_name
+    ORDER BY override_impls DESC, distinct_owners DESC LIMIT :lim"""),
+(
+    "layer-violations",
+    "Web-layer classes calling persistence-layer classes directly",
+    "ANSWERS edges that skip the service layer: a class named like a\n"
+    "     controller/resource/servlet calling one named like a DAO/repository/\n"
+    "     mapper. The heuristic is name-shape only -- we do not model Spring\n"
+    "     stereotypes -- so the same rows describe both real violations and\n"
+    "     false positives; the SME-layer name is the intended middle-man.\n"
+    "ACT for each row check whether a service-layer class mediates the call;\n"
+    "     if not, the controller owns a data-access detail it should not.\n"
+    "MISLEADS pure naming heuristics: a `UserRepository` used INSIDE a\n"
+    "     `UserController` that is itself a legit bounded-context adapter is\n"
+    "     reported. Names are boundary-tested (suffix match), not substring,\n"
+    "     so `MyControllerHelper` does not match; annotations are not\n"
+    "     considered, so a @RestController is detected only by name. Edges are\n"
+    "     method-to-method, so the suffixes tested are the OWNER class names.",
+    """SELECT cal.owner_type AS caller, cle.owner_type AS callee,
+        cal.name AS caller_method, cle.name AS callee_method,
+        e.n_calls, f.path || ':' || cal.line_start AS at
+    FROM edges e
+    JOIN symbols cal ON cal.id=e.caller_id
+    JOIN symbols cle ON cle.id=e.callee_id
+    JOIN files f ON f.id=cal.file_id
+    LEFT JOIN modules m ON m.id=cal.module_id
+    WHERE f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+      AND (substr(lower(cal.owner_type), -10) = 'controller'
+           OR substr(lower(cal.owner_type), -8) = 'resource'
+           OR substr(lower(cal.owner_type), -7) = 'servlet'
+           OR substr(lower(cal.owner_type), -6) = 'action')
+      AND (substr(lower(cle.owner_type), -3) = 'dao'
+           OR substr(lower(cle.owner_type), -10) = 'repository'
+           OR substr(lower(cle.owner_type), -6) = 'mapper'
+           OR substr(lower(cle.owner_type), -2) = 'db')
+      AND cal.id <> cle.id
+    ORDER BY e.n_calls DESC LIMIT :lim"""),
+(
+    "empty-catch-by-fanin",
+    "Catch blocks that discard the exception entirely (PMD EmptyCatchBlock)",
+    "ANSWERS catch blocks whose body is empty -- the exception is swallowed\n"
+    "     and the caller can never learn the failure -- ranked by how much of\n"
+    "     the tree depends on the swallower.\n"
+    "ACT log, rethrow, or narrow the catch; empty is never the answer. A\n"
+    "     comment inside the braces is not empty (the analyzer sees the\n"
+    "     comment node), but a comment is still swallowing.\n"
+    "MISLEADS deliberately broad boundary catches (a controller's top-level\n"
+    "     try that converts everything to a 500) are the dominant legitimate\n"
+    "     row; is_empty is structural (no named children), so a catch whose\n"
+    "     body is only a comment does not fire.",
+    """SELECT f.path, s.name, e.type AS caught, e.line, s.fan_in
+    FROM exceptions e
+    JOIN symbols s ON s.id = e.symbol_id
+    JOIN files f ON f.id = e.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE e.kind='catch' AND e.is_empty = 1 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "try-in-loop",
+    "Exception handlers inside loop bodies (perflint PERF203 analogue)",
+    "ANSWERS handlers inside loop bodies: a thrown exception walks the stack\n"
+    "     per iteration, and caught-as-control-flow hides the cost.\n"
+    "ACT hoist validation out of the loop; prove the throw is exceptional.\n"
+    "MISLEADS the try itself is JIT-cheap -- the THROW is the cost, and this\n"
+    "     query cannot see throw frequency; a parse-until-valid retry loop is\n"
+    "     the dominant legitimate row; is_broad names the catch-all shape.",
+    """SELECT f.path, s.name, COUNT(*) AS handlers_in_loops,
+        MAX(e.is_broad) AS any_broad, s.fan_in
+    FROM exceptions e
+    JOIN symbols s ON s.id = e.symbol_id
+    JOIN files f ON f.id = e.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE e.kind='catch' AND e.in_loop = 1 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY e.symbol_id
+    ORDER BY any_broad DESC, s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "files-stream-leak",
+    "Files.lines / Files.walk / Files.list never closed",
+    "ANSWERS functions that open a file-backed Stream and never close it:\n"
+    "     the file handle stays open until the stream is GC'd, which on a\n"
+    "     busy server exhausts descriptors long before memory.\n"
+    "ACT use try-with-resources around the stream; a Stream is AutoCloseable.\n"
+    "MISLEADS closed_in_fn is a text scan for .close() in the same body, so a\n"
+    "     close one frame deeper (a helper) reads as absent; readAllLines and\n"
+    "     the other List-returning forms are NOT file-backed streams and are\n"
+    "     correctly absent from the capture.",
+    """SELECT f.path, s.name, r.opened_by, r.line, s.fan_in
+    FROM resources r
+    JOIN symbols s ON s.id = r.symbol_id
+    JOIN files f ON f.id = r.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE r.type IN ('lines','walk','list') AND r.closed_in_fn = 0
+      AND r.in_try_resources = 0 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "banned-api-surface",
+    "System.exit, Runtime.halt and Unsafe reachable from application code",
+    "ANSWERS call sites of the APIs disciplined JVM codebases ban: System.exit\n"
+    "     anywhere but main, Runtime.halt (no shutdown hooks, no finally),\n"
+    "     and sun.misc.Unsafe memory access.\n"
+    "ACT gate process-exit behind a dedicated lifecycle class (or delete);\n"
+    "     replace Unsafe with VarHandle and the FFM API.\n"
+    "MISLEADS the denylist is the hazard capture, which is name-based: the\n"
+    "     bare-spelling form (`exit(...)` via a static import) and Thread.stop\n"
+    "     are NOT captured and are absent; CLI tools and main methods are the\n"
+    "     dominant legitimate row.",
+    """WITH banned(name, why) AS (VALUES
+        ('System.exit','kills the host process; servers never return'),
+        ('Runtime.halt','no shutdown hooks, no finally'),
+        ('Unsafe.getUnsafe','deprecated memory access; use VarHandle'))
+    SELECT f.path, s.name AS caller, h.pattern AS banned_api, banned.why,
+        h.n, s.fan_in
+    FROM hazards h
+    JOIN banned ON banned.name = h.pattern
+    JOIN symbols s ON s.id = h.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "lock-on-boxed",
+    "Synchronization on boxed-typed fields (Error Prone LockOnBoxedValues)",
+    "ANSWERS locks whose receiver is a field of a boxed type: the monitor\n"
+    "     object is not the field but the boxed VALUE, and the box is\n"
+    "     replaced on every assignment -- two threads can hold \"the same\"\n"
+    "     lock on two different boxes.\n"
+    "ACT lock on a dedicated final Object field, never on a boxed value.\n"
+    "MISLEADS lock_name is the receiver TEXT of the lock call, matched\n"
+    "     against the owner class's fields by name; a local boxed variable\n"
+    "     (not a field) is invisible; a lock on a String literal is caught\n"
+    "     only when the string is a field.",
+    """SELECT s.name, s.owner_type AS owner, lo.lock_name, fd.type AS field_type,
+        lo.line, s.fan_in
+    FROM lock_ops lo
+    JOIN symbols s ON s.id = lo.symbol_id
+    JOIN symbols c ON c.id = s.parent_id
+    JOIN fields fd ON fd.symbol_id = c.id AND fd.name = lo.lock_name
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE lo.op = 'acquire'
+      AND instr(' Integer Long Boolean Character Byte Short Float Double',
+                ' ' || substr(fd.type, instr(fd.type, '.') + 1)) > 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "static-write-in-ctor",
+    "Constructors that write static fields",
+    "ANSWERS constructor-time writes to Class.staticField: every\n"
+    "     construction overwrites shared state, so the last instance built\n"
+    "     wins -- a cross-instance coupling that looks like per-instance\n"
+    "     initialization.\n"
+    "ACT make the field instance-level, or initialize it in a static block\n"
+    "     once and document the shared intent.\n"
+    "MISLEADS the capture is any class-qualified write in the body; the\n"
+    "     query reads constructors only, and a write through a local\n"
+    "     object (`obj.field =`) reads as static here -- the row is the\n"
+    "     review list, and `this.x =` is excluded by construction.",
+    """SELECT s.name, s.owner_type AS owner, s.n_static_write_ctor AS static_writes,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind = 'constructor' AND s.n_static_write_ctor > 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_static_write_ctor DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "missing-super-call",
+    "Framework lifecycle hooks that never call super()",
+    "ANSWERS overrides of the lifecycle-ish method names (onCreate, init,\n"
+    "     doGet, service, onResume...) whose body has no super() call: the\n"
+    "     parent's contract is silently skipped, and on Android-style\n"
+    "     lifecycles that is a missing super call error waiting to ship.\n"
+    "ACT call super first, then the subclass work.\n"
+    "MISLEADS name-based on the method name -- a hook named otherwise but\n"
+    "     equally contract-bound is absent; a super call inside a lambda or\n"
+    "     nested class in the body is still counted (per-body counter);\n"
+    "     interfaces have no super and are excluded by the name list.",
+    """SELECT s.name, s.owner_type AS owner, s.n_super_calls AS super_calls,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind = 'method'
+      AND (instr(s.name, 'onCreate') > 0 OR s.name = 'init'
+           OR instr(s.name, 'doGet') > 0 OR s.name = 'service'
+           OR instr(s.name, 'onResume') > 0 OR instr(s.name, 'onDestroy') > 0)
+      AND s.n_super_calls = 0
+      AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "dead-exception",
+    "new Exception(...); -- created, never thrown, never assigned",
+    "ANSWERS exception objects constructed in expression-statement position:\n"
+    "     the statement does nothing, and its author almost certainly meant\n"
+    "     to throw it -- the error path silently does nothing.\n"
+    "ACT throw it, assign it, or delete the line.\n"
+    "MISLEADS the parent check is positional: `new X()` as the last call in\n"
+    "     a method body whose next line is `throw` reads as dead here when\n"
+    "     it is really a variable-holding idiom; a non-exception object\n"
+    "     (`new StringBuilder()`) is correctly absent.",
+    """SELECT s.name, s.owner_type AS owner, s.n_dead_exception AS dead_exc,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_dead_exception > 0
+      AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_dead_exception DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "reference-equality",
+    "== on non-literal operands in boxed-heavy code (Error Prone ReferenceEquality)",
+    "ANSWERS == / != comparisons between two non-literal operands in\n"
+    "     functions that also box: Integer == Integer compares references,\n"
+    "     not values, and the cache range (-128..127) makes it pass in\n"
+    "     tests and fail in production.\n"
+    "ACT use .equals() (or Objects.equals) for values; keep == only for\n"
+    "     identity, which this query cannot tell apart.\n"
+    "MISLEADS co-occurrence, not types: n_ref_eq counts every non-literal\n"
+    "     == in the body and n_boxing_sites every boxed operation -- a\n"
+    "     body with `==` on two String CONCAT results plus unrelated\n"
+    "     boxing reads as a violation; enum == and null checks are\n"
+    "     excluded only when the operand is a literal.",
+    """SELECT s.name, s.owner_type AS owner, s.n_ref_eq AS ref_eqs,
+        s.n_boxing_sites AS boxing_sites, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_ref_eq > 0 AND s.n_boxing_sites > 0
+      AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_ref_eq DESC, s.n_boxing_sites DESC LIMIT :lim"""),
+(
+    "narrow-calculation",
+    "int arithmetic assigned to long (Error Prone NarrowCalculation)",
+    "ANSWERS `long x = a * b` where the product is computed in int width:\n"
+    "     the multiplication overflows before the widening. A day counter\n"
+    "     computing seconds overflowed for two billion of the same unit.\n"
+    "ACT widen one operand first (`(long) a * b` or `a * (long) b`).\n"
+    "MISLEADS the parent is the variable declarator ONLY: a product\n"
+    "     assigned through a cast or a helper is invisible; a long-typed\n"
+    "     operand in the product is not distinguished from two int\n"
+    "     operands -- the row is the review list, not a verdict.",
+    """SELECT s.name, s.owner_type AS owner, s.n_narrow_calc AS narrow_calcs,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_narrow_calc > 0
+      AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_narrow_calc DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "modern-idiom-candidates",
+    "Pattern instanceof, arrow switch, text blocks (OpenRewrite fixes)",
+    "ANSWERS functions already touching one modern idiom: the migration\n"
+    "     surface for the rest. Pattern matching instanceof and arrow\n"
+    "     switches are the two biggest readability wins per edit.\n"
+    "ACT apply the remaining idioms in the row's body; OpenRewrite is the\n"
+    "     mechanical half.\n"
+    "MISLEADS text-matched: a `->` inside a lambda in a switch arm or a\n"
+    "     comment reads as an arrow switch; a text block of size one line\n"
+    "     is still counted; this ranks bodies that STARTED the migration,\n"
+    "     not bodies that need it from zero.",
+    """SELECT s.name, s.owner_type AS owner, s.n_modern_idioms AS idioms,
+        s.sloc, s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_modern_idioms > 0
+      AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_modern_idioms DESC, s.sloc DESC LIMIT :lim""")
 ]
 
 JavaAnalyzer.METRICS = [

@@ -3558,6 +3558,7 @@ class RustAnalyzer(TreeSitterAnalyzer):
         ("n_lock_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_to_owned_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_safe_fallback", "INT NOT NULL DEFAULT 0"),
+    ("n_error_swallow", "INT NOT NULL DEFAULT 0"),
     ("n_iter_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_push_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_io_in_loop", "INT NOT NULL DEFAULT 0"),
@@ -3673,18 +3674,28 @@ CREATE TABLE cfg_blocks(
     line INT NOT NULL DEFAULT 0
 ) STRICT;
 
-CREATE TABLE async_points(
-    id INTEGER PRIMARY KEY,
-    symbol_id INT NOT NULL REFERENCES symbols(id),
-    file_id INT NOT NULL REFERENCES files(id),
-    line INT NOT NULL,
-    in_loop INT NOT NULL DEFAULT 0,
-    loop_depth INT NOT NULL DEFAULT 0,
-    n_guards_live INT NOT NULL DEFAULT 0,   -- lock guards still in scope here
-    guards TEXT NOT NULL DEFAULT '',
-    guard_dropped INT NOT NULL DEFAULT 0,   -- an explicit drop() before the await
-    expr TEXT NOT NULL DEFAULT ''
-) STRICT;
+ CREATE TABLE async_points(
+     id INTEGER PRIMARY KEY,
+     symbol_id INT NOT NULL REFERENCES symbols(id),
+     file_id INT NOT NULL REFERENCES files(id),
+     line INT NOT NULL,
+     in_loop INT NOT NULL DEFAULT 0,
+     loop_depth INT NOT NULL DEFAULT 0,
+     n_guards_live INT NOT NULL DEFAULT 0,   -- lock guards still in scope here
+     guards TEXT NOT NULL DEFAULT '',
+     guard_dropped INT NOT NULL DEFAULT 0,   -- an explicit drop() before the await
+     expr TEXT NOT NULL DEFAULT '',
+     has_refcell_guard INT NOT NULL DEFAULT 0  -- guard value text names RefCell
+ ) STRICT;
+
+ -- Dependencies declared in Cargo.toml, for manifest-vs-usage: a declared
+ -- crate with no use/import in the tree is dead weight or a dev-only dep.
+ CREATE TABLE deps(
+     id INTEGER PRIMARY KEY,
+     name TEXT NOT NULL,
+     version TEXT NOT NULL DEFAULT '',
+     is_dev INT NOT NULL DEFAULT 0
+ ) STRICT;
 
 CREATE TABLE crate_features(
     id INTEGER PRIMARY KEY,
@@ -4193,6 +4204,19 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
                 st.bump("n_let_else")
                 st.cyclomatic += 1
                 st.cognitive += max(1, nest)
+            pat = node.child_by_field_name("pattern")
+            val = node.child_by_field_name("value")
+            if pat is not None and val is not None:
+                ptxt = text_of(pat, src).strip()
+                # error-swallowing-sites: `let _ = fallible()` -- the result
+                # is dropped; clippy let_underscore_must_use territory.
+                if ptxt == "_" and val.type in ("call_expression",
+                                                "method_invocation",
+                                                "await_expression"):
+                    st.bump("n_error_swallow")
+                # `.map_err(|_| ...)` ignores the error value entirely.
+                if ptxt == "_" and "map_err" in text_of(val, src)[:200]:
+                    st.bump("n_error_swallow")
         elif t == "binary_expression":
             op = node.child_by_field_name("operator")
             o = op.type if op is not None else ""
@@ -4609,6 +4633,14 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
         """
         src = rec.data
         guards: list[str] = []
+        # The borrow VALUE text (`cell.borrow()`) never names RefCell -- the
+        # type lives in the declaration. The enclosing function's signature
+        # (params, generics) is the honest textual source: a function whose
+        # text mentions RefCell and has a live guard at an await is the trap.
+        fn_sig_has_refcell = re.search(
+            r'\bRefCell\b', text_of(body.parent, src)[:600]) \
+            if body.parent is not None else False
+        has_refcell = int(bool(fn_sig_has_refcell))
         dropped = 0
         cur = n.parent
         while cur is not None and cur.id != body.parent.id:
@@ -4635,7 +4667,7 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
              int(_loop_depth(n, body, loop_types) > 0),
              _loop_depth(n, body, loop_types),
              len(guards), ",".join(guards)[:200], dropped,
-             text_of(n, src)[:120].replace("\n", " ")))
+             text_of(n, src)[:120].replace("\n", " "), has_refcell))
 
     # -- file-level --------------------------------------------------------
     def parse_imports(self, root: Any, rec: FileRec, bufs: Buffers) -> None:
@@ -4727,6 +4759,7 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
             db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                        ("edition", "unknown (no Cargo.toml found)"))
             return
+        dep_rows: list[tuple] = []
         for i, path in enumerate(paths):
             try:
                 text = open(path, encoding="utf-8", errors="replace").read()
@@ -4745,6 +4778,22 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
                 if m and not self.crate_name:
                     self.crate_name = m.group(1)
             self._read_features(text, db)
+            # [dependencies] / [dev-dependencies]: declared crate names for
+            # the manifest-vs-usage query. Workspace member manifests are
+            # read too, matching the feature reading above.
+            for sect, is_dev in (("dependencies", 0), ("dev-dependencies", 1)):
+                block = re.search(
+                    r'^\[%s\]\s*$(.*?)(?=^\[|\Z)' % sect, text,
+                    re.M | re.S)
+                if not block:
+                    continue
+                for dm in re.finditer(
+                        r'^\s*([A-Za-z0-9_-]+)\s*=\s*(?:'
+                        r'\{\s*version\s*=\s*"([^"]*)"|"([^"]*)")',
+                        block.group(1), re.M):
+                    dep_rows.append(
+                        (dm.group(1)[:120],
+                         (dm.group(2) or dm.group(3) or "")[:40], is_dev))
 
         meta_rows = (
             ("crate", self.crate_name or "?"),
@@ -4764,6 +4813,10 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
         )
         db.executemany("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                        meta_rows)
+        if dep_rows:
+            db.executemany(
+                "INSERT INTO deps(name,version,is_dev) VALUES(?,?,?)",
+                dep_rows)
 
     def _read_features(self, text: str, db: sqlite3.Connection) -> None:
         feat_rows: list[tuple] = []
@@ -4827,8 +4880,9 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
              "is_attr_only,line) VALUES(?,?,?,?,?,?,?)"),
             ("async_points",
              "INSERT INTO async_points(symbol_id,file_id,line,in_loop,"
-             "loop_depth,n_guards_live,guards,guard_dropped,expr) "
-             "VALUES(?,?,?,?,?,?,?,?,?)"),
+             "loop_depth,n_guards_live,guards,guard_dropped,expr,"
+             "has_refcell_guard) "
+             "VALUES(?,?,?,?,?,?,?,?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
             if rows:
@@ -5694,7 +5748,399 @@ RustAnalyzer.QUERIES = [
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.n_len_in_loop > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.n_len_in_loop DESC, s.n_loops DESC LIMIT :lim""")
+    ORDER BY s.n_len_in_loop DESC, s.n_loops DESC LIMIT :lim"""),
+(
+    "trait-breadth",
+    "Traits implemented by the most distinct types",
+    "ANSWERS the trait contracts with the widest implementor base -- the\n"
+    "     seams that, if they change, every impl block (and every generic\n"
+    "     bound) must change with them.\n"
+    "ACT treat the top rows as breaking-change surfaces: adding a required\n"
+    "     method to one of these compiles to errors across the whole crate.\n"
+    "MISLEADS counts impl rows per trait NAME; a generic/blanket impl\n"
+    "     (`impl<T: Trait>`) is counted once for its declaring type, not once\n"
+    "     per concrete instantiator, so blankets undercount real breadth.\n"
+    "     `dyn-with-one-impl` is the zero end of this same ranking.",
+    """SELECT im.trait_name AS trait_, COUNT(DISTINCT im.type_name) AS impls,
+        COUNT(DISTINCT im.file_id) AS in_files,
+        SUM(im.n_methods) AS methods_impl,
+        SUM(im.n_unsafe_methods) AS unsafe_methods,
+        MIN(im.line) AS first_line
+    FROM impls im
+    WHERE im.trait_name <> ''
+    GROUP BY im.trait_name
+    HAVING impls >= 2
+    ORDER BY impls DESC, methods_impl DESC LIMIT :lim"""),
+(
+    "macro-density",
+    "Macro invocations per module: code generation heat map",
+    "ANSWERS which modules lean heaviest on macro invocation -- every call\n"
+    "     hides generated code from the call graph, so a module dense in\n"
+    "     macro use is partially invisible to everyone after this.\n"
+    "ACT a hot module is where a proc-macro bug or an expansion-size\n"
+    "     regression hurts most; bodies hidden behind macros there deserve\n"
+    "     eyeball coverage.\n"
+    "MISLEADS counts invocations and definitions separately; `vec!`,\n"
+    "     `println!` and friends from the prelude count as invocations but\n"
+    "     are trivial, while a heavy proc macro in a cold module ranks low.\n"
+    "     Expansion output is not modeled anywhere.",
+    """SELECT m.name AS module_,
+        COUNT(CASE WHEN mc.kind='invocation' THEN 1 END) AS invocations,
+        COUNT(CASE WHEN mc.kind='definition' THEN 1 END) AS definitions,
+        COUNT(CASE WHEN mc.kind='attribute' THEN 1 END) AS attrs,
+        COALESCE(SUM(CASE WHEN mc.kind='invocation' THEN mc.body_bytes
+                          ELSE 0 END), 0) AS invocation_body_bytes,
+        COUNT(DISTINCT mc.file_id) AS in_files
+    FROM macros mc
+    LEFT JOIN modules m ON m.id=(SELECT f.module_id FROM files f
+                                  WHERE f.id=mc.file_id)
+    WHERE m.name LIKE :mod
+    GROUP BY m.id
+    ORDER BY invocations DESC, invocation_body_bytes DESC LIMIT :lim"""),
+(
+    "impl-fragmentation",
+    "Types whose impl blocks are spread across many files",
+    "ANSWERS how many distinct files host impl blocks for one type -- the\n"
+    "     fragmentation that makes a type's full contract unreadable from\n"
+    "     any single file. High fragmentation hides methods from casual\n"
+    "     discovery and scatters the changes a trait addition demands.\n"
+    "ACT consolidate inherent impls into the defining file; cross-file\n"
+    "     trait impls are a real Rust pattern (coherence rules), so expect\n"
+    "     the trait rows and judge inherent rows harder.\n"
+    "MISLEADS a type and its impls in the same file count as one file here;\n"
+    "     `#[cfg(test)]` impls and cfg-gated impls count as distinct\n"
+    "     fragments even when small, and same-named types in different\n"
+    "     modules merge under a bare type_name.",
+    """SELECT im.type_name AS type_, COUNT(DISTINCT im.file_id) AS n_files,
+        COUNT(*) AS n_impls,
+        SUM(CASE WHEN im.trait_name <> '' THEN 1 ELSE 0 END) AS trait_impls,
+        SUM(CASE WHEN im.trait_name = '' THEN 1 ELSE 0 END) AS inherent_impls,
+        GROUP_CONCAT(DISTINCT f.basename) AS in_files
+    FROM impls im JOIN files f ON f.id=im.file_id
+    WHERE im.type_name <> ''
+    GROUP BY im.type_name
+    HAVING n_files >= 2
+    ORDER BY n_files DESC, n_impls DESC LIMIT :lim"""),
+(
+    "ffi-crossings",
+    "Calls that leave Rust into extern blocks",
+    "ANSWERS which functions call FFI-declared extern fns -- every crossing\n"
+    "     is a point where Rust's guarantees stop and C's rules begin. A\n"
+    "     function dense in FFI calls is a boundary node: the place to audit\n"
+    "     pointer lifetimes and null handling.\n"
+    "ACT keep the crossing thin: validate pointers and lengths inside the\n"
+    "     wrapper, never at the call site; prefer safe bindings (libloading\n"
+    "     with a safe layer) over raw extern exposure.\n"
+    "MISLEADS the extern fn count comes from foreign_mod_item tracking and\n"
+    "     n_ffi (unsafe block ops); a call through a function POINTER\n"
+    "     returned from FFI is invisible, and calling an extern fn inside\n"
+    "     an unsafe block is counted while the block's safety comment is\n"
+    "     not evidence either way.",
+    """SELECT s.name, s.n_extern_calls AS ffi_calls,
+        s.n_ffi AS ffi_hazards, s.n_unsafe_blocks AS unsafe_blocks,
+        s.is_unsafe_fn AS unsafe_fn, s.fan_in, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_extern_calls > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_extern_calls DESC, s.n_ffi DESC LIMIT :lim"""),
+(
+    "deep-module-paths",
+    "Calls and imports spelled with long :: chains",
+    "ANSWERS where paths are spelled in full instead of imported -- every\n"
+    "     `crate::services::auth::db::connect` restates the module layout at\n"
+    "     the call site, and a rename anywhere in the chain breaks every\n"
+    "     re-statement.\n"
+    "ACT import the target once (`use`), or shorten through a root alias;\n"
+    "     the deepest rows are the most fragile to module moves.\n"
+    "MISLEADS counts `::` segments in the import target text; a module\n"
+    "     legitimately nested that deep (a crate convention) is not wrong,\n"
+    "     and external crates' long paths are counted the same as local\n"
+    "     ones. Calls whose path came from a macro expansion are unseen.",
+    """SELECT i.target AS path_, i.is_external AS external,
+        (length(i.target) - length(replace(i.target, '::', ''))) / 2 + 1
+            AS segments,
+        f.path AS importer
+    FROM imports i JOIN files f ON f.id=i.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE (length(i.target) - length(replace(i.target, '::', ''))) / 2 >= 4
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY segments DESC, i.is_external ASC LIMIT :lim"""),
+(
+    "async-task-hubs",
+    "Async functions that spawn background tasks",
+    "ANSWERS the async entry points that fire-and-forget tasks (tokio::\n"
+    "     spawn / async_std::task::spawn / wasm_bindgen_futures::spawn_local\n"
+    "     and friends) -- the roots of every background task tree in the\n"
+    "     crate.\n"
+    "ACT each row needs a documented lifetime rule: a spawned task that\n"
+    "     outlives its context is a leak or a race; prefer scoped tasks\n"
+    "     where the API allows. `spawn-without-join` covers the no-join\n"
+    "     half; this ranks the hubs.\n"
+    "MISLEADS counts spawn CALL SITES per async function; a spawn inside a\n"
+    "     helper that the async hub calls is attributed to the helper, and\n"
+    "     a spawn spelled through a wrapper function (`my_spawn(|| ...)`) is\n"
+    "     invisible unless the wrapper name contains spawn.",
+    """SELECT s.name, s.n_spawn AS spawns, s.n_await AS awaits,
+        s.max_loop_depth AS depth, s.fan_in,
+        s.is_async_fn AS is_async, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_spawn > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_spawn DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "placeholder-panic-sites",
+    "todo!/unimplemented!/unreachable!/panic! in production code",
+    "ANSWERS the deployed crash points: todo!() and unimplemented!() compile\n"
+    "     and ship, and each one is a panic waiting for the right input.\n"
+    "     unreachable!() in an exhaustive-match fallback is the only\n"
+    "     deliberate member of the set.\n"
+    "ACT replace todo!/unimplemented! with a Result or a proper error path;\n"
+    "     unreachable! needs a proof comment next to it.\n"
+    "MISLEADS proc-macro expansions are invisible (they never hit this\n"
+    "     table); a panicking macro spelled through a local `macro_rules!`\n"
+    "     alias is invisible to name matching; test exclusion is\n"
+    "     symbols.is_test, which may disagree with cfg(test) on odd trees.",
+    """SELECT f.path, s.name AS fn, ma.name AS macro_, ma.line, s.fan_in
+    FROM macros ma
+    JOIN symbols s ON s.id = ma.symbol_id
+    JOIN files f ON f.id = ma.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE ma.kind = 'invocation'
+      AND ma.name IN ('todo','unimplemented','unreachable','panic')
+      AND s.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "debug-print-residue",
+    "dbg!() outside tests",
+    "ANSWERS dbg!() calls in non-test code: the debugging print that ships.\n"
+    "     dbg!() prints to stderr AND returns the value, so it also changes\n"
+    "     evaluation order (a dbg!(f()) evaluates f() BEFORE the outer\n"
+    "     expression context expects it).\n"
+    "ACT replace with a proper log or remove; a dbg! that is deliberately\n"
+    "     kept for support deserves a comment and a log target instead.\n"
+    "MISLEADS name-based on the invocation capture: `eprintln!` is not dbg!\n"
+    "     and does not appear; test files are excluded by is_test.",
+    """SELECT f.path, s.name AS fn, ma.line, s.fan_in
+    FROM macros ma
+    JOIN symbols s ON s.id = ma.symbol_id
+    JOIN files f ON f.id = ma.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE ma.kind = 'invocation' AND ma.name = 'dbg'
+      AND s.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "unsafe-in-loop",
+    "unsafe blocks inside loop bodies",
+    "ANSWERS unsafe blocks in loops: pointer arithmetic paid per iteration\n"
+    "     is where memory bugs and hot paths meet. The review order is\n"
+    "     n_deref first -- each deref is a place a dangling or misaligned\n"
+    "     pointer becomes a fault.\n"
+    "ACT hoist the invariant check; prove bounds once outside the loop.\n"
+    "MISLEADS a well-audited unsafe hot loop (simd, ring buffers) is the\n"
+    "     legitimate row -- this ranks review order, not guilt; n_ops is\n"
+    "     syntactic and macro-generated unsafe is invisible; has_safety_comment\n"
+    "     is the author's own claim of scrutiny.",
+    """SELECT f.path, s.name AS fn, ub.n_ops, ub.n_deref,
+        ub.has_safety_comment, ub.line
+    FROM unsafe_blocks ub
+    JOIN symbols s ON s.id = ub.symbol_id
+    JOIN files f ON f.id = ub.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE ub.in_loop = 1
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY ub.n_deref DESC, ub.n_ops DESC
+    LIMIT :lim"""),
+(
+    "suppression-without-reason",
+    "Bare #[allow(...)] without an explanation (clippy allow-without-reason)",
+    "ANSWERS allow attributes with no reason given. The 1.83+ discipline is\n"
+    "     #[expect(reason)] over #[allow(...)]: expect FAILS the build when\n"
+    "     the lint stops firing, so the suppression cannot go stale; an allow\n"
+    "     with no reason is a suppression nobody can audit.\n"
+    "ACT add a reason, or convert to #[expect(...)] and let the compiler\n"
+    "     verify the lint still fires.\n"
+    "MISLEADS the reason is the ARGS text -- a bare `#[allow]` with no parens\n"
+    "     at all is the sharpest row; `#[allow(unused)]` with a comment on\n"
+    "     the next line is not distinguished from a reason-free allow.",
+    """SELECT f.path, s.name AS fn, a.name AS attr, a.args, a.line
+    FROM attributes a
+    JOIN symbols s ON s.id = a.symbol_id
+    JOIN files f ON f.id = a.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE a.name IN ('allow','expect') AND (a.args IS NULL OR a.args = '')
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY f.path, a.line
+    LIMIT :lim"""),
+(
+    "refcell-across-await",
+    "RefCell borrows still alive at an .await (the async interior-mut trap)",
+    "ANSWERS .await points where a RefCell/Rc/Cell borrow guard is live: the\n"
+    "     borrow must not outlive the await, or the SAME task can deadlock\n"
+    "     itself re-entering the borrow. Unlike a mutex this is not cross-\n"
+    "     thread -- it is the task's own re-entry.\n"
+    "ACT clone the value out of the borrow before the await, or scope the\n"
+    "     borrow to end before the yield point.\n"
+    "MISLEADS the flag is the guard VALUE text naming RefCell/Rc/Cell: a\n"
+    "     borrow of an already-unwrapped value (a &mut from outside) is not\n"
+    "     flagged; lexical liveness -- the guard's let is an ancestor block\n"
+    "     -- can over-report when the borrow is actually dropped mid-block\n"
+    "     (only an explicit drop() is recognised).",
+    """SELECT f.path, s.name AS fn, a.line, a.n_guards_live AS guards_live,
+        a.guards, a.guard_dropped, s.fan_in
+    FROM async_points a
+    JOIN symbols s ON s.id = a.symbol_id
+    JOIN files f ON f.id = a.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE a.has_refcell_guard = 1
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "indexing-slicing-surface",
+    "v[i] indexing in production code (clippy indexing-slicing)",
+    "ANSWERS functions that index collections directly -- v[i] panics on\n"
+    "     out-of-range and is the community's #1 gap between linters and\n"
+    "     what they can prove. Rows are the review surface for unchecked\n"
+    "     indexing.\n"
+    "ACT use .get(i) and handle the Option, or prove the bound once; for\n"
+    "     hot paths where the bound is invariant, the panic is cheaper than\n"
+    "     the branch -- say which in a comment.\n"
+    "MISLEADS n_index_expr counts every index expression in the body: a\n"
+    "     range check immediately before each index reads the same as an\n"
+    "     unchecked one; a const index (`v[0]` on a fixed array) is\n"
+    "     counted and is safe; `noUncheckedIndexedAccess`-style proof is a\n"
+    "     type-system matter this syntax-level counter cannot see.",
+    """SELECT f.path, s.name AS fn, s.n_index_expr AS indexes,
+        s.n_member_access AS field_accesses, s.fan_in, s.sloc
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_index_expr > 0 AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_index_expr DESC, s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "dropped-futures",
+    "let _ = async_call(): the future is dropped without being awaited",
+    "ANSWERS async functions that drop a future into `let _`: the call\n"
+    "     never runs unless the future is moved elsewhere. In a request\n"
+    "     handler this is a silent no-op; in a spawn-er it is the whole\n"
+    "     work item vanishing.\n"
+    "ACT await the future, or hand it to a spawner; if the fire-and-forget\n"
+    "     is deliberate, the dropped future needs a comment and usually a\n"
+    "     task wrapper.\n"
+    "MISLEADS the capture is `let _ = <call>` in any function -- the query\n"
+    "     reads async functions only, and a let-_ of a NON-future value in\n"
+    "     an async fn still counts (the value is dropped, which is usually\n"
+    "     also a bug); a future bound to a named variable and dropped later\n"
+    "     is invisible here.",
+    """SELECT f.path, s.name AS fn, s.n_error_swallow AS dropped,
+        s.n_await AS awaits, s.fan_in
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_error_swallow > 0 AND s.is_async_fn = 1
+      AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_error_swallow DESC, s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "lossy-casts",
+    "as-casts that narrow or drop precision (clippy cast_sign_loss family)",
+    "ANSWERS type_cast_expression sites: `x as u8` truncates, `f64 as f32`\n"
+    "     loses precision, `i64 as u64` flips signs -- each is a value-\n"
+    "     changing operation the author may not have meant.\n"
+    "ACT prefer From/TryFrom (which cannot lose silently) and handle the\n"
+    "     error; keep `as` only for raw-bytes and known-safe ranges.\n"
+    "MISLEADS n_as_casts counts ALL as-casts, including widening ones that\n"
+    "     cannot lose: a body of `u8 as i64` reads the same as `i64 as u8`;\n"
+    "     the target width is not parsed, so the rows are the review list\n"
+    "     and the cast_sign_loss/cast_possible_truncation families are the\n"
+    "     per-cast verdicts this query lacks.",
+    """SELECT f.path, s.name AS fn, s.n_as_casts AS casts,
+        s.n_checked_arith AS checked, s.fan_in, s.sloc
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_as_casts > 0 AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_as_casts DESC, s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "error-swallowing-sites",
+    "let _ = fallible() and .map_err(|_| ...) (clippy let_underscore_must_use)",
+    "ANSWERS the shapes that discard errors: `let _ = fallible()` drops the\n"
+    "     Result, and `.map_err(|_| ...)` throws away the error value while\n"
+    "     keeping the type. Both compile and both erase the reason.\n"
+    "ACT handle the Result (match, ?, or .ok() with a comment); a map_err\n"
+    "     that replaces the error with a constant loses the context -- use\n"
+    "     .map_err(|e| format!(...) with the error in the message) or\n"
+    "     anyhow's context.\n"
+    "MISLEADS the capture is `let _ = <call>` plus map_err-on-underscore\n"
+    "     text: `let _ =` on a non-Result value (a drop of a must-use value)\n"
+    "     is arguably the same bug and counts; `.ok()` alone in a chain is\n"
+    "     not captured; a deliberate `let _ =` in an FFI shim is the\n"
+    "     legitimate row.",
+    """SELECT f.path, s.name AS fn, s.n_error_swallow AS swallows,
+        s.n_question_mark AS question_marks, s.fan_in
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_error_swallow > 0 AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_error_swallow DESC, s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "public-api-doc-debt",
+    "Public items without a doc comment, by fan-in (rustc missing_docs)",
+    "ANSWERS pub functions/methods that say nothing about themselves: the\n"
+    "     API surface where the next reader pays the documentation tax.\n"
+    "     fan_in ranks the migration order -- the most-called undocumented\n"
+    "     symbol pays first.\n"
+    "ACT add a /// doc comment; with #![warn(missing_docs)] the compiler\n"
+    "     enforces the debt ceiling.\n"
+    "MISLEADS has_doc is the doc-comment/leading-comment scan immediately\n"
+    "     above the item: a `//!` module doc or a comment one line further\n"
+    "     up reads as absent; a pub item reachable only through a re-export\n"
+    "     of a private path is not distinguished; private items are\n"
+    "     excluded by is_public.",
+    """SELECT s.name, s.kind, s.fan_in, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.is_public = 1 AND s.has_doc = 0 AND s.fan_in > 0
+      AND s.kind IN ('function','method')
+      AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, s.sloc DESC
+    LIMIT :lim"""),
+(
+    "manifest-vs-usage",
+    "Cargo.toml dependencies never imported (cargo-machete territory)",
+    "ANSWERS declared crates no use statement references: dead weight in\n"
+    "     build time and the lockfile, or a dependency used only through\n"
+    "     a proc macro that names no path.\n"
+    "ACT remove the dependency, or use it; a dev-dependency used only by a\n"
+    "     build script or a #[test] in another crate shows as unused here\n"
+    "     -- check before deleting.\n"
+    "MISLEADS matching is by use-declaration head: `use tokio::time` counts\n"
+    "     as using tokio; a dependency used only via a macro expansion\n"
+    "     (no textual use path) reads as unused; workspace members and\n"
+    "     target-specific deps in non-root manifests are included only if\n"
+    "     the member Cargo.toml was read.",
+    """    SELECT d.name, d.version, d.is_dev,
+        (SELECT COUNT(*) FROM imports i
+          WHERE i.target = d.name
+             OR substr(i.target, 1, length(d.name) + 2) = d.name || '::')
+            AS used
+    FROM deps d
+    WHERE (SELECT COUNT(*) FROM imports i
+            WHERE i.target = d.name
+               OR substr(i.target, 1, length(d.name) + 2) = d.name || '::') = 0
+    ORDER BY d.is_dev, d.name
+    LIMIT :lim""")
 ]
 
 RustAnalyzer.METRICS = [

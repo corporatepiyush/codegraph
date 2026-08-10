@@ -3433,6 +3433,7 @@ class TypeScriptAnalyzer(TreeSitterAnalyzer):
         ("n_angle_assertion", "INT NOT NULL DEFAULT 0"),
         ("n_non_null", "INT NOT NULL DEFAULT 0"),
         ("n_satisfies", "INT NOT NULL DEFAULT 0"),
+        ("n_template_sub", "INT NOT NULL DEFAULT 0"),
         ("n_suppressions", "INT NOT NULL DEFAULT 0"),
         ("n_ts_ignore", "INT NOT NULL DEFAULT 0"),
         ("n_ts_expect_error", "INT NOT NULL DEFAULT 0"),
@@ -3517,25 +3518,39 @@ CREATE TABLE suppressions(
     reason TEXT
 ) STRICT;
 
-CREATE TABLE tsconfigs(
-    id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL,
-    dir TEXT NOT NULL,
-    extends TEXT,
-    strict INT NOT NULL DEFAULT 0,
-    no_implicit_any INT NOT NULL DEFAULT 0,
-    strict_null_checks INT NOT NULL DEFAULT 0,
-    no_unchecked_indexed_access INT NOT NULL DEFAULT 0,
-    exact_optional INT NOT NULL DEFAULT 0,
-    verbatim_module_syntax INT NOT NULL DEFAULT 0,
-    isolated_modules INT NOT NULL DEFAULT 0,
-    erasable_syntax_only INT NOT NULL DEFAULT 0,
-    n_strict_flags INT NOT NULL DEFAULT 0,
-    target TEXT,
-    module TEXT,
-    module_resolution TEXT,
-    removed_option TEXT
-) STRICT;
+ CREATE TABLE tsconfigs(
+     id INTEGER PRIMARY KEY,
+     path TEXT NOT NULL,
+     dir TEXT NOT NULL,
+     extends TEXT,
+     strict INT NOT NULL DEFAULT 0,
+     no_implicit_any INT NOT NULL DEFAULT 0,
+     strict_null_checks INT NOT NULL DEFAULT 0,
+     no_unchecked_indexed_access INT NOT NULL DEFAULT 0,
+     exact_optional INT NOT NULL DEFAULT 0,
+     verbatim_module_syntax INT NOT NULL DEFAULT 0,
+     isolated_modules INT NOT NULL DEFAULT 0,
+     erasable_syntax_only INT NOT NULL DEFAULT 0,
+     n_strict_flags INT NOT NULL DEFAULT 0,
+     target TEXT,
+     module TEXT,
+     module_resolution TEXT,
+     removed_option TEXT,
+     base_url TEXT,
+     paths_json TEXT
+ ) STRICT;
+
+ -- Dependencies declared in package.json files, for the unused-dependencies
+ -- query: a declared name with no matching import target is config debt or
+ -- a real dead weight (knip/machete territory).
+ CREATE TABLE deps(
+     id INTEGER PRIMARY KEY,
+     name TEXT NOT NULL,
+     version TEXT NOT NULL DEFAULT '',
+     is_dev INT NOT NULL DEFAULT 0,
+     dir TEXT NOT NULL DEFAULT ''
+ ) STRICT;
+
 
 CREATE TABLE type_defs(
     symbol_id INT NOT NULL PRIMARY KEY REFERENCES symbols(id),
@@ -3755,6 +3770,23 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
                     n_const_tp += 1
         name = self.node_name(node, rec)
         sig = self.signature_of(node, rec)
+        # `@deprecated` lives in the doc comment ABOVE the declaration (a
+        # prev sibling). For `export function f` the comment sits beside the
+        # export_statement, not the function node, so climb the export
+        # wrapper first; the typescript-eslint no-deprecated rule reads the
+        # same tag.
+        _doc_sib = node
+        while _doc_sib.parent is not None and _doc_sib.parent.type in (
+                "export_statement", "lexical_declaration",
+                "variable_declaration", "expression_statement"):
+            _doc_sib = _doc_sib.parent
+        is_dep = 0
+        _prv = _doc_sib.prev_sibling
+        while _prv is not None and _prv.type in self.COMMENT_NODES:
+            if "@deprecated" in text_of(_prv, rec.data):
+                is_dep = 1
+                break
+            _prv = _prv.prev_sibling
         params = node.child_by_field_name("parameters")
         ptxt = _txt(params, src) if params is not None else ""
         ret = node.child_by_field_name("return_type")
@@ -3769,6 +3801,7 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
             n_const_type_params=n_const_tp,
             is_public=1 if exported or not name.startswith(("_", "#")) else 0,
             is_exported=int(exported),
+            is_deprecated=is_dep,
             is_async=1 if "async" in sig[:40] else 0,
             is_generator=1 if "*" in sig[:40] else 0,
             is_abstract=1 if node.type == "abstract_method_signature"
@@ -3861,6 +3894,10 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
         elif t == "as_expression":
             if ANY_RE.search(_txt(node, src)[-24:]):
                 st.bump("n_as_any")
+        elif t == "template_substitution":
+            # `${x}` interpolation sites: the raw material of
+            # any-interpolation (restrict-template-expressions).
+            st.bump("n_template_sub")
         elif t == "await_expression":
             if loop_depth:
                 st.bump("await_in_loop")
@@ -4048,7 +4085,9 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
             (sid, len(members), n_opt, n_ro, n_idx, n_call,
              len(heritage), ext_names, n_any,
              int(self._is_exported(node)),
-             int("declare" in txt[:40]),
+             int("declare" in txt[:40]
+                 or (node.parent is not None
+                     and node.parent.type == "ambient_declaration")),
              int("const enum" in txt[:40])))
         if node.type == "enum_declaration" and body is not None:
             for i, mem in enumerate(body.named_children):
@@ -4107,7 +4146,21 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
                 source = _txt(srcn, src).strip('"\'`') if srcn is not None else None
                 is_star = "*" in txt.split("from")[0]
                 is_default = "default" in txt[:24]
-                type_only = txt.lstrip().startswith("export type")
+                # `export interface X` / `export type X` are type-space
+                # exports even without the `type` keyword; a direct
+                # declaration export has no export_specifier, so its name
+                # comes from the declaration child (was "*" for every one).
+                decl = next((c for c in n.named_children
+                             if c.type in ("interface_declaration",
+                                           "type_alias_declaration",
+                                           "enum_declaration",
+                                           "class_declaration",
+                                           "function_declaration",
+                                           "lexical_declaration")), None)
+                type_only = txt.lstrip().startswith("export type") or (
+                    decl is not None
+                    and decl.type in ("interface_declaration",
+                                      "type_alias_declaration"))
                 if source is not None:
                     bufs.imports.append(
                         (rec.fid, source[:300], None, None, "reexport",
@@ -4118,6 +4171,9 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
                 names = [_txt(c, src) for c in walk(n)
                          if c.type == "export_specifier"]
                 if not names:
+                    names = [self.node_name(decl, rec) if decl is not None
+                             else ""]
+                if not names or not names[0]:
                     names = [self.node_name(n, rec) or ("default" if is_default
                                                         else "*")]
                 for nm in names[:40]:
@@ -4182,6 +4238,18 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
                 co = cfg.get("compilerOptions") or {}
                 mr = str(co.get("moduleResolution", "") or "")
                 mod = str(co.get("module", "") or "")
+                # Path-alias materialization: captured here so the
+                # path-alias-utilization query can compare alias imports
+                # against raw relative imports per project dir. Compact JSON;
+                # the keys are the aliases (@app/*), the values the target
+                # patterns, and baseUrl anchors them when relative.
+                paths = co.get("paths") or {}
+                paths_json = None
+                if isinstance(paths, dict) and paths:
+                    import json as _json
+                    paths_json = _json.dumps(paths, sort_keys=True,
+                                              separators=(",", ":"))[:2000]
+                base_url = co.get("baseUrl")
                 removed = [v for k, v in removed_by_ts7.items() if k in co]
                 if mr.lower() in ("classic", "node", "node10"):
                     removed.append("moduleResolution: %s (removed in TS 7)" % mr)
@@ -4203,14 +4271,46 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
                     int(bool(co.get("erasableSyntaxOnly"))),
                     sum(1 for f in STRICT_FLAGS if co.get(f) is True),
                     str(co.get("target", "")), mod, mr,
-                    "; ".join(removed) or None))
+                    "; ".join(removed) or None,
+                    str(base_url) if base_url is not None else None,
+                    paths_json))
         if rows:
             db.executemany(
                 "INSERT INTO tsconfigs(path,dir,extends,strict,no_implicit_any,"
                 "strict_null_checks,no_unchecked_indexed_access,exact_optional,"
                 "verbatim_module_syntax,isolated_modules,erasable_syntax_only,"
-                "n_strict_flags,target,module,module_resolution,removed_option)"
-                " VALUES(%s)" % ",".join("?" * 16), rows)
+                "n_strict_flags,target,module,module_resolution,removed_option,"
+                "base_url,paths_json)"
+                " VALUES(%s)" % ",".join("?" * 18), rows)
+        dep_rows = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if d not in ("node_modules", ".git", "dist", "out")]
+            if "package.json" not in filenames:
+                continue
+            p = os.path.join(dirpath, "package.json")
+            try:
+                raw = open(p, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            try:
+                cfg = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(cfg, dict):
+                continue
+            rel = os.path.relpath(dirpath, root) or "."
+            for sect, is_dev in (("dependencies", 0), ("devDependencies", 1)):
+                deps = cfg.get(sect) or {}
+                if not isinstance(deps, dict):
+                    continue
+                for name, ver in deps.items():
+                    dep_rows.append(
+                        (str(name)[:120], str(ver)[:40], is_dev, rel))
+        if dep_rows:
+            db.executemany(
+                "INSERT INTO deps(name,version,is_dev,dir) VALUES(?,?,?,?)",
+                dep_rows)
         db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                    ("tsx_files", str(self.n_tsx_files)))
 
@@ -4888,7 +4988,426 @@ TypeScriptAnalyzer.QUERIES = [
     WHERE s.n_process_exit > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
-    ORDER BY hops_from_handler ASC, s.n_process_exit DESC LIMIT :lim""")
+    ORDER BY hops_from_handler ASC, s.n_process_exit DESC LIMIT :lim"""),
+(
+    "type-vs-value-space",
+    "Type-space vs value-space weight ratio per file",
+    "ANSWERS the compile-time/runtime balance of every file: how many type\n"
+    "     constructs (interface/type/enum) versus runtime constructs\n"
+    "     (class/function) it declares. A type-dense file is a contract\n"
+    "     surface; a value-dense one is behavior.\n"
+    "ACT a high type-ratio file is where a type-level change ripples most; a\n"
+    "     low ratio with large exports is where a runtime behavior lives.\n"
+    "     The ratio is advisory: categories are keyed by symbol kind, which\n"
+    "     the parser classifies by construct, not by intent.\n"
+    "MISLEADS a module of consts with types imported from elsewhere looks\n"
+    "     value-heavy; an interface-only barrel looks type-heavy though its\n"
+    "     runtime cost is nil. `declaration-vs-implementation` covers the\n"
+    "     exported half of this question.",
+    """SELECT f.path,
+        SUM(CASE WHEN s.kind IN ('interface','type','enum','module')
+                 THEN 1 ELSE 0 END) AS type_space,
+        SUM(CASE WHEN s.kind IN ('class','function','method','closure')
+                 THEN 1 ELSE 0 END) AS value_space,
+        COUNT(*) AS total,
+        CAST(100.0 * SUM(CASE WHEN s.kind IN ('interface','type','enum','module')
+                              THEN 1 ELSE 0 END)
+             / NULLIF(COUNT(*), 0) AS INT) AS pct_type,
+        f.sloc
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('interface','type','enum','module','class','function',
+                     'method','closure')
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY f.id
+    ORDER BY pct_type DESC, type_space DESC LIMIT :lim"""),
+(
+    "orphan-types",
+    "Interfaces and type aliases no runtime symbol references",
+    "ANSWERS the type-level constructs with no detected runtime use: no\n"
+    "     symbol signature contains the type name, and no ts_exports row ties\n"
+    "     it to a value. Each row is a candidate dead contract -- or a\n"
+    "     deliberately exported API type consumed outside this tree.\n"
+    "ACT grep the type name as a string before deleting: an ambient module,\n"
+    "     a mapped type over it, or generic instantiation can keep it alive\n"
+    "     without any signature match here.\n"
+    "MISLEADS signature-text matching is name-based and bounded; a type used\n"
+    "     only through generics (`Array<Foo>`, `Partial<Foo>`) matches only\n"
+    "     if the signature text contains the bare name, and an exported type\n"
+    "     consumed by an external package is invisible. The match is a\n"
+    "     boundary-safe identifier test (case-sensitive GLOB with an\n"
+    "     identifier-exclusion class), so `User` does NOT match inside\n"
+    "     `getUsers` or `UserView` -- subword-only appearances leave the\n"
+    "     type reported. This is a candidate list, not a deletion list.",
+    """SELECT s.name, s.kind, t.n_members, t.n_extends, t.is_exported,
+        (SELECT COUNT(*) FROM ts_exports e WHERE e.name=s.name
+          AND e.is_type_only=1) AS type_exports,
+        f.path || ':' || s.line_start AS at
+    FROM type_defs t JOIN symbols s ON s.id=t.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('interface','type')
+      AND NOT EXISTS (SELECT 1 FROM symbols s2
+                      WHERE s2.id <> s.id
+                        AND (s2.signature = s.name
+                             OR s2.signature GLOB
+                                '*[^A-Za-z0-9_$]' || s.name
+                             OR s2.signature GLOB
+                                s.name || '[^A-Za-z0-9_$]*'
+                             OR s2.signature GLOB
+                                '*[^A-Za-z0-9_$]' || s.name
+                                || '[^A-Za-z0-9_$]*'))
+      AND (SELECT COUNT(*) FROM ts_exports e
+           WHERE e.name=s.name AND e.is_type_only=1) = 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY t.n_members DESC LIMIT :lim"""),
+(
+    "path-alias-utilization",
+    "tsconfig path aliases declared vs alias imports used",
+    "ANSWERS per project dir how much the codebase leans on its own path\n"
+    "     aliases (@app/*, @utils/*) versus raw relative imports. The\n"
+    "     declared alias count is the config surface; the used count is the\n"
+    "     practice.\n"
+    "ACT an alias declared but never used is config debt; heavy alias use\n"
+    "     with no baseUrl is a bundle-configured redirect that stops working\n"
+    "     the day the toolchain changes. The paths_json column records the\n"
+    "     exact map.\n"
+    "MISLEADS alias USE is counted as imports whose target starts with @*/\n"
+    "     (the dominant convention); aliases without an @-prefix are missed,\n"
+    "     and a relative import that reaches the same file is not\n"
+    "     normalised to an alias-equivalent, so utilization is a floor.",
+    """SELECT c.dir AS project_dir, c.base_url,
+        c.paths_json,
+        (SELECT COUNT(*) FROM imports i JOIN files f ON f.id=i.file_id
+          WHERE f.dir LIKE c.dir || '%' AND i.target LIKE '@%/%') AS alias_imports,
+        (SELECT COUNT(*) FROM imports i JOIN files f2 ON f2.id=i.file_id
+          WHERE f2.dir LIKE c.dir || '%' AND i.target LIKE './%') AS rel_imports,
+        (SELECT COUNT(*) FROM imports i JOIN files f3 ON f3.id=i.file_id
+          WHERE f3.dir LIKE c.dir || '%') AS total_imports
+    FROM tsconfigs c
+    WHERE COALESCE(c.paths_json, '') <> '' AND c.dir LIKE :mod
+    ORDER BY alias_imports DESC LIMIT :lim"""),
+(
+    "ambient-augmentation",
+    "Files declaring global types and ambient modules",
+    "ANSWERS the files that augment the global environment: ambient\n"
+    "     declarations (.d.ts with `declare`), global interfaces merged onto\n"
+    "     existing ones, and `declare module` blocks. Each is a change to\n"
+    "     the type environment visible project-wide.\n"
+    "ACT track these files as the ambient surface: a name collision or a\n"
+    "     removed augmentation breaks every consumer, and no import chain\n"
+    "     records the dependency.\n"
+    "MISLEADS `is_ambient` comes from the `declare` keyword in the first 40\n"
+    "     chars of the declaration block (the analyzer's documented\n"
+    "     heuristic); `declare global` blocks augmenting an EXISTING global\n"
+    "     are marked ambient but not distinguished from declarations that\n"
+    "     introduce brand-new types.",
+    """SELECT s.name, s.kind, t.is_ambient, t.n_members,
+        t.is_exported, f.basename,
+        f.path || ':' || s.line_start AS at
+    FROM type_defs t JOIN symbols s ON s.id=t.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE t.is_ambient=1 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY t.n_members DESC LIMIT :lim"""),
+(
+    "iface-inherit-chain",
+    "Interfaces by extends breadth and chain depth",
+    "ANSWERS the interface contracts with the widest extends fan-out\n"
+    "     (A extends B, C) and the deepest inherited chains -- the type\n"
+    "     shapes whose supertype change ripples across every dependent\n"
+    "     interface.\n"
+    "ACT an interface extending many others is a contract that inherits\n"
+    "     every one of those responsibilities; splitting or merging it\n"
+    "     changes the whole fan. `type-defs.n_extends` counts direct\n"
+    "     parents only.\n"
+    "MISLEADS extends_names is captured per declaration and matched\n"
+    "     by name; a chain through re-exported or namespaced parents breaks\n"
+    "     at the first unresolved hop, so chain depth is a floor.",
+    """SELECT s.name, t.n_extends AS extends, t.n_members,
+        t.extends_names, t.n_index_signatures AS idx_sigs,
+        (SELECT COUNT(*) FROM symbols s3 JOIN type_defs t3
+           ON t3.symbol_id=s3.id
+          WHERE instr(',' || t3.extends_names || ',',
+                             ',' || s.name || ',') > 0) AS inherited_by,
+        f.path || ':' || s.line_start AS at
+    FROM type_defs t JOIN symbols s ON s.id=t.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE t.n_extends >= 1 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY inherited_by DESC, t.n_extends DESC LIMIT :lim"""),
+(
+    "type-export-mismatch",
+    "Modules exporting type-only symbols without runtime values",
+    "ANSWERS modules whose ts_exports declare type-only (interface/type)\n"
+    "     names -- the contract-only modules with no runtime executable\n"
+    "     surface. Two shapes get flagged: a type-only barrel (fine when\n"
+    "     intentional) and a module exporting an interface the consumers\n"
+    "     can never instantiate.\n"
+    "ACT for a contract module, keep the export list explicit and add a\n"
+    "     README note; for a candidate dead module, grep whether any value\n"
+    "     symbol imports it at all.\n"
+    "MISLEADS is_type_only on ts_exports is per-export; a module with one\n"
+    "     type export AND a value export is not flagged, and a type exported\n"
+    "     without the `type` keyword reads as a value export to the parser\n"
+    "     when the compiler would elide it.",
+    """SELECT f.path AS module_, COUNT(DISTINCT e.name) AS type_exports,
+        (SELECT COUNT(*) FROM symbols s WHERE s.file_id=f.id
+          AND s.kind IN ('class','function','method','closure'))
+            AS local_values,
+        e.is_reexport AS reexport,
+        (SELECT COUNT(*) FROM ts_exports e2 WHERE e2.file_id=f.id
+          AND e2.is_type_only=0) AS value_exports
+    FROM ts_exports e JOIN files f ON f.id=e.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE e.is_type_only=1 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY f.id, e.is_reexport
+    HAVING value_exports = 0
+    ORDER BY type_exports DESC LIMIT :lim"""),
+(
+    "dead-service-methods",
+    "Class methods with zero resolved callers",
+    "ANSWERS the service-layer (and every class) methods nothing in the\n"
+    "     tree calls -- the API surface that is either about to be used by\n"
+    "     a caller this analyzer cannot see, or genuinely dead.\n"
+    "ACT for each row, grep the method name including its class (`svc.\n"
+    "     method`): a template string call or a dispatch table can hide it.\n"
+    "     `dead-code` covers unexported functions; this covers the method-\n"
+    "     on-a-class shape with the class context visible.\n"
+    "MISLEADS resolution is by name; a method reached through an interface\n"
+    "     satisfaction, a `Proxy`, or a decorator that rewrites the name is\n"
+    "     invisible here, and exported class methods are excluded only when\n"
+    "     the class itself is exported.",
+    """SELECT s.name, p.name AS class_, s.sloc, s.fan_in,
+        s.n_calls, s.cyclomatic AS cyclo,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN symbols p ON p.id=s.parent_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='method' AND s.fan_in=0 AND f.is_test=0
+      AND f.is_generated=0 AND s.name <> 'constructor'
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.sloc DESC LIMIT :lim"""),
+(
+    "deprecated-usage",
+    "@deprecated symbols still being called (typescript-eslint no-deprecated)",
+    "ANSWERS @deprecated functions/methods with in-tree callers, ranked by\n"
+    "     distinct callers: the migration list. Each row is a call site\n"
+    "     family that will break (or at least lose its promise) when the\n"
+    "     symbol is removed.\n"
+    "ACT migrate callers top-down; the deprecation message says where.\n"
+    "MISLEADS is_deprecated comes from a @deprecated tag in the doc comment\n"
+    "     immediately above the declaration -- a deprecation declared in a\n"
+    "     type's interface but implemented in a class without the tag reads\n"
+    "     as clean, and public-API deprecation is deliberate: the rows are\n"
+    "     the migration list, not violations. Name-based edges may hit the\n"
+    "     wrong overload.",
+    """SELECT s.name, f.path, s.line_start, COUNT(DISTINCT e.caller_id) AS n_callers
+    FROM symbols s
+    JOIN edges e ON e.callee_id = s.id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.is_deprecated = 1
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY n_callers DESC
+    LIMIT :lim"""),
+(
+    "duplicate-enum-values",
+    "Enums where two members alias one runtime value",
+    "ANSWERS enums with two members equal to the same value: `==` between\n"
+    "     members is true and a switch on the value hits the first member.\n"
+    "     Rows name the members and the colliding value.\n"
+    "ACT rename or re-value one member; if intentional, comment it.\n"
+    "MISLEADS computed members are excluded (n_fields > 0 / non-literal\n"
+    "     value); intentional bitflag aliases are the dominant false\n"
+    "     positive -- a flag set whose members share bits is NOT a bug.",
+    """SELECT s.name AS enum_name, em.value, COUNT(*) AS n_members,
+        GROUP_CONCAT(em.name) AS members, f.path
+    FROM enum_members em
+    JOIN symbols s ON s.id = em.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE em.value IS NOT NULL AND em.n_fields = 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY em.symbol_id, em.value
+    HAVING n_members > 1
+    ORDER BY n_members DESC
+    LIMIT :lim"""),
+(
+    "mixed-enums",
+    "Enums mixing numeric and string members",
+    "ANSWERS enums whose members are a mix of numbers and strings: the\n"
+    "     runtime values have two types, comparisons and serialization\n"
+    "     behave differently per member, and a switch written for one half\n"
+    "     silently misses the other.\n"
+    "ACT split into two enums, or make every member one type.\n"
+    "MISLEADS a member whose value is a computed expression (n_fields > 0)\n"
+    "     is excluded because its type is unknown; a member with no value at\n"
+    "     all auto-increments numerically and counts as numeric.",
+    """SELECT s.name AS enum_name, f.path,
+        SUM(CASE WHEN substr(em.value,1,1) IN ('''','"') THEN 1 ELSE 0 END)
+            AS string_members,
+        SUM(CASE WHEN substr(em.value,1,1) NOT IN ('''','"')
+                 THEN 1 ELSE 0 END) AS numeric_members,
+        COUNT(*) AS total_members
+    FROM enum_members em
+    JOIN symbols s ON s.id = em.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE em.value IS NOT NULL AND em.n_fields = 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY em.symbol_id
+    HAVING string_members > 0 AND numeric_members > 0
+    ORDER BY total_members DESC
+    LIMIT :lim"""),
+(
+    "type-import-misuse",
+    "Value imports of modules whose every export is type-only",
+    "ANSWERS value-space imports of modules that export nothing but types:\n"
+    "     a dead runtime import, and a real compile error under\n"
+    "     verbatimModuleSyntax, which elides nothing.\n"
+    "ACT switch to `import type`; confirm the module really has no values.\n"
+    "MISLEADS re-export chains confuse target matching (the barrel's\n"
+    "     exports are what counts, not the leaf's); side-effect-only modules\n"
+    "     have no exports and are excluded by the EXISTS; per-NAME import\n"
+    "     analysis needs a capture this query deliberately lacks.",
+    """SELECT f.path, i.target, i.line, i.n_names
+    FROM imports i
+    JOIN files f ON f.id = i.file_id
+    LEFT JOIN modules m ON m.id = f.module_id
+    WHERE i.is_type_only = 0 AND i.target_id IS NOT NULL
+      AND EXISTS (SELECT 1 FROM ts_exports te WHERE te.file_id = i.target_id)
+      AND NOT EXISTS (SELECT 1 FROM ts_exports te
+                      WHERE te.file_id = i.target_id AND te.is_type_only = 0)
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY f.path, i.line
+    LIMIT :lim"""),
+(
+    "suppression-without-reason",
+    "Bare @ts-ignore / @ts-expect-error with no reason",
+    "ANSWERS suppressions whose trailing comment is empty: nobody wrote why\n"
+    "     the suppression is safe. The ts-expect-error form FAILS the build\n"
+    "     when the error disappears, so a bare one is also a silent\n"
+    "     invitation to leave it behind forever.\n"
+    "ACT add the reason (`// @ts-expect-error - <why>`); a suppression\n"
+    "     without one cannot be audited.\n"
+    "MISLEADS the reason is the text after the directive on the same line;\n"
+    "     a reason on the NEXT line is not associated and reads as absent;\n"
+    "     eslint-disable comments are counted in the same column.",
+    """SELECT f.path, su.kind, su.line,
+        (SELECT s.name FROM symbols s
+          WHERE s.file_id = su.file_id
+            AND su.line BETWEEN s.line_start AND s.line_end
+            AND s.kind IN ('function','method','closure')
+          ORDER BY s.line_start DESC LIMIT 1) AS in_fn
+    FROM suppressions su
+    JOIN files f ON f.id = su.file_id
+    LEFT JOIN modules m ON m.id = f.module_id
+    WHERE (su.reason IS NULL OR su.reason = '')
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY f.path, su.line
+    LIMIT :lim"""),
+(
+    "unused-dependencies",
+    "package.json dependencies never imported (knip/machete territory)",
+    "ANSWERS declared dependencies no import in the tree references: dead\n"
+    "     weight in install time and lockfile surface, or a module used only\n"
+    "     through a global/plugin the importer cannot see.\n"
+    "ACT remove the dependency, or import it where it is actually used; a\n"
+    "     dependency used only by a build script or a global side effect\n"
+    "     shows as unused here -- check before deleting.\n"
+    "MISLEADS matching is target-basename: `import x from 'lodash/merge'`\n"
+    "     counts as using lodash; a dependency used only via a package\n"
+    "     internal (no import statement) reads as unused; devDependencies\n"
+    "     used only by scripts (no source import) are the dominant\n"
+    "     legitimate row.",
+    """SELECT d.name, d.version, d.is_dev, d.dir AS package_dir,
+        (SELECT COUNT(*) FROM imports i
+          WHERE i.target = d.name
+             OR substr(i.target, 1, length(d.name) + 1) = d.name || '/')
+            AS used
+    FROM deps d
+    WHERE (SELECT COUNT(*) FROM imports i
+            WHERE i.target = d.name
+               OR substr(i.target, 1, length(d.name) + 1) = d.name || '/') = 0
+    ORDER BY d.is_dev, d.name
+    LIMIT :lim"""),
+(
+    "any-interpolation",
+    "Template literals with any-typed substitutions",
+    "ANSWERS functions that interpolate into template literals while also\n"
+    "     touching `any`: the ${x} family that restrict-template-expressions\n"
+    "     rejects, because an any-typed value can smuggle anything into a\n"
+    "     DOM sink or a URL. Co-occurrence, not data flow.\n"
+    "ACT type the interpolated value (unknown + narrowing beats any); if the\n"
+    "     value is genuinely untyped, String(x) with a comment.\n"
+    "MISLEADS n_template_sub counts ALL ${} sites and n_any_total all any\n"
+    "     references in the body -- the join is per-function co-occurrence,\n"
+    "     so a function with ${x} on a well-typed value plus an unrelated\n"
+    "     any param reads as a violation; a `String(x)` interpolation is not\n"
+    "     distinguished.",
+    """SELECT s.name, s.n_template_sub AS substitutions,
+        s.n_any_total AS any_refs, s.n_as_any, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_template_sub > 0 AND s.n_any_total > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_template_sub DESC, s.n_any_total DESC LIMIT :lim"""),
+(
+    "mutability-blast",
+    "Exported interfaces with no readonly members (prefer-readonly)",
+    "ANSWERS the exported contracts whose members are all mutable: every\n"
+    "     consumer can mutate the shape, so a change to any member ripples\n"
+    "     as a behavioral change, not a type error. The biggest member\n"
+    "     counts are the widest blast radii.\n"
+    "ACT mark members readonly; preferReadonly makes the compiler enforce\n"
+    "     the discipline going forward.\n"
+    "MISLEADS n_readonly_members counts members whose declaration line starts\n"
+    "     with `readonly` -- an index signature or a type alias member is\n"
+    "     not counted as readonly; a deliberately mutable DTO (form input,\n"
+    "     draft state) is the legitimate row.",
+    """SELECT s.name, t.n_members AS members,
+        t.n_readonly_members AS readonly,
+        CAST(100.0 * t.n_readonly_members / NULLIF(t.n_members, 0) AS INT)
+            AS pct_readonly,
+        f.path || ':' || s.line_start AS at
+    FROM type_defs t JOIN symbols s ON s.id=t.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind = 'interface' AND t.is_exported = 1
+      AND t.n_members > 0 AND t.n_readonly_members = 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY t.n_members DESC LIMIT :lim"""),
+(
+    "boundary-crossings",
+    "ui/views/pages files importing api/db/server files",
+    "ANSWERS the layer crossings in the conventional UI stack: a component\n"
+    "     file importing a data-access module. The fix is the same as in\n"
+    "     every layering rule -- route through an interface -- but the\n"
+    "     directory convention is the cheapest detector there is.\n"
+    "ACT move the data access behind a hook/port, or accept the crossing\n"
+    "     deliberately and say why in a comment.\n"
+    "MISLEADS pure directory-name convention: a `pages/` dir that is not a\n"
+    "     UI layer (e.g. a pagination module) misreads, and a `db/` helper\n"
+    "     that is really a pure utility is flagged; a crossing through a\n"
+    "     barrel (ui/ importing api/index) is matched on the barrel's dir.",
+    """SELECT fc.path AS from_file, ft.path AS to_file, i.line, i.target
+    FROM imports i
+    JOIN files fc ON fc.id = i.file_id
+    JOIN files ft ON ft.id = i.target_id
+    LEFT JOIN modules m ON m.id = fc.module_id
+    WHERE (instr('/' || fc.dir || '/', '/ui/') > 0
+           OR instr('/' || fc.dir || '/', '/views/') > 0
+           OR instr('/' || fc.dir || '/', '/pages/') > 0)
+      AND (instr('/' || ft.dir || '/', '/api/') > 0
+           OR instr('/' || ft.dir || '/', '/db/') > 0
+           OR instr('/' || ft.dir || '/', '/server/') > 0)
+      AND fc.id <> ft.id
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY fc.path, i.line
+    LIMIT :lim""")
 ]
 
 TypeScriptAnalyzer.METRICS = [

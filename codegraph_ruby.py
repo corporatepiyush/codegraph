@@ -3753,6 +3753,10 @@ class RubyAnalyzer(TreeSitterAnalyzer):
     ("n_serialize_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_elif", "INT NOT NULL DEFAULT 0"),
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
+        # -- P2 pack: save/db discipline, enumerable idioms, sorbet ---------
+        ("n_save_ignored", "INT NOT NULL DEFAULT 0"),
+        ("n_legacy_chain", "INT NOT NULL DEFAULT 0"),
+        ("has_sig", "INT NOT NULL DEFAULT 0"),
         # -- file/class role -------------------------------------------------
         ("has_frozen_literal", "INT NOT NULL DEFAULT 0"),
         ("is_controller", "INT NOT NULL DEFAULT 0"),
@@ -3928,6 +3932,15 @@ UPDATE symbols AS s SET n_unique_calls = x.c FROM
     (SELECT caller_id AS id, COUNT(*) AS c FROM edges GROUP BY caller_id) AS x
     WHERE x.id = s.id;
 
+-- blocks.n_queries was declared but never populated -- every block read as
+-- query-free, which silently zeroed find-each-missed. Count AR queries whose
+-- line falls inside the block's span (line..line+body_sloc), same symbol.
+UPDATE blocks AS b SET n_queries = x.c FROM
+    (SELECT b2.id AS id, COUNT(*) AS c
+     FROM ar_queries aq JOIN blocks b2 ON b2.symbol_id = aq.symbol_id
+     WHERE aq.line BETWEEN b2.line AND b2.line + b2.body_sloc
+     GROUP BY b2.id) AS x WHERE x.id = b.id;
+
 UPDATE symbols AS s SET n_ar_query_in_block = x.c FROM
     (SELECT symbol_id AS id, COUNT(*) AS c FROM ar_queries
      WHERE loop_depth > 0 GROUP BY symbol_id) AS x WHERE x.id = s.id;
@@ -3939,6 +3952,23 @@ UPDATE symbols AS s SET n_metaprogram_dynamic = x.c FROM
 UPDATE symbols AS s SET n_mixins = x.c FROM
     (SELECT host_id AS id, COUNT(*) AS c FROM mixins
      WHERE host_id IS NOT NULL GROUP BY host_id) AS x WHERE x.id = s.id;
+
+-- attr_accessor/reader/writer macros record a FIELD per declared name with
+-- the macro base in the `type` column ('attr_accessor'/'attr_reader'/
+-- 'attr_writer', from the ATTR_KINDS map); the n_attr_* columns are the
+-- per-class totals materialized from those rows, so the attr-coupling query
+-- can rank classes without re-deriving the macro spelling.
+UPDATE symbols AS s SET n_attr_accessor = x.c FROM
+    (SELECT symbol_id AS id, COUNT(*) AS c FROM fields
+     WHERE type='attr_accessor' GROUP BY symbol_id) AS x WHERE x.id = s.id;
+
+UPDATE symbols AS s SET n_attr_reader = x.c FROM
+    (SELECT symbol_id AS id, COUNT(*) AS c FROM fields
+     WHERE type='attr_reader' GROUP BY symbol_id) AS x WHERE x.id = s.id;
+
+UPDATE symbols AS s SET n_attr_writer = x.c FROM
+    (SELECT symbol_id AS id, COUNT(*) AS c FROM fields
+     WHERE type='attr_writer' GROUP BY symbol_id) AS x WHERE x.id = s.id;
 
 -- A callback names a method by symbol; the edge from the macro to the method
 -- does not exist in the tree, so it is stitched here by name within the file.
@@ -4080,6 +4110,13 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
         vis = self.visibility_of(node, rec)
         singleton = 1 if (node.type == "singleton_method"
                           or _in_singleton_class(node)) else 0
+        # sorbet sig{} sits directly above the def as a prev sibling call.
+        _prv = node.prev_sibling
+        has_sig = 0
+        if _prv is not None and _prv.type == "call":
+            _pt = text_of(_prv, rec.data).lstrip()
+            if _pt.startswith("sig") and _pt.startswith("signature") is False:
+                has_sig = 1
         ctrl, model, job = self._role
         out: dict[str, Any] = {
             "is_public": int(vis == "public"),
@@ -4097,6 +4134,7 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
             "is_model": model,
             "is_job": job,
             "has_frozen_literal": self._frozen,
+            "has_sig": has_sig,
             "is_abstract": int(_raises_not_implemented(node, rec.data)),
         }
         out.update(self._scan_body(node, rec, vis))
@@ -4581,6 +4619,11 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
                     rn = parent.child_by_field_name("receiver")
                     if rn is not None and rn.type in SIMPLE_RECEIVERS:
                         recv = text_of(rn, src)[:60]
+                    elif rn is not None and rn.type == "call":
+                        # `User.all.each` -- the receiver is itself a call
+                        # chain; record its text so all-table iteration is
+                        # visible to find-each-missed.
+                        recv = text_of(rn, src)[:60]
                 is_iter = meth in ITER_METHODS
                 if is_iter:
                     iter_stack.append(depth)
@@ -4647,6 +4690,23 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
                                  and any(c.type == "range"
                                          for c in recv.named_children)):
                 bump("n_range_include")
+        # -- Rails/SaveBang: `save` (no bang) with the result discarded --
+        # rubocop-rails SaveBang wants save! in callbacks; the graph angle
+        # is the DISCARDED boolean: save returns false on failure and an
+        # expression-statement call throws that away.
+        if meth == "save" and not recv \
+                or meth == "save" and recv is not None and recv.type != "call":
+            par = n.parent
+            if par is not None and par.type in (
+                    "expression_statement", "body_statement", "do", "then"):
+                bump("n_save_ignored")
+        # -- fasterer / Performance::SelectMap chain pairs ---------------
+        if meth in ("first", "flatten", "each") and recv is not None:
+            rtxt = text_of(recv, src)[:120]
+            if (meth == "first" and "select" in rtxt) \
+                    or (meth == "flatten" and "map" in rtxt) \
+                    or (meth == "each" and "reverse" in rtxt):
+                bump("n_legacy_chain")
 
         # -- metaprogramming site, with its argument if we can see it
         api_col = METAPROGRAM_APIS.get(meth)
@@ -5843,7 +5903,380 @@ RubyAnalyzer.QUERIES = [
       AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.fan_in DESC,
-        s.n_monkey_patch + s.n_mixins DESC LIMIT :lim""")
+        s.n_monkey_patch + s.n_mixins DESC LIMIT :lim"""),
+(
+    "ancestor-chain-depth",
+    "Superclass depth per class: the monkey-patch resistance meter",
+    "ANSWERS how many superclass hops sit between each class and the root of\n"
+    "     its inheritance tree. Deep ancestry is where a superclass change\n"
+    "     ripples widest and where an include/extend mixin has the most\n"
+    "     intervening method-lookup layers to cut through.\n"
+    "ACT prefer composition below ~4 levels; at minimum, the deep rows are\n"
+    "     the ones to watch when an ancestor changes.\n"
+    "MISLEADS walks the superclass TEXT column by exact name, so a\n"
+    "     superclass spelled with a different constant path (`Foo::Bar` vs\n"
+    "     `Bar` where Bar is a wrapper) breaks the chain at that hop; depth\n"
+    "     is capped at 8 (the recursion bound) and includes/extend depth is\n"
+    "     NOT counted -- only `class X < Y` ancestry, which matches the\n"
+    "     compiler-enforced single-inheritance chain.",
+    """WITH RECURSIVE anc(klass, parent, depth) AS (
+        SELECT m.name, m.superclass, 1
+        FROM ruby_modules m
+        WHERE m.superclass <> ''
+        UNION ALL
+        SELECT anc.klass, m2.superclass, anc.depth+1
+        FROM anc JOIN ruby_modules m2 ON m2.name=anc.parent
+        WHERE m2.superclass <> '' AND m2.name <> anc.klass
+          AND anc.depth < 8)   -- depth bound: 8 hops
+    SELECT klass, MAX(depth) AS depth,
+        COUNT(DISTINCT parent) AS distinct_ancestors
+    FROM anc
+    WHERE EXISTS (SELECT 1 FROM ruby_modules rm
+                  JOIN symbols s3 ON s3.id=rm.symbol_id
+                  JOIN modules m3 ON m3.id=s3.module_id
+                  WHERE rm.name=anc.klass
+                    AND COALESCE(m3.name,'') LIKE :mod)
+    GROUP BY klass
+    ORDER BY depth DESC, distinct_ancestors DESC LIMIT :lim"""),
+(
+    "yield-hubs",
+    "Methods that hand control to a block via yield",
+    "ANSWERS which methods are callback processing hubs: every `yield`\n"
+    "     passes control to whatever block the caller supplied, so a method\n"
+    "     dense in yields is the funnel through which behavior is injected.\n"
+    "ACT a method yielding in a loop should be documented as a hook; each\n"
+    "     yield is a contract point with the caller's block.\n"
+    "MISLEADS counts yield KEYWORDS, not distinct block receivers; `yield`\n"
+    "     inside a nested lambda in the same method still counts to the\n"
+    "     method, and a method that yields through a helper (block.call in\n"
+    "     another method) is hidden. block-vs-proc-cost covers the passing\n"
+    "     side.",
+    """SELECT s.name, s.kind, s.n_yield AS yields,
+        s.n_blocks AS blocks, s.max_loop_depth AS depth, s.fan_in,
+        s.n_calls, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_yield > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_yield DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "attr-coupling",
+    "Classes exposing state through attr_accessor/reader/writer",
+    "ANSWERS which classes publish read/write access to their instance\n"
+    "     state via attribute macros -- the coupling surface that makes\n"
+    "     internal fields public API. High writer counts mean mutation from\n"
+    "     outside; high reader-only counts mean the class is more a data\n"
+    "     holder than an object.\n"
+    "ACT every attr_accessor is an invitation to mutate from outside: prefer\n"
+    "     attr_reader plus a method that changes state with intent.\n"
+    "MISLEADS counts the macro DECLARATIONS (one per attribute), not the\n"
+    "     generated method call sites; `attr` and `class_attribute` are\n"
+    "     grouped with reader; a `mattr_`/`cattr_` variant is counted as an\n"
+    "     accessor on the class rather than the instance.",
+    """SELECT s.name, s.n_attr_accessor AS accessors,
+        s.n_attr_reader AS readers, s.n_attr_writer AS writers,
+        s.n_attr_accessor + s.n_attr_reader + s.n_attr_writer AS total_attrs,
+        s.sloc, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE (s.n_attr_accessor + s.n_attr_reader + s.n_attr_writer) > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY total_attrs DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "heavy-mixins",
+    "Modules and concerns included by the most classes",
+    "ANSWERS which mixin surfaces spread across the widest class set -- the\n"
+    "     gems and core modules every host pulls in, and the ones whose\n"
+    "     method-name collisions hurt the most hosts at once.\n"
+    "ACT a mixin included by many classes is a coupling axis: changing its\n"
+    "     methods changes every host. Keep it stable or split it.\n"
+    "MISLEADS counts distinct HOSTS per mixin text, so the same mixin\n"
+    "     spelled with and without a namespace prefix splits into two rows;\n"
+    "     `include`/`extend`/`prepend` all count equally although the\n"
+    "     method-lookup position differs.",
+    """SELECT mx.mixin_short AS mixin_, COUNT(DISTINCT mx.host) AS hosts,
+        COUNT(DISTINCT CASE WHEN mx.kind='prepend' THEN mx.host END)
+            AS prepended_by,
+        COUNT(DISTINCT CASE WHEN mx.kind='extend' THEN mx.host END)
+            AS extended_by,
+        GROUP_CONCAT(DISTINCT mx.kind) AS via,
+        f.path || ':' || MIN(mx.line) AS at_any
+    FROM mixins mx JOIN files f ON f.id=mx.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE COALESCE(m.name,'') LIKE :mod
+    GROUP BY mx.mixin_short
+    ORDER BY hosts DESC, prepended_by DESC LIMIT :lim"""),
+(
+    "super-overrides",
+    "Methods that call super: the override surface",
+    "ANSWERS every method whose body reaches back to its ancestor via\n"
+    "     `super` -- the precise list of behavioral overrides in this tree.\n"
+    "     Each row is a place where the subclass extends, wraps or replaces\n"
+    "     the superclass contract.\n"
+    "ACT an override with no super-call is a complete replacement; one with\n"
+    "     super is a hook. Code review should treat the two differently.\n"
+    "MISLEADS counts `super` keywords per method; `super` with explicit\n"
+    "     arguments and bare `super` both count once, and a super written as\n"
+    "     a delegated message (super.send(:x)) is not seen.",
+    """SELECT s.name, s.n_super AS supers,
+        s.n_params AS params, s.cyclomatic AS cyclo, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_super > 0 AND s.kind='method' AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_super DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "unused-private",
+    "Private methods nothing in this class calls",
+    "ANSWERS private/protected methods with no resolved caller anywhere --\n"
+    "     the internal helpers that nobody invokes. In Ruby, where method\n"
+    "     calls through `send` and dynamic dispatch are idiomatic, this is a\n"
+    "     candidate list rather than a proof of death.\n"
+    "ACT grep the method name as a string before deleting: a symbol call,\n"
+    "     a DSL callback, or a `send(:method)` keeps it alive invisibly.\n"
+    "MISLEADS visibility comes from the method's declared visibility; a\n"
+    "     method called through send/instance_exec/define_method looks\n"
+    "     uncalled here, and a private method called ON ITSELF inside the\n"
+    "     class counts only if resolution followed the receiver.",
+    """SELECT s.name, s.visibility,
+        s.n_calls AS calls, s.cyclomatic AS cyclo, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='method' AND s.is_public=0 AND s.visibility IN ('private','protected')
+      AND s.fan_in=0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.sloc DESC LIMIT :lim"""),
+(
+    "nested-iterators",
+    "Methods iterating inside an iteration (reek NestedIterators)",
+    "ANSWERS methods with blocks at iteration depth >= 2: the accidental\n"
+    "     O(n*m). Each nested level multiplies the work by the outer size.\n"
+    "ACT flatten, pluck, or push the inner query into SQL.\n"
+    "MISLEADS matrix pipelines and group_by chains are legitimately nested;\n"
+    "     depth counts blocks, not data size -- rank by queries_inside\n"
+    "     first, because an inner AR query is the expensive half.",
+    """SELECT f.path, s.name, COUNT(*) AS nested_iters, MAX(b.depth) AS max_depth,
+        SUM(b.n_queries) AS queries_inside
+    FROM blocks b
+    JOIN symbols s ON s.id = b.symbol_id
+    JOIN files f ON f.id = b.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE b.is_iteration = 1 AND b.depth >= 2
+      AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY b.symbol_id
+    ORDER BY queries_inside DESC, nested_iters DESC
+    LIMIT :lim"""),
+(
+    "feature-envy",
+    "Methods whose calls mostly leave the object (reek FeatureEnvy)",
+    "ANSWERS methods whose foreign calls dominate self calls: the method\n"
+    "     wants to move to the class it keeps calling. Each row is a\n"
+    "     placement smell -- the data it works on lives elsewhere.\n"
+    "ACT move it to the envied class, or extract a value object.\n"
+    "MISLEADS DSL receivers, delegation one-liners and AR association\n"
+    "     proxies all read as envy; is_self is receiver-text based, so a\n"
+    "     call through a local (`items.map`) counts as foreign even when\n"
+    "     `items` is the method's own parameter -- which is the point for\n"
+    "     params-heavy helpers but noise for pure functions.",
+    """SELECT s.name, f.path,
+        SUM(CASE WHEN e.is_self = 0 THEN e.n_calls ELSE 0 END) AS foreign_calls,
+        SUM(CASE WHEN e.is_self = 1 THEN e.n_calls ELSE 0 END) AS self_calls
+    FROM edges e
+    JOIN symbols s ON s.id = e.caller_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY e.caller_id
+    HAVING foreign_calls >= 5 AND foreign_calls > 2 * self_calls
+    ORDER BY foreign_calls DESC
+    LIMIT :lim"""),
+(
+    "debugger-surface",
+    "binding.pry / debugger / byebug left in application code",
+    "ANSWERS the debugger entry points in non-test code: a binding.pry\n"
+    "     shipped to production is an interactive session waiting for a\n"
+    "     stdin, and byebug breaks under load in the same way.\n"
+    "ACT remove before shipping; gate the debugger behind an env flag if it\n"
+    "     must survive in the tree.\n"
+    "MISLEADS name-based on unresolved calls, so a wrapper around\n"
+    "     binding.pry hides it; a debugger behind a development-only\n"
+    "     constant is still reported (the row is the review list); test\n"
+    "     files are excluded by is_test.",
+    """SELECT f.path, s.name, uc.name AS debugger, uc.n, uc.first_line, s.fan_in
+    FROM unresolved_calls uc
+    JOIN symbols s ON s.id = uc.caller_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE uc.name IN ('binding.pry','byebug','debugger','binding.irb')
+      AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, uc.n DESC
+    LIMIT :lim"""),
+(
+    "unscoped-find-params",
+    "find / find_by / where with params and no visible scope (brakeman)",
+    "ANSWERS AR lookups fed straight from params: unscoped find. Without an\n"
+    "     explicit default scope or tenant filter, params[:id] from one\n"
+    "     tenant can read another tenant's row.\n"
+    "ACT scope the query to the current account/tenant before the find, or\n"
+    "     whitelist the param.\n"
+    "MISLEADS from_params is an ARGUMENT-SHAPE flag: params[:id] inside a\n"
+    "     method that is itself called with a scoped relation is invisible\n"
+    "     (the flag looks at the literal argument, not data flow); a\n"
+    "     controller that scopes first then finds is still reported if the\n"
+    "     find call's own argument is params-derived.",
+    """SELECT f.path, s.name, aq.model, aq.api, aq.build_kind, aq.loop_depth,
+        s.fan_in
+    FROM ar_queries aq
+    JOIN symbols s ON s.id = aq.symbol_id
+    JOIN files f ON f.id = aq.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE aq.from_params = 1
+      AND aq.api IN ('find','find_by','find_by!','first','last','take','where')
+      AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "find-each-missed",
+    "Model.all.each with a query inside the block",
+    "ANSWERS the accidental N+1 in its most mechanical form: iterate\n"
+    "     EVERY row of a model, and run a query inside the loop.\n"
+    "ACT switch to find_each / find_in_batches; or preload and use the\n"
+    "     association, which is one query.\n"
+    "MISLEADS the block receiver is text (`User.all.each`); a variable\n"
+    "     holding the collection reads as 'other' and is missed; n_queries\n"
+    "     counts AR calls inside the block body, so a loop that does no\n"
+    "     querying is excluded by the HAVING.",
+    """SELECT f.path, s.name, b.receiver, b.line, b.n_queries, s.fan_in
+    FROM blocks b
+    JOIN symbols s ON s.id = b.symbol_id
+    JOIN files f ON f.id = b.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE b.is_iteration = 1
+      AND instr(b.receiver, '.all') > 0
+      AND b.n_queries > 0
+      AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY b.n_queries DESC, s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "unsafe-deserialization",
+    "Marshal.load / YAML.load / Psych.load sites (brakeman UnsafeDeserialization)",
+    "ANSWERS the deserialization entry points that can turn attacker bytes\n"
+    "     into object construction: Marshal.load on any untrusted input is\n"
+    "     remote code execution, and YAML.load is the same in legacy Psych.\n"
+    "ACT feed untrusted bytes only to the safe forms: YAML.safe_load,\n"
+    "     Psych.safe_load, Marshal never; JSON.load is listed but JSON\n"
+    "     cannot construct objects.\n"
+    "MISLEADS the capture is the deserialize hazard family, which includes\n"
+    "     JSON.load and Oj.load -- rows whose payload cannot execute; the\n"
+    "     data origin is NOT tracked, so a Marshal.load on a server-side\n"
+    "     constant ranks the same as one on a cookie.",
+    """SELECT f.path, s.name, h.pattern AS api, h.n AS sites, h.first_line,
+        s.fan_in
+    FROM hazards h
+    JOIN symbols s ON s.id = h.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE h.category = 'deserialize'
+      AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, h.n DESC
+    LIMIT :lim"""),
+(
+    "save-without-bang",
+    "save (no bang) with the boolean result discarded (Rails/SaveBang)",
+    "ANSWERS save calls whose false-on-failure result is thrown away: the\n"
+    "     failure is invisible to the caller, and in a callback the save can\n"
+    "     silently not happen. rubocop-rails wants save! for this shape.\n"
+    "ACT use save! in callbacks and let the exception propagate, or handle\n"
+    "     the false branch explicitly.\n"
+    "MISLEADS the discard is positional (expression statement): a save whose\n"
+    "     result feeds an if (`if record.save`) is correctly absent; save on\n"
+    "     a bare receiver that is a method call (a relation) is excluded by\n"
+    "     construction; validation-false is the common failure and is not\n"
+    "     distinguished from an IO failure.",
+    """SELECT f.path, s.name, s.n_save_ignored AS ignored_saves,
+        s.n_ar_write AS writes, s.fan_in
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_save_ignored > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_save_ignored DESC, s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "legacy-enumerable-idioms",
+    "select.first / map.flatten / reverse.each chains (fasterer)",
+    "ANSWERS the three chain pairs with a dedicated idiom: select{}.first is\n"
+    "     find{}, map{}.flatten is flat_map{}, reverse.each is\n"
+    "     reverse_each -- each saves an intermediate array or a pass.\n"
+    "ACT swap to the dedicated form; the change is mechanical.\n"
+    "MISLEADS text-matched on the chain receiver: `xs.select(&:x).first`\n"
+    "     matches, `ys.select(...)` with the call split across a local does\n"
+    "     not; a select that is genuinely cheaper than find (all matches\n"
+    "     needed elsewhere) still reads as a violation.",
+    """SELECT f.path, s.name, s.n_legacy_chain AS legacy_chains,
+        s.n_ar_query AS queries, s.fan_in
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_legacy_chain > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_legacy_chain DESC, s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "param-clumps",
+    "Three or more methods sharing the same parameter set (reek DataClump)",
+    "ANSWERS the parameter tuples repeated across methods: a DataClump is\n"
+    "     the raw material of a missing value object. Each row names the\n"
+    "     shared tuple and how many methods carry it.\n"
+    "ACT extract a value object (or a positional struct) and pass it once.\n"
+    "MISLEADS the tuple is grouped as WRITTEN (parameter order matters):\n"
+    "     two methods with the same params in different orders read as\n"
+    "     different clumps; common framework params (request, response)\n"
+    "     appear in every method of a class and dominate the list; a\n"
+    "     one-off two-method pair is excluded by the HAVING.",
+    """WITH sigs(symbol_id, names) AS (
+        SELECT p.symbol_id, GROUP_CONCAT(p.name, ',')
+        FROM params p GROUP BY p.symbol_id
+    )
+    SELECT names, COUNT(*) AS n_methods,
+        COUNT(DISTINCT s.file_id) AS n_files
+    FROM sigs JOIN symbols s ON s.id = sigs.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.kind = 'method' AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+      AND length(names) - length(replace(names, ',', '')) + 1 >= 3
+    GROUP BY names
+    HAVING n_methods >= 3
+    ORDER BY n_methods DESC, n_files DESC
+    LIMIT :lim"""),
+(
+    "typing-coverage",
+    "Methods in sig-using classes that have no sig (sorbet adoption gaps)",
+    "ANSWERS public methods missing a sig{} in files where sorbet is in use:\n"
+    "     the untyped gap. A class that typed one method proves the author\n"
+    "     is adopting sorbet -- the untyped ones are the remainder.\n"
+    "ACT add sig{} to the method; if it is deliberately untyped (dynamic\n"
+    "     dispatch), say so with a T.untyped comment.\n"
+    "MISLEADS has_sig is the prev-sibling text: `sig` on the line before the\n"
+    "     def; a sig separated by a comment or wrapped in a helper reads as\n"
+    "     absent; files that never use sorbet are excluded by the EXISTS,\n"
+    "     so the rows are the ADOPTION gaps, not a raw typing census.",
+    """SELECT f.path, s.name,
+        (SELECT COUNT(*) FROM symbols m2 JOIN files f2 ON f2.id=m2.file_id
+          WHERE f2.id = f.id AND m2.kind='method' AND m2.has_sig=1)
+            AS sigs_in_file,
+        s.fan_in, s.sloc
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='method' AND s.has_sig = 0 AND s.is_public = 1
+      AND EXISTS (SELECT 1 FROM symbols m2
+                   WHERE m2.file_id = f.id AND m2.has_sig = 1)
+      AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY sigs_in_file DESC, s.sloc DESC
+    LIMIT :lim""")
 ]
 
 RubyAnalyzer.METRICS = [

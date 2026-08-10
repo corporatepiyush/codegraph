@@ -35,3 +35,5 @@ test_repos/
 
 # one-shot local helpers
 _*.py
+PLAN.md
+.audit-probes/

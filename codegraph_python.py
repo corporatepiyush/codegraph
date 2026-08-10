@@ -629,6 +629,11 @@ MARKER_RE = re.compile(
     r'\b(TODO|FIXME|XXX|HACK|BUG|NOTE|WARNING|OPTIMIZE|REVIEW|DEPRECATED|'
     r'SAFETY|PANIC|UNSAFE)\b[ \t]*[:\-(]', re.I)
 
+#: # noqa / # type: ignore / # pragma: no cover / # pyright: ignore --
+#: suppression directives counted as markers for `suppression-burden`.
+NOQA_RE = re.compile(r'#\s*(noqa|type:\s*ignore|pragma:\s*no\s*cover|'
+                     r'pyright:\s*ignore)\b', re.I)
+
 MAGIC_OK = {0, 1, 2, -1, 10, 100, 1000, 8, 16, 32, 64, 128, 256, 512, 1024,
             255, 65535, 4096, 24, 60, 365, 7, 12, 3, 4, 6}
 
@@ -1576,12 +1581,21 @@ def _has_surrogates(text: str) -> bool:
     return any("\ud800" <= ch <= "\udfff" for ch in text)
 
 def scan_markers(rec: FileRec, bufs: Buffers) -> None:
-    """TODO/FIXME/HACK and friends, with their line and text."""
+    """TODO/FIXME/HACK and friends, with their line and text.
+
+    Suppression kinds (# noqa, # type: ignore, pragma) are counted in the
+    same table so `suppression-burden` can rank them against TODO debt:
+    a file drowning in noqa is a file that outgrew its linter.
+    """
     for i, line in enumerate(rec.text.splitlines(), 1):
         m = MARKER_RE.search(line)
         if m and ("//" in line or "#" in line or "*" in line or "--" in line):
             bufs.markers.append(
                 (rec.fid, None, m.group(1).upper(), i, line.strip()[:200]))
+        sm = NOQA_RE.search(line)
+        if sm:
+            bufs.markers.append(
+                (rec.fid, None, sm.group(1).upper(), i, line.strip()[:200]))
 
 #: Files between incremental flushes of the per-file row buffers. The
 #: accumulators used to hold every row until the end of the parse: on
@@ -2605,6 +2619,11 @@ class FunctionMetrics(ast.NodeVisitor):
                 self.bump("n_yield_from")
         elif t is ast.Lambda:
             self.bump("n_lambda")
+            if self.loop_depth:
+                # bugbear B023: a closure inside a loop -- it captures the
+                # loop variable's FINAL value unless the call is delayed
+                # correctly.
+                self.bump("n_loop_closure")
         elif t is ast.NamedExpr:
             self.bump("n_walrus")
         elif t is ast.Delete:
@@ -2654,6 +2673,8 @@ class FunctionMetrics(ast.NodeVisitor):
             self.bump("n_inner_class")
         elif t in (ast.FunctionDef, ast.AsyncFunctionDef) and node is not self._root:
             self.bump("n_inner_function")
+            if self.loop_depth:
+                self.bump("n_loop_closure")
 
         if isinstance(node, OPERATOR_NODES):
             key = t.__name__
@@ -2705,6 +2726,20 @@ class FunctionMetrics(ast.NodeVisitor):
 
         if name:
             base = name.split(".")[-1]
+            if base == "raises" and name.startswith(("pytest.",)):
+                # bugbear B017: pytest.raises(Exception) -- a broad literal
+                # argument that will catch almost anything (and pass).
+                a0 = node.args[0] if node.args else None
+                if isinstance(a0, ast.Name) and a0.id in (
+                        "Exception", "BaseException"):
+                    self.bump("n_broad_raises")
+            if base == "Environment" and name.endswith(("Environment",)):
+                # bandit S701: jinja2.Environment(autoescape=False)
+                for kw in node.keywords:
+                    if kw.arg == "autoescape" and isinstance(kw.value,
+                                                             ast.Constant) \
+                            and kw.value.value is False:
+                        self.bump("n_autoescape_false")
             if base in ("append", "extend", "insert") and self.loop_depth:
                 self.bump("append_in_loop")
             if base in ("compile",) and name.startswith(("re.", "regex.")):
@@ -2898,6 +2933,10 @@ class PythonAnalyzer(Analyzer):
         ("n_format_in_loop", "INT NOT NULL DEFAULT 0"),     # PERF
         ("n_elif", "INT NOT NULL DEFAULT 0"),
         ("n_external_calls", "INT NOT NULL DEFAULT 0"),
+        # -- P2 pack: closure-in-loop, broad-test-expectation, jinja ---------
+        ("n_loop_closure", "INT NOT NULL DEFAULT 0"),       # B023
+        ("n_broad_raises", "INT NOT NULL DEFAULT 0"),       # B017
+        ("n_autoescape_false", "INT NOT NULL DEFAULT 0"),   # S701
         ("is_property", "INT NOT NULL DEFAULT 0"),
         ("is_classmethod", "INT NOT NULL DEFAULT 0"),
         ("is_staticmethod", "INT NOT NULL DEFAULT 0"),
@@ -2935,19 +2974,20 @@ CREATE TABLE classes(
     is_metaclass INT NOT NULL DEFAULT 0
 ) WITHOUT ROWID, STRICT;
 
-CREATE TABLE handlers(
-    id INTEGER PRIMARY KEY,
-    symbol_id INT NOT NULL REFERENCES symbols(id),
-    line INT NOT NULL,
-    types TEXT NOT NULL DEFAULT '',
-    is_bare INT NOT NULL DEFAULT 0,
-    is_broad INT NOT NULL DEFAULT 0,
-    is_empty INT NOT NULL DEFAULT 0,
-    has_reraise INT NOT NULL DEFAULT 0,
-    has_log INT NOT NULL DEFAULT 0,
-    n_body_lines INT NOT NULL DEFAULT 0,
-    in_loop INT NOT NULL DEFAULT 0
-) STRICT;
+ CREATE TABLE handlers(
+     id INTEGER PRIMARY KEY,
+     symbol_id INT NOT NULL REFERENCES symbols(id),
+     line INT NOT NULL,
+     types TEXT NOT NULL DEFAULT '',
+     is_bare INT NOT NULL DEFAULT 0,
+     is_broad INT NOT NULL DEFAULT 0,
+     is_empty INT NOT NULL DEFAULT 0,
+     has_reraise INT NOT NULL DEFAULT 0,
+     has_log INT NOT NULL DEFAULT 0,
+     n_body_lines INT NOT NULL DEFAULT 0,
+     in_loop INT NOT NULL DEFAULT 0,
+     has_raise_no_from INT NOT NULL DEFAULT 0
+ ) STRICT;
 
 CREATE TABLE dynamic_sites(
     id INTEGER PRIMARY KEY,
@@ -2972,18 +3012,28 @@ CREATE TABLE comprehensions(
 ) STRICT;
 
 CREATE TABLE module_vars(
-    id INTEGER PRIMARY KEY,
-    file_id INT NOT NULL REFERENCES files(id),
-    module_id INT REFERENCES modules(id),
-    name TEXT NOT NULL,
-    line INT NOT NULL,
-    type TEXT NOT NULL DEFAULT '',
-    is_constant INT NOT NULL DEFAULT 0,
-    is_mutable_container INT NOT NULL DEFAULT 0,
-    is_private INT NOT NULL DEFAULT 0,
-    has_call_init INT NOT NULL DEFAULT 0
-) STRICT;
-"""
+     id INTEGER PRIMARY KEY,
+     file_id INT NOT NULL REFERENCES files(id),
+     module_id INT REFERENCES modules(id),
+     name TEXT NOT NULL,
+     line INT NOT NULL,
+     type TEXT NOT NULL DEFAULT '',
+     is_constant INT NOT NULL DEFAULT 0,
+     is_mutable_container INT NOT NULL DEFAULT 0,
+     is_private INT NOT NULL DEFAULT 0,
+     has_call_init INT NOT NULL DEFAULT 0
+ ) STRICT;
+
+ -- Package entry points declared via `__all__ = [...]`. A name here that has
+ -- no definition in this file is a re-export; seeing both halves is what
+ -- makes `is_reexport` checkable from SQL.
+ CREATE TABLE all_exports(
+     id INTEGER PRIMARY KEY,
+     file_id INT NOT NULL REFERENCES files(id),
+     name TEXT NOT NULL,
+     line INT NOT NULL
+ ) STRICT;
+ """
 
     INDEX_EXT = r"""
 CREATE INDEX idx_cls_kind ON classes(is_dataclass, is_abc, is_enum);
@@ -3182,6 +3232,13 @@ WHERE x.id = c.symbol_id;
             ann = ""
             if isinstance(node, ast.Assign):
                 targets, value = node.targets, node.value
+            elif isinstance(node, ast.AugAssign) \
+                    and isinstance(node.target, ast.Name) \
+                    and node.target.id == "__all__" \
+                    and isinstance(node.op, ast.Add):
+                # `__all__ += [...]` is the extend form of the same promise;
+                # only the literal-list shape is captured, like Assign.
+                targets, value = [node.target], node.value
             elif isinstance(node, ast.AnnAssign) and node.value is not None:
                 targets, value, ann = [node.target], node.value, type_str(
                     node.annotation)
@@ -3191,6 +3248,17 @@ WHERE x.id = c.symbol_id;
                 if not isinstance(tgt, ast.Name):
                     continue
                 name = tgt.id
+                if name == "__all__":
+                    # `__all__ = [...names...]` declares the package surface.
+                    # Literal names only; anything computed is skipped, which
+                    # is honest for a wildcard-export entry point.
+                    if isinstance(value, (ast.List, ast.Tuple)):
+                        for elt in value.elts:
+                            if isinstance(elt, ast.Constant) \
+                                    and isinstance(elt.value, str):
+                                bufs.rows("all_exports").append(
+                                    (rec.fid, elt.value, elt.lineno))
+                    continue
                 mutable = isinstance(value, (ast.List, ast.Dict, ast.Set)) or (
                     isinstance(value, ast.Call)
                     and dotted(value.func).split(".")[-1] in
@@ -3441,33 +3509,51 @@ WHERE x.id = c.symbol_id;
             self._mutable_defaults.append((n_mutable, sid))
 
     def _handlers(self, node: ast.AST, sid: int, bufs: Buffers) -> None:
-        for h in ast.walk(node):
-            if not isinstance(h, ast.ExceptHandler):
-                continue
-            types = dotted(h.type) if h.type is not None else ""
-            if isinstance(h.type, ast.Tuple):
-                types = ",".join(dotted(e) for e in h.type.elts)
-            body = h.body
-            empty = len(body) == 1 and isinstance(body[0], (ast.Pass,))
-            # One walk, not two. `reraise` and `log` each used to run their
-            # own `ast.walk(h)` over the same handler body; both answers come
-            # from the same pass, and it can stop as soon as both are known.
-            reraise = log = False
-            for n in ast.walk(h):
-                if isinstance(n, ast.Raise):
-                    reraise = True
-                elif isinstance(n, ast.Call) and any(
-                        k in dotted(n.func).lower()
-                        for k in ("log", "warn", "error", "print",
-                                  "capture", "report")):
-                    log = True
-                if reraise and log:
-                    break
-            end = getattr(h, "end_lineno", h.lineno) or h.lineno
-            bufs.rows("handlers").append(
-                (sid, h.lineno, types[:200], int(h.type is None),
-                 int(h.type is None or types in BROAD_EXCEPTIONS),
-                 int(empty), int(reraise), int(log), end - h.lineno, 0))
+        # `in_loop` used to be hardcoded 0 -- every handler in the language
+        # read as loop-free, which silently zeroed the exception-in-loop
+        # query. ast.walk cannot carry loop ancestry, so walk by hand.
+        def walk(n: ast.AST, in_loop: int) -> None:
+            for h in ast.iter_child_nodes(n):
+                if isinstance(h, ast.ExceptHandler):
+                    types = dotted(h.type) if h.type is not None else ""
+                    if isinstance(h.type, ast.Tuple):
+                        types = ",".join(dotted(e) for e in h.type.elts)
+                    body = h.body
+                    empty = len(body) == 1 and isinstance(body[0], (ast.Pass,))
+                    # One walk, not two. `reraise` and `log` each used to run
+                    # their own `ast.walk(h)` over the same handler body; both
+                    # answers come from the same pass, and it can stop as soon
+                    # as both are known.
+                    reraise = log = raise_no_from = False
+                    for n in ast.walk(h):
+                        if isinstance(n, ast.Raise):
+                            reraise = True
+                            # pylint W0707: a NEW exception raised without
+                            # `from` loses the original traceback. Bare
+                            # `raise` (exc None) and `raise e` (the caught
+                            # name) preserve it and are not flagged.
+                            if n.exc is not None and n.cause is None and (
+                                    not isinstance(n.exc, ast.Name)
+                                    or n.exc.id != h.name):
+                                raise_no_from = True
+                        elif isinstance(n, ast.Call) and any(
+                                k in dotted(n.func).lower()
+                                for k in ("log", "warn", "error", "print",
+                                          "capture", "report")):
+                            log = True
+                        if reraise and log:
+                            break
+                    end = getattr(h, "end_lineno", h.lineno) or h.lineno
+                    bufs.rows("handlers").append(
+                        (sid, h.lineno, types[:200], int(h.type is None),
+                         int(h.type is None or types in BROAD_EXCEPTIONS),
+                         int(empty), int(reraise), int(log), end - h.lineno,
+                         in_loop, int(raise_no_from)))
+                elif isinstance(h, (ast.For, ast.AsyncFor, ast.While)):
+                    walk(h, 1)
+                else:
+                    walk(h, in_loop)
+        walk(node, 0)
 
     def _comprehensions(self, node: ast.AST, sid: int, rec: FileRec,
                         bufs: Buffers) -> None:
@@ -3820,8 +3906,8 @@ WHERE x.id = c.symbol_id;
              "is_django_model,is_metaclass) VALUES(%s)" % ",".join("?" * 22)),
             ("handlers",
              "INSERT INTO handlers(symbol_id,line,types,is_bare,is_broad,"
-             "is_empty,has_reraise,has_log,n_body_lines,in_loop) "
-             "VALUES(?,?,?,?,?,?,?,?,?,?)"),
+             "is_empty,has_reraise,has_log,n_body_lines,in_loop,"
+             "has_raise_no_from) VALUES(?,?,?,?,?,?,?,?,?,?,?)"),
             ("dynamic_sites",
              "INSERT INTO dynamic_sites(symbol_id,file_id,kind,expr,line,"
              "is_literal_arg) VALUES(?,?,?,?,?,?)"),
@@ -3832,6 +3918,8 @@ WHERE x.id = c.symbol_id;
              "INSERT INTO module_vars(file_id,module_id,name,line,type,"
              "is_constant,is_mutable_container,is_private,has_call_init) "
              "VALUES(?,?,?,?,?,?,?,?,?)"),
+            ("all_exports",
+             "INSERT INTO all_exports(file_id,name,line) VALUES(?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
             if rows:
@@ -4512,7 +4600,411 @@ QUERIES: list[tuple[str, str, str, str]] = [
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.append_in_loop > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.append_in_loop DESC, s.n_loops DESC LIMIT :lim""")
+    ORDER BY s.append_in_loop DESC, s.n_loops DESC LIMIT :lim"""),
+(
+    "decorator-depth",
+    "Functions stacked with the most decorators",
+    "ANSWERS which definitions carry the deepest decorator chains. Each\n"
+    "     stacked decorator adds a wrapper frame on every call and a layer of\n"
+    "     indirection that breakpoints and tracebacks must cross -- and a\n"
+    "     decorator conference (`@login_required @rate_limit @cache`) means\n"
+    "     the real body is several wrappers deep.\n"
+    "ACT collapse chains of pure wrappers into one composite decorator, or\n"
+    "     question whether the stacking is doing three jobs that belong in\n"
+    "     three places.\n"
+    "MISLEADS counts rows in the attributes table per symbol, so a decorator\n"
+    "     applied via `functools.wraps`-style aliasing or `apply(fn)` is\n"
+    "     invisible; stacked class decorators are counted the same as stacked\n"
+    "     function decorators and the semantic weight differs.",
+    """SELECT s.name, s.kind, s.n_decorators AS decorators,
+        COUNT(a.id) AS attr_rows, s.sloc, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    LEFT JOIN attributes a ON a.symbol_id=s.id
+    WHERE s.n_decorators >= 3 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_decorators DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "non-public-leak",
+    "Calls to _private symbols from outside their module",
+    "ANSWERS cross-module edges whose callee name starts with underscore --\n"
+    "     the private-by-convention functions other modules reach into. Each\n"
+    "     row is a coupling that the author did not declare and a rename\n"
+    "     without a forwarding shim will break.\n"
+    "ACT export the function properly (drop the underscore or add a public\n"
+    "     alias) or move the caller inside the module; a `_` name is a\n"
+    "     maintenance contract, not a lock.\n"
+    "MISLEADS same-file calls to _private symbols are NOT leaks (they are the\n"
+    "     normal internal call pattern) and are excluded; `__name`\n"
+    "     name-mangled attributes and dunder-named symbols are not reported.",
+    """SELECT cal.name AS callee_, cal.kind AS callee_kind,
+        cal.sloc,
+        GROUP_CONCAT(DISTINCT fcal.path) AS defined_in,
+        GROUP_CONCAT(DISTINCT fcall.path) AS called_from,
+        SUM(e.n_calls) AS n_calls
+    FROM edges e
+    JOIN symbols cal ON cal.id=e.callee_id
+    JOIN symbols call ON call.id=e.caller_id
+    JOIN files fcal ON fcal.id=cal.file_id
+    JOIN files fcall ON fcall.id=call.file_id
+    LEFT JOIN modules m ON m.id=cal.module_id
+    WHERE instr(cal.name, '_') = 1
+      AND NOT (instr(cal.name, '__') = 1)
+      AND cal.file_id <> call.file_id
+      AND fcall.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY cal.id
+    ORDER BY n_calls DESC, cal.sloc DESC LIMIT :lim"""),
+(
+    "wildcard-import-rank",
+    "Files importing with `from x import *`",
+    "ANSWERS the star imports that flood the importing namespace with\n"
+    "     unresolvable names: nothing can say what a later `foo()` resolves\n"
+    "     to, and the module's `__all__` (where it exists) is the only\n"
+    "     contract. One wildcard import makes the file's symbol table opaque.\n"
+    "ACT replace with explicit names, or constrain the source module with a\n"
+    "     proper `__all__` and check it covers everything that is used.\n"
+    "MISLEADS `is_wildcard` marks the import row; the names it brings in are\n"
+    "     NOT added to the alias map (by design), so every use of an\n"
+    "     imported-through-star name is either unresolved or resolved by\n"
+    "     global-name luck. A `__all__`-less library star-imported this way\n"
+    "     reads as zero hints.",
+    """SELECT f.path, COUNT(*) AS wildcard_imports,
+        (SELECT COUNT(*) FROM all_exports ae WHERE ae.file_id=f.id)
+            AS local_all_exports,
+        f.sloc
+    FROM imports i JOIN files f ON f.id=i.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE i.is_wildcard=1 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY f.id
+    ORDER BY wildcard_imports DESC, f.sloc DESC LIMIT :lim"""),
+(
+    "all-reexports",
+    "Names in __all__ that are not defined in the same file",
+    "ANSWERS the package entry points `__all__` promises yet defines\n"
+    "     elsewhere -- the re-export surface of an __init__.py. Each row is\n"
+    "     a name that is importable-from-package but whose definition lives\n"
+    "     elsewhere, which makes the package's API two edits deep.\n"
+    "ACT keep the list explicit and short; a `__all__` entry with no\n"
+    "     definition AT ALL in the tree is a dangling promise.\n"
+    "MISLEADS relies on the literal-list capture of `__all__ = [...]`;\n"
+    "     computed `__all__` (sorted(), set operations) has no row here, and\n"
+    "     a same-file definition counted as \"defined\" means the re-export\n"
+    "     half is the missing one -- the query reports exactly that half.",
+    """SELECT f.path AS package_file, ae.name AS exported_name, ae.line,
+        (SELECT COUNT(*) FROM symbols s
+          WHERE s.name=ae.name AND s.file_id=f.id
+            AND s.kind IN ('function','class')) AS defined_here,
+        (SELECT COUNT(*) FROM symbols s2
+          WHERE s2.name=ae.name
+            AND s2.kind IN ('function','class')) AS defined_anywhere
+    FROM all_exports ae JOIN files f ON f.id=ae.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE COALESCE(m.name,'') LIKE :mod
+    GROUP BY ae.id
+    HAVING defined_here = 0
+    ORDER BY f.path, ae.line LIMIT :lim"""),
+(
+    "relative-import-depth",
+    "Import chains climbing packages with leading dots",
+    "ANSWERS which files reach across package boundaries with `from ..x`\n"
+    "     chains -- the dots count one per level climbed. Deep chains couple\n"
+    "     the file to the layout above it, and moving either end silently\n"
+    "     severs the link.\n"
+    "ACT replace depth >= 2 relative imports with an absolute import from a\n"
+    "     shared root, or move the shared code closer to the consumer.\n"
+    "MISLEADS depth is computed from the leading-dot count in the import\n"
+    "     specifier; `from . import x` (depth one, same package) is counted\n"
+    "     as a chain of depth 1, which is normal and reported only as data;\n"
+    "     a module that imports itself or a missing sibling looks identical\n"
+    "     here.",
+    """SELECT f.path,
+        MAX(i.is_relative * (length(i.target) - length(ltrim(i.target, '.'))
+                             )) AS max_depth,
+        SUM(CASE WHEN i.is_relative=1 THEN 1 ELSE 0 END) AS relative_imports,
+        SUM(CASE WHEN i.is_relative=1
+                 AND (length(i.target) - length(ltrim(i.target, '.'))) >= 2
+             THEN 1 ELSE 0 END) AS deep_imports
+    FROM imports i JOIN files f ON f.id=i.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE i.is_relative=1
+      AND (length(i.target) - length(ltrim(i.target, '.'))) >= 1
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY f.id
+    ORDER BY deep_imports DESC, max_depth DESC LIMIT :lim"""),
+(
+    "method-kind-mix",
+    "Class methods by kind: instance vs classmethod vs staticmethod",
+    "ANSWERS how each class mixes method kinds. A heavy classmethod/\n"
+    "     staticmethod share signals factory-style design; an instance-method\n"
+    "     majority is the plain OO shape. The mix column shows the split.\n"
+    "ACT a class whose methods are entirely static/class-wide is probably a\n"
+    "     module hiding in a class -- consider a plain function module or\n"
+    "     functools.singledispatch instead.\n"
+    "MISLEADS relies on is_classmethod/is_staticmethod flags derived from\n"
+    "     decorator names: `@classmethod`/`@staticmethod` spellings only, so\n"
+    "     a decorator alias (e.g. `import classmethod as cm`) is invisible,\n"
+    "     and inherited methods are not counted per subclass.",
+    """SELECT pc.name AS class_,
+        SUM(s.is_classmethod) AS classmethods,
+        SUM(s.is_staticmethod) AS staticmethods,
+        COUNT(*) - SUM(s.is_classmethod) - SUM(s.is_staticmethod)
+            AS instance_methods,
+        COUNT(*) AS total_methods,
+        CAST(100.0 * (SUM(s.is_classmethod) + SUM(s.is_staticmethod))
+             / NULLIF(COUNT(*), 0) AS INT) AS pct_staticish,
+        f.path || ':' || MIN(s.line_start) AS at_any
+    FROM symbols s
+    JOIN symbols pc ON pc.id=s.parent_id AND pc.kind='class'
+    JOIN files f ON f.id=pc.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE s.kind='method' AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY pc.id
+    HAVING classmethods + staticmethods > 0
+    ORDER BY classmethods + staticmethods DESC, total_methods DESC LIMIT :lim"""),
+(
+    "request-without-timeout",
+    "requests/urlopen calls with no timeout (bandit S113)",
+    "ANSWERS functions issuing requests.get/post or urllib urlopen calls with\n"
+    "     no timeout: one stalled peer hangs the caller forever, and a\n"
+    "     downstream outage becomes an upstream hang.\n"
+    "ACT pass a timeout; wrap in a deadline at the call site.\n"
+    "MISLEADS deliberately infinite streams (SSE) read as violations; the\n"
+    "     counter is per-function not per-site, so fan_in approximates blast\n"
+    "     radius, not call count; a wrapper around requests that threads a\n"
+    "     timeout internally is invisible to the name-based capture.",
+    """SELECT f.path, s.name, s.n_request_no_timeout, s.fan_in
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_request_no_timeout > 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, s.n_request_no_timeout DESC
+    LIMIT :lim"""),
+(
+    "exception-in-loop",
+    "try/except inside loop bodies (perflint PERF203)",
+    "ANSWERS handlers inside loop bodies: handler bookkeeping per iteration,\n"
+    "     usually validation that belongs outside the loop.\n"
+    "ACT hoist the try, or prove the except is the loop's retry idiom.\n"
+    "MISLEADS retry loops and break-on-success are the CORRECT form and will\n"
+    "     rank here; is_broad + n_body_lines is the smell heuristic, not a\n"
+    "     verdict; is_bare names the bare-except shape, which is a separate\n"
+    "     (pre-existing) finding family.",
+    """SELECT f.path, s.name, COUNT(*) AS handlers_in_loops,
+        MAX(h.is_broad) AS any_broad, s.fan_in
+    FROM handlers h
+    JOIN symbols s ON s.id = h.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE h.in_loop = 1 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY h.symbol_id
+    ORDER BY any_broad DESC, s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "call-in-default-argument",
+    "Defaults that are CALLS, evaluated once at def time (flake8-bugbear B008)",
+    "ANSWERS defaults that call a function: evaluated ONCE when the def runs\n"
+    "     and shared by every caller. time.time() freezes at import; a\n"
+    "     get_config() result is baked in; an object factory gives every call\n"
+    "     the SAME instance.\n"
+    "ACT default None, compute inside the body.\n"
+    "MISLEADS mutable-defaults owns []/{}/set(); this owns the call form. An\n"
+    "     immutable-typed call default (e.g. `t=time.time()`) is benign in\n"
+    "     practice but still shared, so it reads as a violation here.",
+    """SELECT f.path, s.name, p.name AS param, p.default_value, s.fan_in
+    FROM params p
+    JOIN symbols s ON s.id = p.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE p.default_value IS NOT NULL AND instr(p.default_value, '(') > 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "name-shadowing",
+    "Parameters, locals and module vars named after builtins",
+    "ANSWERS names that shadow a builtin -- `def f(len)`, `id = 5` at module\n"
+    "     scope, a local named `type`. The shadow is invisible until the\n"
+    "     shadowing name is removed or the builtin is called after the\n"
+    "     assignment, and it blocks static checkers that follow the builtin.\n"
+    "ACT rename the parameter/local; a module var that shadows a builtin is\n"
+    "     the worst form -- it taints every file that imports it.\n"
+    "MISLEADS the builtin list is inline and conservative -- names that are\n"
+    "     builtins on some platforms (e.g. `exec` always, `input` always) but\n"
+    "     absent here are missed; shadowing a builtin you never call and\n"
+    "     never re-export is harmless and still reported.",
+    """WITH builtin(name) AS (VALUES
+        ('abs'),('all'),('any'),('bool'),('bytes'),('dict'),('dir'),('enumerate'),
+        ('filter'),('float'),('format'),('frozenset'),('hash'),('hex'),('id'),
+        ('input'),('int'),('iter'),('len'),('list'),('map'),('max'),('min'),
+        ('next'),('object'),('oct'),('open'),('ord'),('pow'),('print'),('range'),
+        ('repr'),('reversed'),('round'),('set'),('slice'),('sorted'),('str'),
+        ('sum'),('tuple'),('type'),('vars'),('zip'))
+    SELECT f.path, s.name AS fn, b.name AS shadowed, 'param' AS where_,
+        s.fan_in
+    FROM params p
+    JOIN builtin b ON b.name = p.name
+    JOIN symbols s ON s.id = p.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.kind IN ('function','method') AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    UNION ALL
+    SELECT f.path, s.name AS fn, b.name AS shadowed, 'local' AS where_,
+        s.fan_in
+    FROM locals l
+    JOIN builtin b ON b.name = l.name
+    JOIN symbols s ON s.id = l.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.kind IN ('function','method') AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    UNION ALL
+    SELECT f.path, '<module>' AS fn, b.name AS shadowed, 'module_var' AS where_,
+        0 AS fan_in
+    FROM module_vars mv
+    JOIN builtin b ON b.name = mv.name
+    JOIN files f ON f.id = mv.file_id
+    LEFT JOIN modules m ON m.id = mv.module_id
+    WHERE f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY fan_in DESC, shadowed
+    LIMIT :lim"""),
+(
+    "undocumented-export",
+    "Public functions and classes with no docstring, by fan-in",
+    "ANSWERS the public API surface that says nothing about itself: no\n"
+    "     docstring, no comment the analyzer can see, and callers inside the\n"
+    "     tree to care about. The most-called undocumented symbol is where a\n"
+    "     docstring pays off first.\n"
+    "ACT add a docstring; the row's fan_in is the number of callers who had\n"
+    "     to read the code instead.\n"
+    "MISLEADS Python has no is_exported signal, so is_public (not starting\n"
+    "     with `_`) is the proxy and a module-private-ish public name slips\n"
+    "     through; has_doc is a docstring/comment prefix scan, so a comment\n"
+    "     above the def counts; dead symbols (fan_in 0) are excluded because\n"
+    "     `dead-code` owns them.",
+    """SELECT s.name, s.kind, s.fan_in, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.is_public = 1 AND s.has_doc = 0 AND s.fan_in > 0
+      AND s.kind IN ('function','method','class')
+      AND f.is_generated = 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, s.sloc DESC
+    LIMIT :lim"""),
+(
+    "closure-in-loop",
+    "Lambdas and nested defs inside loop bodies (flake8-bugbear B023)",
+    "ANSWERS closures created inside loops: a lambda that references the\n"
+    "     loop variable captures its FINAL value, so every call sees the\n"
+    "     last iteration unless the value is bound early.\n"
+    "ACT bind the value as a default argument (`lambda x=x: ...`) or move\n"
+    "     the closure creation out of the loop.\n"
+    "MISLEADS the capture is positional (any lambda/def in a loop): a\n"
+    "     closure that never references the loop variable is benign and\n"
+    "     still counted; a def whose body ignores the loop var is the same;"
+    "     list-comprehension closures are separate comprehension scopes and"
+    "     are not counted.",
+    """SELECT s.name, s.n_loop_closure AS closures, s.max_loop_depth AS depth,
+        s.n_lambda AS lambdas, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_loop_closure > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_loop_closure DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "raise-without-from",
+    "New exceptions raised from handlers without `from` (pylint W0707)",
+    "ANSWERS handlers that raise a NEW exception with no `from`: the\n"
+    "     original exception's traceback is lost, so the root cause chain\n"
+    "     breaks at exactly the translation layer where it matters most.\n"
+    "ACT add `from e` (or `from None` if the cause is deliberately hidden).\n"
+    "MISLEADS a bare `raise` (re-raise) and `raise e` (the caught name)\n"
+    "     preserve context and are correctly absent; `raise X() from None`\n"
+    "     is a deliberate hiding and reads as clean; the flag is per-\n"
+    "     handler, so a handler that raises WITH from elsewhere still\n"
+    "     appears if any raise in it lacks the from.",
+    """SELECT f.path, s.name, h.line, h.types, s.fan_in
+    FROM handlers h
+    JOIN symbols s ON s.id = h.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE h.has_raise_no_from = 1 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "suppression-burden",
+    "Files drowning in # noqa / # type: ignore vs their TODO debt",
+    "ANSWERS files with more suppression directives than TODO markers: the\n"
+    "     file has outgrown its linter. Suppressions without comments are\n"
+    "     the audit gap -- someone silenced the check and moved on.\n"
+    "ACT fix or document the suppressed violations; a suppression with a\n"
+    "     reason is half the problem solved.\n"
+    "MISLEADS suppression text is not inspected beyond the directive kind:\n"
+    "     `# noqa: F401` (scoped) counts the same as bare `# noqa`;\n"
+    "     vendored or generated files are excluded by is_generated; the\n"
+    "     ratio is per-file, so a small file with one noqa outranks a big\n"
+    "     one with ten.",
+    """SELECT f.path,
+        SUM(CASE WHEN mk.kind IN ('NOQA','TYPE: IGNORE',
+                                  'PRAGMA: NO COVER','PYRIGHT: IGNORE')
+                 THEN 1 ELSE 0 END) AS suppressions,
+        SUM(CASE WHEN mk.kind IN ('NOQA','TYPE: IGNORE',
+                                  'PRAGMA: NO COVER','PYRIGHT: IGNORE')
+                 THEN 0 ELSE 1 END) AS todos,
+        COUNT(*) AS markers
+    FROM markers mk JOIN files f ON f.id=mk.file_id
+    LEFT JOIN modules m ON m.id=f.module_id
+    WHERE f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY f.id
+    HAVING suppressions > 0 AND suppressions >= todos
+    ORDER BY suppressions DESC, todos DESC LIMIT :lim"""),
+(
+    "broad-test-expectation",
+    "pytest.raises(Exception) -- a test that cannot fail (flake8-bugbear B017)",
+    "ANSWERS pytest.raises calls whose argument is the broad Exception or\n"
+    "     BaseException: the test passes when ANY error is raised, which is\n"
+    "     how a broken assertion hides for months.\n"
+    "ACT name the specific exception the code path is expected to raise.\n"
+    "MISLEADS the capture is the literal first argument only: a variable\n"
+    "     holding Exception (`exc = Exception`) or a tuple of exceptions\n"
+    "     containing the broad ones is not distinguished; a test that\n"
+    "     genuinely expects any failure (a fuzz-style guard) is the\n"
+    "     legitimate row.",
+    """SELECT f.path, s.name, s.n_broad_raises AS broad_raises,
+        s.n_calls, s.fan_in
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_broad_raises > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_broad_raises DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "template-injection",
+    "Jinja environments with autoescape disabled (bandit S701)",
+    "ANSWERS every Environment(autoescape=False): rendered user input is\n"
+    "     emitted unescaped, which is stored/server XSS whenever the data\n"
+    "     crosses to a browser.\n"
+    "ACT enable autoescape (it is the default in modern Jinja), or escape\n"
+    "     at the sink with the template's own filter.\n"
+    "MISLEADS text-matched on the keyword argument: `autoescape=False` set\n"
+    "     via a variable or a wrapper around Environment is invisible;\n"
+    "     a template used only for email (HTML escaping irrelevant) is the\n"
+    "     legitimate row; `select_autoescape` policies are not read.",
+    """SELECT f.path, s.name, s.n_autoescape_false AS unescaped_envs,
+        s.fan_in, s.sloc
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_autoescape_false > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_autoescape_false DESC, s.fan_in DESC LIMIT :lim""")
 ]
 
 METRICS = [

@@ -195,17 +195,17 @@ measures its own blindness and reports it before anything else:
 **Query counts (this revision):**
 
 | Script | QUERIES (act) | METRICS (weigh) | total |
-|---|---|---|---|
-| `codegraph_python.py` | 32 | 23 | 55 |
-| `codegraph_go.py` | 33 | 17 | 50 |
-| `codegraph_c.py` | 26 | 26 | 52 |
-| `codegraph_java.py` | 24 | 17 | 41 |
-| `codegraph_typescript.py` | 24 | 19 | 43 |
-| `codegraph_ruby.py` | 31 | 9 | 40 |
-| `codegraph_rust.py` | 29 | 14 | 43 |
-| `codegraph_javascript.py` | 20 | 14 | 34 |
-| `codegraph_php.py` | 26 | 13 | 39 |
-| **All** | **245** | **152** | **397** |
+|---|---|---|---|---|
+| `codegraph_python.py` | 48 | 23 | 71 |
+| `codegraph_go.py` | 51 | 17 | 68 |
+| `codegraph_c.py` | 42 | 26 | 68 |
+| `codegraph_java.py` | 43 | 17 | 60 |
+| `codegraph_typescript.py` | 40 | 19 | 59 |
+| `codegraph_ruby.py` | 47 | 9 | 56 |
+| `codegraph_rust.py` | 46 | 14 | 60 |
+| `codegraph_javascript.py` | 31 | 14 | 45 |
+| `codegraph_php.py` | 42 | 13 | 55 |
+| **All** | **390** | **152** | **542** |
 
 (Single source of truth for these numbers: run `codegraph_<lang>.py --list` and
 `--metrics --list`. If the table disagrees with the scripts, the scripts win.)

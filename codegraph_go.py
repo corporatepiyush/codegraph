@@ -3248,6 +3248,11 @@ DEPS = DepSet(lang="go", deps=[
     grammar("Go", "tree_sitter_go", "tree-sitter-go>=0.25", "0.25.0 (ABI 15)"),
 ])
 
+#: Longest error-propagation chain the error-fan-out pass will report.
+#: An error chain through a recursive cycle is unbounded; 32 is the honest
+#: ceiling and is stated in the query's MISLEADS.
+ERROR_CHAIN_CAP = 32
+
 HAZARD_CATEGORIES = (
     "goroutine", "channel", "defer", "lock", "atomic", "context", "io", "net",
     "sql", "exec", "unsafe", "reflect", "cgo", "alloc", "panic", "time",
@@ -3464,6 +3469,12 @@ class GoAnalyzer(TreeSitterAnalyzer):
         "QueryContext": "query_in_loop",
         "Query": "query_in_loop",
         "ExecContext": "query_in_loop",
+        # A context deadline/cancel created PER ITERATION leaks a timer each
+        # pass (context.WithTimeout) or can never fire (WithCancel recreated
+        # every loop) -- the context-built-in-loop query ranks these.
+        "WithTimeout": "n_ctx_in_loop",
+        "WithDeadline": "n_ctx_in_loop",
+        "WithCancel": "n_ctx_in_loop",
     }
 
     EXTRA_SYMBOL_COLS = (
@@ -3548,6 +3559,11 @@ class GoAnalyzer(TreeSitterAnalyzer):
         ("receiver_type", "TEXT NOT NULL DEFAULT ''"),
         ("is_handler", "INT NOT NULL DEFAULT 0"),
         ("is_init", "INT NOT NULL DEFAULT 0"),
+        # -- P2 pack: context/error/tls/loopvar discipline -----------------
+        ("n_ctx_in_loop", "INT NOT NULL DEFAULT 0"),
+        ("n_err_nil_return", "INT NOT NULL DEFAULT 0"),
+        ("n_loopvar_rebind", "INT NOT NULL DEFAULT 0"),
+        ("n_insecure_tls", "INT NOT NULL DEFAULT 0"),
     )
 
     SCHEMA_EXT = r"""
@@ -3622,12 +3638,31 @@ CREATE TABLE implements(
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE build_tags(
-    id INTEGER PRIMARY KEY,
-    file_id INT NOT NULL REFERENCES files(id),
-    expr TEXT NOT NULL,
-    line INT NOT NULL
-) STRICT;
-"""
+     id INTEGER PRIMARY KEY,
+     file_id INT NOT NULL REFERENCES files(id),
+     expr TEXT NOT NULL,
+     line INT NOT NULL
+ ) STRICT;
+ 
+ -- Longest transitive import chain starting at each module, computed in
+ -- Python (the import graph is a DAG; SQL recursion would re-expand paths).
+ CREATE TABLE module_depth(
+     module_id INT NOT NULL PRIMARY KEY REFERENCES modules(id),
+     max_depth INT NOT NULL DEFAULT 0,
+     n_direct_imports INT NOT NULL DEFAULT 0,
+     n_transitive INT NOT NULL DEFAULT 0
+ ) WITHOUT ROWID, STRICT;
+ 
+ -- Longest error-propagation chain starting at each error-returning
+ -- function, computed in Python: max_depth is the length of the longest
+ -- path f -> g -> h where every hop's callee RETURNS error. A function
+ -- whose callees absorb errors terminates a chain at depth 1. Only
+ -- symbols with n_err_returns > 0 appear.
+ CREATE TABLE error_chain_depth(
+     symbol_id INT NOT NULL PRIMARY KEY REFERENCES symbols(id),
+     max_depth INT NOT NULL DEFAULT 0
+ ) WITHOUT ROWID, STRICT;
+ """
 
     INDEX_EXT = r"""
 -- parse-coverage joins build_tags by file; the planner was building this.
@@ -3645,6 +3680,8 @@ CREATE INDEX idx_fn_ctxbg ON symbols(n_ctx_background DESC, name)
     WHERE n_ctx_background>0;
 CREATE INDEX idx_fn_errign ON symbols(n_err_ignored DESC, name)
     WHERE n_err_ignored>0;
+CREATE INDEX idx_errchain ON error_chain_depth(max_depth DESC)
+    WHERE max_depth > 1;
 """
 
     VIEW_EXT = r"""
@@ -3782,6 +3819,16 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
             txt = _txt(node, src)[:160]
             if re.search(r'\berr\s*!=\s*nil', txt):
                 st.bump("n_err_checks")
+                # nil-error-after-check: the error check leads to a nil
+                # return -- the error is dropped at the moment it was
+                # detected (nilerr). `return nil, err` is the honest shape.
+                cons = node.child_by_field_name("consequence")
+                if cons is not None:
+                    ctxt = _txt(cons, src)[:200]
+                    if re.search(r'\breturn\s+nil\b', ctxt) \
+                            and not re.search(r'\breturn\s+nil,\s*err\b',
+                                              ctxt):
+                        st.bump("n_err_nil_return")
             if re.search(r'\b\w+\s*,\s*err\s*:=', txt):
                 st.bump("n_err_shadowed")
         elif t == "assignment_statement" or t == "short_var_declaration":
@@ -3790,13 +3837,28 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
                 st.bump("n_err_ignored")
             elif re.search(r'\b_\s*,?\s*(?:err)?\s*=\s*\w', txt) and "_" in txt:
                 pass
+            if t == "short_var_declaration":
+                # `v := v` -- the dead rebind loopvar pattern (go >= 1.22
+                # no longer copies per iteration, so the rebind is a lie).
+                m = re.match(r'^\s*(\w+)\s*:=\s*\1\b', txt)
+                if m:
+                    st.bump("n_loopvar_rebind")
         elif t == "return_statement":
             if not node.named_children:
                 st.bump("n_naked_returns")
             else:
                 rt = _txt(node, src)
-                if "err" in rt:
+                # Case-insensitive: `return fmt.Errorf(...)` is the dominant
+                # error return and was invisible to a lowercase-only match.
+                if "err" in rt.lower():
                     st.bump("n_err_returns")
+        elif t == "composite_literal":
+            # tls.Config{InsecureSkipVerify: true} -- the accepted-insecure
+            # shape gosec G402 hunts by AST; the text scan sees it too.
+            ty = node.child_by_field_name("type")
+            if ty is not None and "tls.Config" in _txt(ty, src) \
+                    and "InsecureSkipVerify" in _txt(node, src)[:400]:
+                st.bump("n_insecure_tls")
         elif t == "call_expression":
             txt = _txt(node.child_by_field_name("function") or node, src)
             if txt == "recover":
@@ -4095,6 +4157,112 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
                 "interface_name,n_methods,in_test) VALUES(?,?,?,?,?)", rows)
         db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                    ("implements_pairs", str(len(rows))))
+        self._module_depth(db)
+        self._error_chain_depth(db)
+
+    def _module_depth(self, db: sqlite3.Connection) -> None:
+        """Longest transitive import chain and transitive package count per
+        module, computed on resolved (in-tree) import edges.
+
+        The import graph is a DAG, so each module is visited once with a
+        memoised DFS; SQL recursion over imports would re-expand every path.
+        External (stdlib/module) imports terminate a chain at depth 1.
+        """
+        deps: dict[int, set[int]] = {}
+        in_degree: dict[int, int] = {}
+        for fmod, tmod in db.execute(
+                "SELECT f.module_id, tf.module_id FROM imports i "
+                "JOIN files f ON f.id=i.file_id "
+                "JOIN files tf ON tf.id=i.target_id "
+                "WHERE f.module_id IS NOT NULL AND tf.module_id IS NOT NULL "
+                "AND f.module_id <> tf.module_id"):
+            if fmod not in deps:
+                deps[fmod] = set()
+                in_degree.setdefault(fmod, 0)
+            if tmod not in deps:
+                deps[tmod] = set()
+                in_degree.setdefault(tmod, 0)
+            if tmod not in deps[fmod]:
+                deps[fmod].add(tmod)
+                in_degree[tmod] = in_degree.get(tmod, 0) + 1
+        if not deps:
+            return
+        # Kahn topological order: chain length = longest path through DAG.
+        depth: dict[int, int] = {m: 0 for m in deps}
+        from collections import deque
+        q = deque([m for m, d in in_degree.items() if d == 0])
+        order: list[int] = []
+        while q:
+            m = q.popleft()
+            order.append(m)
+            for t in deps[m]:
+                in_degree[t] -= 1
+                if in_degree[t] == 0:
+                    q.append(t)
+        for m in order:
+            for t in deps[m]:
+                depth[t] = max(depth[t], depth[m] + 1)
+        # Count distinct transitive deps per module via set union along the
+        # reverse graph (dense-set fold: E unions, each O(nodes) worst case --
+        # fine for a module graph, which is small even on huge repos).
+        reach: dict[int, set[int]] = {m: set() for m in deps}
+        for m in reversed(order):
+            for t in deps[m]:
+                reach[t].add(m)
+                reach[t].update(reach[m])
+        rows = [(m, depth[m], len(deps[m]), len(reach[m])) for m in deps]
+        db.executemany(
+            "INSERT OR REPLACE INTO module_depth(module_id,max_depth,"
+            "n_direct_imports,n_transitive) VALUES(?,?,?,?)", rows)
+
+    def _error_chain_depth(self, db: sqlite3.Connection) -> None:
+        """Longest error-propagation chain per error-returning function.
+
+        max_depth(f) = 1 + max over error-returning callees g of
+        max_depth(g): the length of the longest call chain f -> g -> h
+        where every hop returns error, so an error raised at the deepest
+        leaf surfaces max_depth frames above it. A callee that absorbs
+        errors (logs, returns nil) terminates the chain -- that
+        containment is exactly what the query is asking about.
+
+        Only edges BETWEEN error-returning functions are traversed, which
+        keeps the walk small even on large repos. Recursion cycles are
+        capped at ERROR_CHAIN_CAP (a chain through a cycle is unbounded;
+        the cap is the honest answer). Memoised, so each node is expanded
+        once per reachable-again path; the call graph is small enough that
+        this is a fraction of a second on a 20k-symbol repo.
+        """
+        err_syms = {r[0] for r in db.execute(
+            "SELECT id FROM symbols WHERE n_err_returns > 0")}
+        if not err_syms:
+            return
+        fwd: dict[int, list[int]] = {}
+        for cid, lid in db.execute(
+                "SELECT caller_id, callee_id FROM edges"):
+            if cid in err_syms and lid in err_syms:
+                fwd.setdefault(cid, []).append(lid)
+        memo: dict[int, int] = {}
+
+        def depth(node: int, on_path: set) -> int:
+            got = memo.get(node)
+            if got is not None:
+                return got
+            if node in on_path:
+                return ERROR_CHAIN_CAP
+            on_path.add(node)
+            best = 0
+            for nxt in fwd.get(node, ()):
+                d = depth(nxt, on_path)
+                if d > best:
+                    best = d
+            on_path.discard(node)
+            memo[node] = best + 1
+            return best + 1
+
+        rows = [(root, depth(root, set())) for root in err_syms]
+        db.executemany(
+            "INSERT OR REPLACE INTO error_chain_depth(symbol_id,max_depth)"
+            " VALUES(?,?)", rows)
 
     def flush_extra(self, db: sqlite3.Connection, bufs: Buffers) -> None:
         for tbl, sql in (
@@ -4986,7 +5154,431 @@ WITH RECURSIVE down(root, sym, depth) AS (
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.n_readall_in_loop > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.n_readall_in_loop DESC, s.io_in_loop DESC LIMIT :lim""")
+    ORDER BY s.n_readall_in_loop DESC, s.io_in_loop DESC LIMIT :lim"""),
+(
+    "iface-satisfaction-breadth",
+    "Structs that implicitly satisfy the most interfaces",
+    "ANSWERS which concrete types are the load-bearing implementations: a type\n"
+    "     satisfying many interfaces is the one every swap-in replacement must\n"
+    "     match, and the one whose method name changes break the most contracts.\n"
+    "ACT test the top rows against the interface list before renaming any\n"
+    "     method; these are the types where a signature change is a broad API\n"
+    "     break.\n"
+    "MISLEADS satisfaction is method-NAME containment only (see the implements\n"
+    "     post_build contract): a type is counted as satisfying an interface\n"
+    "     even where signatures disagree, and only in-tree implementors exist.",
+    """SELECT im.type_name, COUNT(DISTINCT im.interface_id) AS contracts,
+        COUNT(DISTINCT CASE WHEN im.in_test=1 THEN im.interface_id END)
+            AS test_contracts,
+        SUM(im.n_methods) AS methods_matched,
+        COUNT(DISTINCT im.interface_name) AS iface_names
+    FROM implements im
+    WHERE im.in_test=0
+      AND EXISTS (SELECT 1 FROM symbols s
+                  JOIN modules m ON m.id=s.module_id
+                  WHERE s.name=im.type_name
+                    AND COALESCE(m.name,'') LIKE :mod)
+    GROUP BY im.type_name
+    ORDER BY contracts DESC, methods_matched DESC LIMIT :lim"""),
+(
+    "concurrency-hotspots",
+    "Functions that spawn goroutines AND touch channels: contention hubs",
+    "ANSWERS the functions where concurrency is personally invented rather\n"
+    "     than inherited: goroutine spawns plus channel sends/recvs in one body\n"
+    "     are the primitive shapes the sync package exists to replace.\n"
+    "ACT check whether each channel has ONE sender and ONE receiver per\n"
+    "     message (the safe shape); multiple senders need locks or per-channel\n"
+    "     mutexes.\n"
+    "MISLEADS a function that spawns goroutines that later touch channels is\n"
+    "     invisible here (the edge points at the goroutine's closure, whose\n"
+    "     symbol is separate). Counts are per-symbol, and spawns in a loop are\n"
+    "     one spawn call regardless of trip count.",
+    """SELECT s.name, s.receiver_type AS receiver,
+        s.n_goroutines AS spawns, s.n_chan_send AS sends,
+        s.n_chan_recv AS recvs, s.n_chan_close AS closes,
+        s.n_go_in_loop AS spawns_in_loop,
+        s.n_waitgroup_add AS wg_adds, s.n_lock AS mutexes, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_goroutines + s.n_chan_send + s.n_chan_recv > 0
+      AND s.kind IN ('function','method') AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY (s.n_goroutines*4 + s.n_chan_send + s.n_chan_recv) DESC,
+        s.sloc DESC LIMIT :lim"""),
+(
+    "unused-exported",
+    "Exported symbols nothing in this tree references",
+    "ANSWERS the public API surface the repository itself never calls -- the\n"
+    "     symbols released to the world but exercised only by external\n"
+    "     consumers, if any.\n"
+    "ACT for a library, an exported-and-unused symbol is a candidate for a\n"
+    "     deprecation note: the tree does not exercise it, so it is the most\n"
+    "     likely to rot. For an application, it is a dead export.\n"
+    "MISLEADS external consumers are not in this tree, so a genuinely public\n"
+    "     API looks identical to a dead one; `dead-code` is the unexported\n"
+    "     counterpart. Interface-implementing methods are excluded because\n"
+    "     they are reached through the interface, not by name.",
+    """SELECT s.name, s.receiver_type AS receiver, s.sloc,
+        s.cyclomatic AS cyclo, s.n_external_calls AS ext_calls,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.fan_in=0 AND s.is_public=1 AND s.is_test=0
+      AND s.is_entrypoint=0 AND s.is_handler=0 AND f.is_test=0
+      AND f.is_generated=0 AND s.name <> '(anonymous)'
+      AND s.kind IN ('function','method')
+      AND NOT EXISTS (SELECT 1 FROM implements im
+                      WHERE im.type_name = COALESCE(s.receiver_type, ''))
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.sloc DESC LIMIT :lim"""),
+(
+    "receiver-pointer-mix",
+    "Value vs pointer receivers per type: the allocation-copy axis",
+    "ANSWERS which types mix receiver styles, which is the complaint that\n"
+    "     blows up when the struct grows: a value receiver copies the whole\n"
+    "     struct on every call, and a type that mixes the two will not get a\n"
+    "     consistent compiler error about it.\n"
+    "ACT pick ONE style per type -- pointer receivers for anything with a\n"
+    "     slice/header inside, value receivers only for tiny immutable types.\n"
+    "MISLEADS methods taking a POINTER-typed receiver alias could be misread;\n"
+    "     the count is per declared receiver, not per call, so a hot value\n"
+    "     receiver is not weightened by its call frequency here.",
+    """SELECT s.receiver_type AS receiver,
+        COUNT(CASE WHEN s.receiver_is_pointer=1 THEN 1 END) AS ptr_methods,
+        COUNT(CASE WHEN s.receiver_is_pointer=0 THEN 1 END) AS value_methods,
+        COUNT(*) AS total_methods,
+        CAST(100.0 * COUNT(CASE WHEN s.receiver_is_pointer=1 THEN 1 END)
+             / NULLIF(COUNT(*), 0) AS INT) AS pct_ptr,
+        MAX(f.path) AS sample_path
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='method' AND s.receiver_type <> '' AND f.is_test=0
+      AND s.receiver_is_pointer IN (0,1)
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.receiver_type
+    HAVING ptr_methods > 0 AND value_methods > 0
+    ORDER BY total_methods DESC, pct_ptr DESC LIMIT :lim"""),
+(
+    "abstraction-reach",
+    "Interfaces satisfied by the most distinct types",
+    "ANSWERS the interface contracts with the widest implementation base --\n"
+    "     the seams that, if they change, every implementor (and every caller\n"
+    "     through the interface) must change with them.\n"
+    "ACT these are the interfaces worth keeping stable and worth writing\n"
+    "     conformance tests for: a change here is a change across the tree.\n"
+    "MISLEADS counts in-tree implementors by method-name containment only; an\n"
+    "     interface that stdlib or an external module satisfies is invisible.\n"
+    "     `single-impl-interface` is the zero-end of this same ranking.",
+    """SELECT i.symbol_id AS iface_id, s.name AS iface, i.n_methods AS methods,
+        i.is_exported AS exported,
+        COUNT(DISTINCT im.type_name) AS implementors,
+        COUNT(DISTINCT CASE WHEN im.in_test=1 THEN im.type_name END)
+            AS test_implementors,
+        GROUP_CONCAT(DISTINCT im.type_name) AS implemented_by,
+        f.path || ':' || s.line_start AS at
+    FROM interfaces i
+    JOIN symbols s ON s.id=i.symbol_id
+    JOIN implements im ON im.interface_id=i.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE i.is_constraint=0 AND i.n_methods > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY i.symbol_id
+    ORDER BY implementors DESC, i.n_methods DESC LIMIT :lim"""),
+(
+    "internal-package-leak",
+    "Imports reaching into /internal/ from outside its root",
+    "ANSWERS import statements whose target contains an internal/ segment,\n"
+    "     joined with the importer's own path, so the Go-rule check (only\n"
+    "     code under the internal root may import it) is visible per row.\n"
+    "ACT for each row, decide whether the importer sits under the internal\n"
+    "     root: if not, the import is a layering leak that a module boundary\n"
+    "     will break later.\n"
+    "MISLEADS the tree does not know the module root, so the query cannot\n"
+    "     CONFIRM the leak -- it lists candidate rows and lets the path\n"
+    "     comparison be done by eye. Stdlib internal/ packages are excluded\n"
+    "     by is_external.",
+    """SELECT i.target AS imported, i.alias,
+        imp.path AS importer_path, fimp.path AS import_file,
+        i.line, i.is_external AS external
+    FROM imports i
+    JOIN files imp ON imp.id=i.file_id
+    JOIN files fimp ON fimp.id=i.target_id
+    LEFT JOIN modules m ON m.id=imp.module_id
+    WHERE instr(i.target, '/internal/') > 0
+      AND i.target_id IS NOT NULL AND i.is_external=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY imp.path, i.line LIMIT :lim"""),
+(
+    "module-dependency-depth",
+    "Longest import chain through each package",
+    "ANSWERS how deeply each package sits in the import DAG, and how many\n"
+    "     distinct packages it transitively depends on -- the numbers that\n"
+    "     describe whether a change here drags a long chain along.\n"
+    "ACT a package with max_depth>=5 or many transitive deps is a candidate\n"
+    "     for dependency trimming; a leaf package (depth 0, few transitives)\n"
+    "     is the safe place to put shared code.\n"
+    "MISLEADS computed on RESOLVED in-tree imports only, so stdlib and\n"
+    "     external modules terminate a chain rather than extending it; depth\n"
+    "     is the longest single chain, not an average, and modules that share\n"
+    "     no resolved edge with the tree are absent entirely.",
+    """SELECT m.name AS package_, md.max_depth AS chain_depth,
+        md.n_direct_imports AS direct_imports,
+        md.n_transitive AS transitive_deps,
+        (SELECT COUNT(*) FROM symbols s WHERE s.module_id=m.id
+          AND s.kind IN ('function','method')) AS n_fns
+    FROM module_depth md JOIN modules m ON m.id=md.module_id
+    WHERE md.max_depth > 0 AND m.name LIKE :mod
+    ORDER BY md.n_transitive DESC, md.max_depth DESC LIMIT :lim"""),
+(
+    "error-fan-out",
+    "Error-returning functions ranked by how far a failure propagates",
+    "ANSWERS where an error raised deep down surfaces many frames above:\n"
+    "     max_depth is the longest chain of error-returning callees reachable\n"
+    "     (f -> g -> h where every hop returns error), so a row with depth 4\n"
+    "     means the deepest leaf's failure is carried, unwrapped or not,\n"
+    "     through four frames. These are the chains where %w discipline and\n"
+    "     context (file, line, operation) are cheapest to add and most often\n"
+    "     missing.\n"
+    "ACT audit the deepest chains first: each hop is a place an error either\n"
+    "     gains context (%w), stays bare (fmt.Errorf without %w), or gets\n"
+    "     dropped. `error-not-wrapped` and `error-handling-drift` rank the\n"
+    "     same functions on the text signals; this ranks the chain itself.\n"
+    "MISLEADS depth counts error-RETURNING hops only -- a callee that absorbs\n"
+    "     the error (logs and returns nil) terminates the chain, which is the\n"
+    "     containment this query is asking about, not a miss. Edges are\n"
+    "     name-resolved, so an error passed through an interface or returned\n"
+    "     by a closure is invisible and chains undercount. A chain through a\n"
+    "     recursive cycle is reported at the cap of 32; the call graph is\n"
+    "     walked in Python per root, O(V*(V+E)) on error-returning symbols\n"
+    "     only.",
+    """SELECT s.name, s.receiver_type AS receiver, e.max_depth,
+        s.n_err_returns AS err_returns, s.n_err_checks AS checks,
+        s.n_err_ignored AS ignored, s.fan_in, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM error_chain_depth e JOIN symbols s ON s.id=e.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_err_returns > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY e.max_depth DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "command-exec-surface",
+    "Where the process boundary is crossed (gosec G204)",
+    "ANSWERS the functions that reach exec.Command / exec.CommandContext /\n"
+    "     syscall.Exec -- every place a string becomes a process.\n"
+    "ACT each row needs an allowlisted or constant command; a command built\n"
+    "     from variables or input is a command-injection review item.\n"
+    "MISLEADS arg literalness is NOT captured -- constant commands rank the\n"
+    "     same as tainted ones; a wrapper around exec.Command is invisible\n"
+    "     to name matching; the capture is the hazard map, so os.Exit and\n"
+    "     syscall.Syscall (same category, different risk) are excluded by\n"
+    "     the exact-name denylist on purpose.",
+    """SELECT f.path, s.name AS caller, h.pattern AS sink, h.n AS sites,
+        h.first_line, s.fan_in
+    FROM hazards h
+    JOIN symbols s ON s.id = h.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE h.pattern IN ('exec.Command','exec.CommandContext','syscall.Exec')
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, h.n DESC
+    LIMIT :lim"""),
+(
+    "deprecated-stdlib-calls",
+    "Call sites of deprecated stdlib entry points (staticcheck SA1019)",
+    "ANSWERS where deprecated stdlib functions are still called, with the\n"
+    "     replacement inline. The ioutil.* family moved to io/os in Go 1.16.\n"
+    "ACT swap to the replacement; each row is mechanical.\n"
+    "MISLEADS the denylist ships inline and goes stale with each Go release;\n"
+    "     ioutil.WriteFile/Discard/NopCloser and rand.Seed/rand.Read are NOT\n"
+    "     hazard-captured and are absent here (rand.Read is contextual\n"
+    "     anyway -- crypto/rand where security-relevant, math/rand/v2\n"
+    "     elsewhere); a dotted alias (io.ReadAll) is unaffected.",
+    """WITH dep(name, replacement) AS (VALUES
+        ('ioutil.ReadAll','io.ReadAll'), ('ioutil.ReadFile','os.ReadFile'))
+    SELECT f.path, s.name AS caller, h.pattern, dep.replacement, h.n
+    FROM hazards h
+    JOIN dep ON dep.name = h.pattern
+    JOIN symbols s ON s.id = h.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY h.n DESC
+    LIMIT :lim"""),
+(
+    "deferred-close-unchecked",
+    "defer x.Close() whose error return vanishes (staticcheck SA5001)",
+    "ANSWERS defer sites where a Close()/Flush() error is silently dropped,\n"
+    "     ranked by how much of the tree calls the deferrer: a write error\n"
+    "     that surfaces at defer time is exactly the one nobody checks.\n"
+    "ACT join the close error into the named return, or accept the loss\n"
+    "     deliberately (a comment is cheaper than a bug report).\n"
+    "MISLEADS Close errors on read handles are benign; whether THIS Close\n"
+    "     returns error is name-inferred, not type-checked; in-loop defers\n"
+    "     belong to defer-lifetime and are excluded here.",
+    """SELECT f.path, s.name, d.target, d.line, s.fan_in
+    FROM defers d
+    JOIN symbols s ON s.id = d.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE d.is_close = 1 AND d.in_loop = 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC
+    LIMIT :lim"""),
+(
+    "http-request-no-context",
+    "http.NewRequest without a context (noctx territory)",
+    "ANSWERS functions that build requests with the context-less\n"
+    "     http.NewRequest instead of http.NewRequestWithContext: the request\n"
+    "     cannot be cancelled, and a slow peer hangs the caller forever.\n"
+    "ACT pass the caller's context (or context.Background() where none\n"
+    "     exists) via NewRequestWithContext.\n"
+    "MISLEADS a wrapper around NewRequest that threads ctx internally is\n"
+    "     invisible to name matching; the plain form in a CLI one-shot is\n"
+    "     the legitimate row; the http.Client without a Timeout is a\n"
+    "     different (pre-existing) family and does not appear here.",
+    """SELECT f.path, s.name AS caller, h.n AS sites, h.first_line, s.fan_in
+    FROM hazards h
+    JOIN symbols s ON s.id = h.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE h.pattern = 'http.NewRequest'
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, h.n DESC
+    LIMIT :lim"""),
+(
+    "file-read-surface",
+    "os.ReadFile / os.Open call sites by fan-in",
+    "ANSWERS where whole-file reads and opens happen -- the functions most\n"
+    "     likely to hit path-traversal (G304) or unbounded reads, ranked by\n"
+    "     how much of the tree trusts them.\n"
+    "ACT for a read whose path is derived from input, validate the path;\n"
+    "     for os.ReadFile of a remote/untrusted file, prefer a reader with\n"
+    "     a size limit.\n"
+    "MISLEADS path origin is NOT captured -- a constant path ranks the same\n"
+    "     as one built from user input; os.Open without a follow-on read\n"
+    "     still appears (it IS the open surface); handler-adjacency is\n"
+    "     approximated by fan_in.",
+    """SELECT f.path, s.name AS caller, h.pattern AS api, h.n AS sites,
+        h.first_line, s.fan_in
+    FROM hazards h
+    JOIN symbols s ON s.id = h.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE h.pattern IN ('os.ReadFile','os.Open','ioutil.ReadFile')
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, h.n DESC
+    LIMIT :lim"""),
+(
+    "sql-injection-build",
+    "SQL assembled by string concatenation (gosec G201/G202 territory)",
+    "ANSWERS functions that build SQL by concatenating string literals: the\n"
+    "     value can only be injected if a variable reaches the concat, and\n"
+    "     this is the review list for exactly that question, ranked by how\n"
+    "     much of the tree trusts the builder.\n"
+    "ACT use placeholders (QueryContext with args), or parameterise the\n"
+    "     identifier with a whitelist -- concatenation is never the fix.\n"
+    "MISLEADS n_sql_concat counts SQL literal sites whose parent is a `+`\n"
+    "     expression: a query assembled by Sprintf or passed in whole as a\n"
+    "     variable is invisible here, and a concat of two constants (no\n"
+    "     injection possible) reads the same as one mixing a variable.\n"
+    "     `string-concat-in-loop` owns the generic allocation shape.",
+    """SELECT s.name, s.receiver_type AS receiver, s.n_sql_concat AS concat_sql,
+        s.query_in_loop, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_sql_concat > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_sql_concat DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "context-built-in-loop",
+    "context.WithTimeout / WithDeadline / WithCancel inside a loop",
+    "ANSWERS deadline/cancel contexts created per iteration: WithTimeout in\n"
+    "     a loop leaks one timer per pass until the iteration ends, and\n"
+    "     WithCancel recreated every iteration can never be the thing the\n"
+    "     body waits on -- the loop restarts it.\n"
+    "ACT create the context once before the loop; per-iteration deadlines\n"
+    "     belong to the work function, not the loop.\n"
+    "MISLEADS the counter is base-name based: a method literally named\n"
+    "     WithTimeout on a non-context type also matches; a context created\n"
+    "     in a helper called from the loop is invisible; a short loop over\n"
+    "     a fixed slice pays little -- this ranks review order.",
+    """SELECT s.name, s.n_ctx_in_loop AS in_loop, s.max_loop_depth AS depth,
+        s.n_ctx_withcancel AS ctx_creations, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_ctx_in_loop > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_ctx_in_loop DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "nil-error-after-check",
+    "if err != nil { return nil }: the error is dropped at the check (nilerr)",
+    "ANSWERS functions whose error check leads straight to a nil return:\n"
+    "     the error is detected and then discarded. Callers cannot tell\n"
+    "     success from swallowed failure, and a nil error from a function\n"
+    "     that just failed is the hardest-to-reproduce bug class in Go.\n"
+    "ACT return the error (`return nil, err` in the multi-value shape); a\n"
+    "     deliberately ignored failure needs a comment saying why.\n"
+    "MISLEADS the shape is text-matched on the if-consequence: `return 0, nil`\n"
+    "     (a zero value plus nil error) is missed, and an if-block that\n"
+    "     returns nil BEFORE checking a second condition is caught even when\n"
+    "     the later return is honest -- read the row, do not trust it.",
+    """SELECT s.name, s.receiver_type AS receiver, s.n_err_nil_return AS dropped,
+        s.n_err_checks AS checks, s.n_err_returns AS err_returns,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_err_nil_return > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_err_nil_return DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "loopvar-rebind-dead",
+    "`v := v` rebinds under go >= 1.22 (copyloopvar territory)",
+    "ANSWERS the dead rebind: `for _, v := range xs { v := v ... }`. Before\n"
+    "     Go 1.22 the rebind captured a per-iteration copy; from 1.22 the\n"
+    "     loop variable already is per-iteration, so the rebind is a no-op\n"
+    "     that reads as if it does something.\n"
+    "ACT delete the rebind; the semantics are already what the rebind\n"
+    "     pretended to provide.\n"
+    "MISLEADS gated on the go directive from go.mod: below 1.22 the rebind\n"
+    "     is REAL and the row would be a false positive, so nothing fires;\n"
+    "     the go directive can be lower than the toolchain actually used;\n"
+    "     the text shape is `name := name`, so an unrelated same-name\n"
+    "     shadow in a loop body also matches.",
+    """SELECT s.name, s.n_loopvar_rebind AS rebinds, s.max_loop_depth AS depth,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_loopvar_rebind > 0 AND f.is_test=0
+      AND (SELECT CAST(substr(value,1,instr(value,'.')-1) AS INT)*100
+                + CAST(substr(value,instr(value,'.')+1) AS INT)
+           FROM meta WHERE key='go_version') >= 122
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_loopvar_rebind DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "insecure-tls-config",
+    "tls.Config with InsecureSkipVerify: true (gosec G402)",
+    "ANSWERS every tls.Config that disables certificate verification: the\n"
+    "     connection accepts ANY certificate, which turns TLS into\n"
+    "     obfuscated plaintext. One wrong flag in a config struct is the\n"
+    "     whole class.\n"
+    "ACT use the default verification; if a test or internal service needs\n"
+    "     a skip, pin the expected cert instead of disabling the check.\n"
+    "MISLEADS text-matched on the composite literal: a config built\n"
+    "     field-by-field (`c := tls.Config{}; c.InsecureSkipVerify = true`)\n"
+    "     is missed, and a flag set from a variable (`= allowInsecure`)\n"
+    "     reads as absent here.",
+    """SELECT s.name, s.n_insecure_tls AS insecure_cfgs, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.n_insecure_tls > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_insecure_tls DESC, s.fan_in DESC LIMIT :lim""")
 ]
 
 GoAnalyzer.METRICS = [
