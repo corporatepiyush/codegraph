@@ -2242,6 +2242,10 @@ class BodyStats:
     #: (callee_text, line, is_dynamic, in_loop)
     calls: list[tuple[str, int, bool, bool]] = dc_field(default_factory=list)
     literals: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
+    #: (var_text, kind, line, in_loop) -- Express request-input reads
+    input_sites: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
+    #: (value, line) -- G07 credential-shaped string literals
+    secrets: list[tuple[str, int]] = dc_field(default_factory=list)
 
     def bump(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -2469,6 +2473,7 @@ class TreeSitterAnalyzer(Analyzer):
                 continue
             self.add_pending(sid, rec.fid, rec.mid, text, line, "")
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_input_sites(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -2588,6 +2593,7 @@ class TreeSitterAnalyzer(Analyzer):
             self.add_pending(sid, rec.fid, rec.mid, text, line,
                                  scope.type_name)
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_input_sites(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -3001,6 +3007,15 @@ class TreeSitterAnalyzer(Analyzer):
                 e[1] += 1
         for pattern, (category, n, line) in seen.items():
             bufs.add_hazard(sid, pattern[:120], category, n, line)
+
+    def emit_input_sites(self, stats: BodyStats, sid: int, rec: FileRec,
+                         bufs: Buffers) -> None:
+        for var, kind, line, in_loop in stats.input_sites:
+            bufs.rows("user_input_sites").append(
+                (sid, rec.fid, var, kind, line, int(in_loop)))
+        for sval, sline in stats.secrets:
+            bufs.rows("secret_candidates").append(
+                (sid, rec.fid, sval, sline))
 
     def hazard_of(self, callee: str) -> Optional[tuple[str, str]]:
         """(pattern, category) for a call, or None. Languages override."""
@@ -3497,6 +3512,28 @@ GENERATED_HINT_RE = re.compile(
     r'^(__webpack|__turbopack|__vite|_interopRequire|__esModule|'
     r'__importDefault|__awaiter|__generator|__extends)')
 
+#: Express-style request bases and member->kind map for user_input_sites.
+#: Shape-based (object text): an untyped `req: any` handler fires the same
+#: rows as a typed one; a base/member outside these maps records nothing.
+REQ_BASES = ("req", "request")
+USER_INPUT_MEMBERS = {
+    "query": "query", "body": "body",
+    "headers": "header", "cookies": "cookie",
+    "files": "form", "params": "path",
+}
+
+#: G07: a string literal that names a credential (mirrors the Python pack).
+SECRET_RE = re.compile(
+    r'(api[_-]?key|apikey|secret|password|passwd|pwd|token|bearer|'
+    r'access[_-]?key|private[_-]?key|client[_-]?secret|'
+    r'auth[_-]?token|jwt|credential|smtp[_-]?pass|db[_-]?pass|'
+    r'sk_live|rk_live|pk_live|ghp_|xoxb-|AKIA)', re.I)
+SECRET_MIN_LEN = 12
+
+#: G14/G21: logger level methods (winston/pino `logger.info`; console.*).
+LOG_LEVELS = frozenset(("debug", "info", "warn", "warning", "error",
+                        "fatal", "trace", "log"))
+
 class JavaScriptAnalyzer(TreeSitterAnalyzer):
     LANG = "javascript"
     TARGET = "ES2026 (17th ed.) + using/Temporal (ES2027 candidates)"
@@ -3677,6 +3714,15 @@ class JavaScriptAnalyzer(TreeSitterAnalyzer):
         ("n_yield", "INT NOT NULL DEFAULT 0"),
         ("n_labeled", "INT NOT NULL DEFAULT 0"),
         ("n_child_process", "INT NOT NULL DEFAULT 0"),
+        ("n_redirect", "INT NOT NULL DEFAULT 0"),          # G26 location.href
+        # -- OWASP P2 pack: sinks for the input-surface family ---------------
+        ("n_fetch", "INT NOT NULL DEFAULT 0"),             # G27 SSRF sink
+        ("n_dynamic_open", "INT NOT NULL DEFAULT 0"),      # G12 fs with var
+        ("n_upload_save", "INT NOT NULL DEFAULT 0"),       # G28 req.files write
+        ("n_zip_read", "INT NOT NULL DEFAULT 0"),          # G29 archive open
+        ("n_mass_assign", "INT NOT NULL DEFAULT 0"),       # G30 Object.assign
+        ("n_log_call", "INT NOT NULL DEFAULT 0"),          # G14 logger calls
+        ("n_console_log", "INT NOT NULL DEFAULT 0"),       # G21 console calls
     ("n_fs_sync", "INT NOT NULL DEFAULT 0"),
     ("n_assign_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_dup_cond", "INT NOT NULL DEFAULT 0"),
@@ -3843,10 +3889,31 @@ CREATE TABLE hooks(
     registers_listener INT NOT NULL DEFAULT 0,
     registers_timer INT NOT NULL DEFAULT 0
 ) STRICT;
+
+CREATE TABLE user_input_sites(
+    id INTEGER PRIMARY KEY,
+    symbol_id INT REFERENCES symbols(id),
+    file_id INT NOT NULL REFERENCES files(id),
+    var TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    line INT NOT NULL,
+    in_loop INT NOT NULL DEFAULT 0
+) STRICT;
+
+CREATE TABLE secret_candidates(
+    id INTEGER PRIMARY KEY,
+    symbol_id INT REFERENCES symbols(id),
+    file_id INT NOT NULL REFERENCES files(id),
+    value TEXT NOT NULL,
+    line INT NOT NULL
+) STRICT;
 """
 
     INDEX_EXT = r"""
 CREATE INDEX idx_lis_file ON listeners(file_id, op, event);
+CREATE INDEX idx_uis_kind ON user_input_sites(kind, symbol_id);
+CREATE INDEX idx_uis_sym ON user_input_sites(symbol_id);
+CREATE INDEX idx_secret_sym ON secret_candidates(symbol_id);
 CREATE INDEX idx_lis_add ON listeners(file_id, api) WHERE op='add';
 CREATE INDEX idx_lis_sym ON listeners(symbol_id);
 CREATE INDEX idx_tim_file ON timers(file_id, op, kind);
@@ -4194,6 +4261,47 @@ UPDATE exports AS e SET symbol_id = x.id FROM
         _b = name.rsplit(".", 1)[-1]
         if _b in ("exec", "execSync", "spawnSync") and "child_process" in name:
             st.bump("n_child_process")        # eslint-plugin-security
+        if _b in ("fetch",) or name.startswith(
+                ("axios.", "got.", "superagent.", "node-fetch", "http.request",
+                 "https.request")):
+            # G27: SSRF sink -- fetch a URL that may come from the client
+            st.bump("n_fetch")
+        if _b in ("readFile", "readFileSync", "writeFile", "writeFileSync") \
+                and name.startswith("fs."):
+            args = node.child_by_field_name("arguments")
+            first = args.named_children[0] if args is not None \
+                and args.named_children else None
+            if first is not None and first.type not in ("string",
+                                                        "template_string"):
+                # G12: fs.* with a non-literal path -- the traversal sink
+                st.bump("n_dynamic_open")
+        if _b in ("writeFile", "writeFileSync") and name.startswith("fs."):
+            args = node.child_by_field_name("arguments")
+            if args is not None and any(
+                    a.type in ("member_expression", "identifier")
+                    and text_of(a, src).strip().startswith(
+                        ("req.", "request.", "file"))
+                    for a in args.named_children):
+                # G28: fs.writeFile fed from req.files/req.file -- the upload
+                # sink with no visible size/type check
+                st.bump("n_upload_save")
+        if "unzip" in name.lower() or ("zip" in name.lower() and _b in (
+                "extract", "extractAll", "extractAllTo", "extractFiles")):
+            # G29: archive extraction -- entry containment is a check, not a
+            # name; this ranks where archives are opened.
+            st.bump("n_zip_read")
+        if _b == "assign" and name.startswith("Object."):
+            # G30: mass assignment -- Object.assign(obj, input) merges every
+            # key; the spread {...req.body} shape is invisible here.
+            st.bump("n_mass_assign")
+        if _b in LOG_LEVELS and "logger" in name.lower():
+            # G14: a logging call -- injection into the log line is the risk
+            # when the message contains request input.
+            st.bump("n_log_call")
+        if name.startswith("console.") and _b in LOG_LEVELS:
+            # G21: a console call -- sensitive data in logs is the risk when
+            # the message contains request input.
+            st.bump("n_console_log")
         if _b in ("readFileSync", "writeFileSync", "existsSync", "statSync"):
             st.bump("n_fs_sync")              # detect-non-literal-fs-filename
         if name in ("Object.assign",) and loop_depth:
@@ -4312,6 +4420,32 @@ UPDATE exports AS e SET symbol_id = x.id FROM
                 st.bump("n_arith")
                 if o == "+" and loop_depth and _looks_stringy(node, src):
                     st.bump("concat_in_loop")
+        elif t == "member_expression":
+            obj = node.child_by_field_name("object")
+            prop = node.child_by_field_name("property")
+            if obj is None or prop is None:
+                return
+            base = text_of(obj, src)
+            kind = USER_INPUT_MEMBERS.get(text_of(prop, src))
+            if base not in REQ_BASES or kind is None:
+                return
+            var = text_of(node, src)[:120]
+            par = node.parent
+            if par is not None and par.type == "member_expression":
+                var = text_of(par, src)[:120]
+            st.input_sites.append(
+                (var, kind, node.start_point[0] + 1, bool(loop_depth)))
+        elif t == "assignment_expression":
+            left = node.child_by_field_name("left")
+            if left is not None and left.type == "member_expression":
+                o = left.child_by_field_name("object")
+                p = left.child_by_field_name("property")
+                if o is None or p is None:
+                    return
+                ot, pt = text_of(o, src), text_of(p, src)
+                if (ot == "location" and pt == "href") or \
+                   (ot == "window" and pt == "location"):
+                    st.bump("n_redirect")    # G26 open-redirect sink
         elif t == "unary_expression":
             op = node.child_by_field_name("operator")
             o = text_of(op, src) if op is not None else ""
@@ -4412,6 +4546,11 @@ UPDATE exports AS e SET symbol_id = x.id FROM
                   loop_depth: int) -> None:
         if node.type == "template_string":
             return
+        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+            # G07: credential-shaped literal -- candidate, not verdict.
+            # Template strings return above, so a secret interpolated into
+            # one is invisible here.
+            st.secrets.append((text[:200], node.start_point[0] + 1))
         low = text[:200].lower()
         if "<script" in low or "<div" in low or "<span" in low or "</" in low:
             st.bump("n_innerhtml") if len(text) > 24 else None
@@ -5095,6 +5234,12 @@ UPDATE exports AS e SET symbol_id = x.id FROM
              "has_dep_array,n_deps,has_cleanup,in_loop,in_condition,"
              "registers_listener,registers_timer) "
              "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"),
+            ("user_input_sites",
+             "INSERT INTO user_input_sites(symbol_id,file_id,var,kind,line,"
+             "in_loop) VALUES(?,?,?,?,?,?)"),
+            ("secret_candidates",
+             "INSERT INTO secret_candidates(symbol_id,file_id,value,line) "
+             "VALUES(?,?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
             if rows:
@@ -5709,9 +5854,9 @@ JavaScriptAnalyzer.QUERIES = [
               FROM down GROUP BY root)
     SELECT cle.name AS async_fn, r.async_depth, r.subtree AS reaches_fns,
         COUNT(DISTINCT e.caller_id) AS callers,
-        SUM(CASE WHEN cal.is_async = 0 THEN 1 ELSE 0 END) AS sync_callers,
-        SUM(CASE WHEN cal.is_async = 0 AND cal.n_then = 0
-                 THEN 1 ELSE 0 END) AS sync_and_unchained,
+        COUNT(*) FILTER (WHERE cal.is_async = 0) AS sync_callers,
+        COUNT(*) FILTER (WHERE cal.is_async = 0 AND cal.n_then = 0)
+            AS sync_and_unchained,
         cle.n_await AS own_awaits, cle.await_in_loop AS awaits_in_loop,
         cle.n_promise_all AS batches, cle.fan_in,
         f.path || ':' || cle.line_start AS at
@@ -5880,6 +6025,219 @@ JavaScriptAnalyzer.QUERIES = [
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.fan_in DESC, s.n_child_process DESC LIMIT :lim"""),
 (
+    "open-redirect-surface",
+    "location.href writes in functions that read request input (OWASP G26)",
+    "ANSWERS functions that assign location.href / window.location AND read\n"
+    "     request input (req.query / req.params / req.headers) -- the shape of\n"
+    "     a client-side open redirect: location.href = req.query.next.\n"
+    "ACT validate the target against an allowlist; never forward a\n"
+    "     user-supplied URL.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the assignment, and a constant redirect beside an\n"
+    "     unrelated input read reads as a violation. The assignment target is\n"
+    "     matched textually (location.href / window.location); location.assign\n"
+    "     and location.replace calls are not captured; a wrapper around the\n"
+    "     sink is invisible to it.",
+    """SELECT s.name, s.n_redirect AS redirect_writes,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_redirect > 0 AND u.kind IS NOT NULL
+      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.fan_in DESC, s.n_redirect DESC LIMIT :lim"""),
+(
+    "ssrf-fetch-surface",
+    "fetch/http calls in functions that read request input (OWASP G27)",
+    "ANSWERS functions that fetch a URL (fetch, axios, got, superagent, "
+    "http.request) AND read request input -- the shape of server-side "
+    "request forgery: fetch(req.query.url).\n"
+    "ACT validate the URL scheme and host against an allowlist; never fetch a\n"
+    "     user-supplied URL.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the fetch, and a constant URL beside an unrelated\n"
+    "     input read reads as a violation. The capture is the dotted call\n"
+    "     text: an http client assigned to a variable (const c = axios.create())\n"
+    "     and used via c.get is invisible; a wrapper around fetch is too.",
+    """SELECT s.name, s.n_fetch AS fetch_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_fetch > 0 AND u.kind IS NOT NULL
+      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_fetch DESC, input_sites DESC LIMIT :lim"""),
+(
+    "hardcoded-secret-candidates",
+    "Credential-shaped string literals (OWASP G07)",
+    "ANSWERS string literals at least 12 chars long whose text names a\n"
+    "     credential (password, token, api_key, secret, bearer, jwt, ...) --\n"
+    "     the literal that a committed secret looks like.\n"
+    "ACT rotate and move to a secret manager; never commit the literal.\n"
+    "MISLEADS a format string or test fixture containing the WORD token/pass\n"
+    "     reads as a candidate (the filter is the literal's own text, not its\n"
+    "     use); values over 200 chars are truncated at capture; a secret\n"
+    "     interpolated into a template string is invisible; a secret built\n"
+    "     from parts or read from an env var is invisible here. This is a\n"
+    "     candidate list, not a verdict.",
+    """SELECT s.name, sc.value AS candidate, sc.line,
+        f.path || ':' || sc.line AS at
+    FROM secret_candidates sc
+    JOIN symbols s ON s.id = sc.symbol_id
+    JOIN files f ON f.id = sc.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY length(sc.value) DESC LIMIT :lim"""),
+(
+    "path-traversal-surface",
+    "fs.* with a non-literal path in input-reading functions (OWASP G12)",
+    "ANSWERS functions that call fs.readFile/writeFile with a variable path\n"
+    "     AND read request input -- the shape of path traversal:\n"
+    "     fs.readFile(req.query.f).\n"
+    "ACT validate the resolved path stays under a configured root; use\n"
+    "     path.resolve and a prefix check.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the read, and a constant-read beside an unrelated\n"
+    "     input read reads as a violation. The path is not analyzed: a\n"
+    "     variable path is assumed suspicious, a literal is not; a\n"
+    "     destructured fs import (const {readFile} = require('fs')) is\n"
+    "     invisible to the fs. capture.",
+    """SELECT s.name, s.n_dynamic_open AS open_sites,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_dynamic_open > 0 AND u.kind IS NOT NULL
+      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_dynamic_open DESC, input_sites DESC LIMIT :lim"""),
+(
+    "unchecked-upload-surface",
+    "fs.writeFile fed from req.files with no visible check (OWASP G28)",
+    "ANSWERS functions that write a file whose data argument is req.files /\n"
+    "     req.file -- the shape of an unchecked upload: fs.writeFile(dst,\n"
+    "     req.files.f.data).\n"
+    "ACT check extension, MIME and size against an allowlist before saving;\n"
+    "     store outside the web root.\n"
+    "MISLEADS the writeFile data argument is matched textually -- an upload\n"
+    "     assigned to a local (const d = req.files.f.data) before the write\n"
+    "     is invisible; multer middleware configuration (diskStorage\n"
+    "     destination) is not captured at all; the size/type check is not\n"
+    "     modeled, so a checked write ranks the same as an unchecked one.",
+    """SELECT s.name, s.n_upload_save AS save_calls,
+        COUNT(DISTINCT u.id) AS form_reads,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id AND u.kind = 'form'
+    WHERE s.n_upload_save > 0 AND u.kind IS NOT NULL
+      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_upload_save DESC, form_reads DESC LIMIT :lim"""),
+(
+    "zip-slip-surface",
+    "Archive extraction sites (OWASP G29)",
+    "ANSWERS functions that touch archive libraries (unzipper, adm-zip,\n"
+    "     jszip, yauzl) -- the surface where an entry name becomes a\n"
+    "     filesystem path.\n"
+    "ACT validate every entry name against a containment check before\n"
+    "     extraction; reject ../ and absolute paths.\n"
+    "MISLEADS the containment check is not modeled: a function that checks\n"
+    "     each name before extraction ranks the same as one that does not.\n"
+    "     The capture needs zip/unzip in the call text, so a renamed\n"
+    "     extraction helper is invisible.",
+    """SELECT s.name, s.n_zip_read AS zip_access,
+        s.sloc, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_zip_read > 0 AND f.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_zip_read DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "mass-assignment-surface",
+    "Object.assign in functions that read request input (OWASP G30)",
+    "ANSWERS functions that call Object.assign AND read request input -- the\n"
+    "     shape of mass assignment: Object.assign(user, req.body).\n"
+    "ACT whitelist the fields you accept; never assign a request body whole.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the assigned\n"
+    "     source may not be request input, and a constant object beside an\n"
+    "     unrelated input read reads as a violation. The spread shape\n"
+    "     {...req.body} is invisible to the Object.assign capture; a\n"
+    "     per-field whitelist elsewhere in the function is not modeled.",
+    """SELECT s.name, s.n_mass_assign AS assigns,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_mass_assign > 0 AND u.kind IS NOT NULL
+      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_mass_assign DESC, input_sites DESC LIMIT :lim"""),
+(
+    "log-injection-surface",
+    "Logger calls in functions that read request input (OWASP G14)",
+    "ANSWERS functions that call a logger level method (logger.info,\n"
+    "     winston/pino) AND read request input -- the shape of log forging:\n"
+    "     logger.info(req.headers['user-agent']).\n"
+    "ACT sanitize newlines and control characters in log messages; never log\n"
+    "     raw request input.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the log call, and a constant message beside an\n"
+    "     unrelated input read reads as a violation. The capture needs the\n"
+    "     word logger in the call text, so a differently-named logger is\n"
+    "     invisible.",
+    """SELECT s.name, s.n_log_call AS log_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_log_call > 0 AND u.kind IS NOT NULL
+      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_log_call DESC, input_sites DESC LIMIT :lim"""),
+(
+    "sensitive-log-surface",
+    "console.* calls in functions that read request input (OWASP G21)",
+    "ANSWERS functions that call console.log/info/warn/error AND read request\n"
+    "     input -- the shape of request data (tokens, bodies) ending up in\n"
+    "     stdout logs: console.log(req.headers.authorization).\n"
+    "ACT route through a structured logger with redaction; never console-log\n"
+    "     raw request input.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the console call, and a constant message beside an\n"
+    "     unrelated input read reads as a violation. The capture is the\n"
+    "     dotted console. call; a destructured console alias is invisible.",
+    """SELECT s.name, s.n_console_log AS console_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_console_log > 0 AND u.kind IS NOT NULL
+      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_console_log DESC, input_sites DESC LIMIT :lim"""),
+(
     "proto-mutation",
     "Direct __proto__ or prototype mutation (ESLint security)",
     "ANSWERS where __proto__ is written or Object.prototype is modified, which\n"
@@ -6004,8 +6362,8 @@ JavaScriptAnalyzer.QUERIES = [
     "     const is named and invisible here, so this UNDERcounts closures and\n"
     "     says nothing about nesting depth, which `deep-nesting` measures.",
     """SELECT f.path,
-        COUNT(CASE WHEN s.name='(anonymous)'
-                   AND s.kind IN ('function','closure') THEN 1 END)
+        COUNT(*) FILTER (WHERE s.name='(anonymous)'
+                   AND s.kind IN ('function','closure'))
             AS anon_closures,
         COUNT(DISTINCT s.name) AS distinct_names,
         f.sloc
@@ -6029,12 +6387,11 @@ JavaScriptAnalyzer.QUERIES = [
     "     rows; `import x from` is one. Namespace imports (import_names\n"
     "     is_namespace) are excluded from both buckets.",
     """SELECT f.path,
-        COUNT(CASE WHEN i.is_default=1 THEN 1 END) AS default_imports,
-        COUNT(CASE WHEN i.is_namespace=1 THEN 1 END) AS ns_imports,
-        COUNT(CASE WHEN i.is_default=0 AND i.is_namespace=0 THEN 1 END)
+        COUNT(*) FILTER (WHERE i.is_default=1) AS default_imports,
+        COUNT(*) FILTER (WHERE i.is_namespace=1) AS ns_imports,
+        COUNT(*) FILTER (WHERE i.is_default=0 AND i.is_namespace=0)
             AS named_imports,
-        CAST(100.0 * COUNT(CASE WHEN i.is_default=0 AND i.is_namespace=0
-                                THEN 1 END)
+        CAST(100.0 * COUNT(*) FILTER (WHERE i.is_default=0 AND i.is_namespace=0)
              / NULLIF(COUNT(*), 0) AS INT) AS pct_named
     FROM import_names i JOIN files f ON f.id=i.file_id
     LEFT JOIN modules m ON m.id=f.module_id
@@ -6056,7 +6413,7 @@ JavaScriptAnalyzer.QUERIES = [
     """SELECT f.path,
         MAX((length(i.target) - length(replace(i.target, '../', '')))
             / 3) AS max_up,
-        SUM(CASE WHEN instr(i.target, '../') > 0 THEN 1 ELSE 0 END)
+        COUNT(*) FILTER (WHERE instr(i.target, '../') > 0)
             AS deep_imports
     FROM imports i JOIN files f ON f.id=i.file_id
     LEFT JOIN modules m ON m.id=f.module_id
