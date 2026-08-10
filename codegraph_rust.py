@@ -2233,6 +2233,8 @@ class BodyStats:
     #: (callee_text, line, is_dynamic, in_loop)
     calls: list[tuple[str, int, bool, bool]] = dc_field(default_factory=list)
     literals: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
+    #: (value, line) -- G07 credential-shaped string literals
+    secrets: list[tuple[str, int]] = dc_field(default_factory=list)
 
     def bump(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -2460,6 +2462,7 @@ class TreeSitterAnalyzer(Analyzer):
                 continue
             self.add_pending(sid, rec.fid, rec.mid, text, line, "")
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_secrets(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -2579,6 +2582,7 @@ class TreeSitterAnalyzer(Analyzer):
             self.add_pending(sid, rec.fid, rec.mid, text, line,
                                  scope.type_name)
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_secrets(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -2961,6 +2965,12 @@ class TreeSitterAnalyzer(Analyzer):
     def emit_attributes(self, node: Any, rec: FileRec, sid: int,
                         bufs: Buffers) -> None:
         """Hook: annotations, decorators, derives, struct tags."""
+
+    def emit_secrets(self, stats: BodyStats, sid: int, rec: FileRec,
+                     bufs: Buffers) -> None:
+        for sval, sline in stats.secrets:
+            bufs.rows("secret_candidates").append(
+                (sid, rec.fid, sval, sline))
 
     def emit_hazards(self, stats: BodyStats, sid: int, rec: FileRec,
                      bufs: Buffers) -> None:
@@ -3366,6 +3376,20 @@ LOGIC_OPS = frozenset(("&&", "||"))
 CHECKED_PREFIXES = ("checked_", "wrapping_", "saturating_", "overflowing_",
                     "unchecked_")
 
+#: G07: a string literal that names a credential (mirrors the other packs).
+SECRET_RE = re.compile(
+    r'(api[_-]?key|apikey|secret|password|passwd|pwd|token|bearer|'
+    r'access[_-]?key|private[_-]?key|client[_-]?secret|'
+    r'auth[_-]?token|jwt|credential|smtp[_-]?pass|db[_-]?pass|'
+    r'sk_live|rk_live|pk_live|ghp_|xoxb-|AKIA)', re.I)
+SECRET_MIN_LEN = 12
+
+#: G19: deserialization entry points across serde_json/bincode/ron/toml.
+DESER_BASES = frozenset(("from_str", "from_slice", "from_reader", "from_bytes"))
+
+#: G29: the zip crate's entry points.
+ZIP_PREFIXES = ("ZipArchive::", "zip::")
+
 class RustAnalyzer(TreeSitterAnalyzer):
     LANG = "rust"
     TARGET = "Rust 1.97 (edition 2024)"
@@ -3503,6 +3527,12 @@ class RustAnalyzer(TreeSitterAnalyzer):
         ("n_to_owned", "INT NOT NULL DEFAULT 0"),
         ("n_collect", "INT NOT NULL DEFAULT 0"),
         ("n_format_macro", "INT NOT NULL DEFAULT 0"),
+        #: SQL keywords inside a string literal (on_string); the count was
+        #: collected but never declared, so it silently never reached the graph.
+        ("n_sql_literal", "INT NOT NULL DEFAULT 0"),
+        # -- OWASP P2 pack: sinks for the input-surface family ---------------
+        ("n_deserialize", "INT NOT NULL DEFAULT 0"),         # G19 from_str etc
+        ("n_zip_read", "INT NOT NULL DEFAULT 0"),            # G29 zip crate
         ("n_with_capacity", "INT NOT NULL DEFAULT 0"),
         ("n_iter_adapters", "INT NOT NULL DEFAULT 0"),
         # -- async (clippy::await_holding_lock, await_holding_refcell_ref)
@@ -3664,6 +3694,14 @@ CREATE TABLE macros(
     line INT NOT NULL DEFAULT 0
 ) STRICT;
 
+CREATE TABLE secret_candidates(
+    id INTEGER PRIMARY KEY,
+    symbol_id INT REFERENCES symbols(id),
+    file_id INT NOT NULL REFERENCES files(id),
+    value TEXT NOT NULL,
+    line INT NOT NULL
+) STRICT;
+
 CREATE TABLE cfg_blocks(
     id INTEGER PRIMARY KEY,
     file_id INT NOT NULL REFERENCES files(id),
@@ -3722,6 +3760,7 @@ CREATE INDEX idx_macro_name ON macros(name, kind);
 CREATE INDEX idx_macro_def ON macros(name) WHERE kind='definition';
 CREATE INDEX idx_cfg_feature ON cfg_blocks(feature) WHERE feature<>'';
 CREATE INDEX idx_cfg_file ON cfg_blocks(file_id, line);
+CREATE INDEX idx_secret_sym ON secret_candidates(symbol_id);
 CREATE INDEX idx_async_sym ON async_points(symbol_id, line);
 CREATE INDEX idx_async_guard ON async_points(symbol_id)
     WHERE n_guards_live>0;
@@ -4146,6 +4185,15 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
 
         base = name.rsplit(".", 1)[-1].rsplit("::", 1)[-1]
         tail2 = "::".join(name.replace(".", "::").split("::")[-2:])
+        if base in DESER_BASES:
+            # G19: deserialization entry point (serde_json/bincode/ron/toml
+            # all spell from_str/from_slice/from_reader); whether the input
+            # is untrusted is the query's question, not this counter's.
+            st.bump("n_deserialize")
+        if name.startswith(ZIP_PREFIXES):
+            # G29: the zip crate -- entry containment is a check, not a
+            # name; this ranks where archives are opened.
+            st.bump("n_zip_read")
         if base == "unwrap":
             st.bump("n_unwrap")
         elif base == "expect":
@@ -4278,6 +4326,9 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
 
     def on_string(self, node: Any, text: str, src: bytes, st: BodyStats,
                   loop_depth: int) -> None:
+        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+            # G07: credential-shaped literal -- candidate, not verdict
+            st.secrets.append((text[:200], node.start_point[0] + 1))
         if re.search(r'\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b',
                      text, re.I):
             st.bump("n_sql_literal")
@@ -4884,6 +4935,9 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
              "loop_depth,n_guards_live,guards,guard_dropped,expr,"
              "has_refcell_guard) "
              "VALUES(?,?,?,?,?,?,?,?,?,?)"),
+            ("secret_candidates",
+             "INSERT INTO secret_candidates(symbol_id,file_id,value,line) "
+             "VALUES(?,?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
             if rows:
@@ -5786,9 +5840,9 @@ RustAnalyzer.QUERIES = [
     "     are trivial, while a heavy proc macro in a cold module ranks low.\n"
     "     Expansion output is not modeled anywhere.",
     """SELECT m.name AS module_,
-        COUNT(CASE WHEN mc.kind='invocation' THEN 1 END) AS invocations,
-        COUNT(CASE WHEN mc.kind='definition' THEN 1 END) AS definitions,
-        COUNT(CASE WHEN mc.kind='attribute' THEN 1 END) AS attrs,
+        COUNT(*) FILTER (WHERE mc.kind='invocation') AS invocations,
+        COUNT(*) FILTER (WHERE mc.kind='definition') AS definitions,
+        COUNT(*) FILTER (WHERE mc.kind='attribute') AS attrs,
         COALESCE(SUM(CASE WHEN mc.kind='invocation' THEN mc.body_bytes
                           ELSE 0 END), 0) AS invocation_body_bytes,
         COUNT(DISTINCT mc.file_id) AS in_files
@@ -5814,8 +5868,8 @@ RustAnalyzer.QUERIES = [
     "     modules merge under a bare type_name.",
     """SELECT im.type_name AS type_, COUNT(DISTINCT im.file_id) AS n_files,
         COUNT(*) AS n_impls,
-        SUM(CASE WHEN im.trait_name <> '' THEN 1 ELSE 0 END) AS trait_impls,
-        SUM(CASE WHEN im.trait_name = '' THEN 1 ELSE 0 END) AS inherent_impls,
+        COUNT(*) FILTER (WHERE im.trait_name <> '') AS trait_impls,
+        COUNT(*) FILTER (WHERE im.trait_name = '') AS inherent_impls,
         GROUP_CONCAT(DISTINCT f.basename) AS in_files
     FROM impls im JOIN files f ON f.id=im.file_id
     WHERE im.type_name <> ''
@@ -5935,6 +5989,116 @@ RustAnalyzer.QUERIES = [
       AND s.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.sloc DESC
     LIMIT :lim"""),
+(
+    "sql-string-build",
+    "SQL text assembled by string building (OWASP G09 / A05)",
+    "ANSWERS functions whose string literals contain SQL keywords AND which\n"
+    "     also build strings (format!, or more than one string literal) -- the\n"
+    "     shape that lets a query be glued together instead of parameterized.\n"
+    "ACT use a parameterized statement (rusqlite params!, sea-orm bind); never\n"
+    "     interpolate a variable into a SQL string.\n"
+    "MISLEADS the pairing is same-function co-occurrence, NOT data flow: the\n"
+    "     SQL literal and the format! may be unrelated, and a constant SQL\n"
+    "     string beside unrelated string literals reads as a violation. A\n"
+    "     constant format! with no interpolated variable is safe. The SQL\n"
+    "     test is the literal's own text, so SQL in comments or identifiers\n"
+    "     does not count.",
+    """SELECT s.name, s.n_sql_literal AS sql_literals,
+        s.n_format_macro AS format_calls,
+        s.n_string_lit AS string_literals,
+        s.fan_in, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_sql_literal > 0
+      AND (s.n_format_macro > 0 OR s.n_string_lit > 1)
+      AND f.is_test = 0 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, s.n_sql_literal DESC LIMIT :lim"""),
+(
+    "command-build-surface",
+    "Command::new sites -- the process boundary (OWASP G10 / A05)",
+    "ANSWERS every function that constructs a Command -- the places a string\n"
+    "     becomes a process. The string-building columns are context: a\n"
+    "     Command::new with format! or literal churn in the same function is\n"
+    "     where a built command line is likely.\n"
+    "ACT use std::process::Command's argument array; never pass a shell string.\n"
+    "MISLEADS .arg() chains are NOT counted (no argument capture), so an\n"
+    "     arg-built command and a constant command rank the same. Name-based:\n"
+    "     only the bare `Command::new`/`Command::spawn` call text matches;\n"
+    "     `std::process::Command::new` is invisible. A constant command is\n"
+    "     safe -- the graph sees the construction, not the argument source.",
+    """SELECT s.name, h.pattern AS sink, h.n AS command_sites,
+        s.n_string_lit AS string_literals,
+        s.n_format_macro AS format_calls,
+        s.fan_in, s.sloc,
+        f.path || ':' || s.line_start AS at
+    FROM hazards h
+    JOIN symbols s ON s.id = h.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE h.pattern IN ('Command::new','Command::spawn')
+      AND f.is_test = 0 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, h.n DESC LIMIT :lim"""),
+(
+    "hardcoded-secret-candidates",
+    "Credential-shaped string literals (OWASP G07)",
+    "ANSWERS string literals at least 12 chars long whose text names a\n"
+    "     credential (password, token, api_key, secret, bearer, jwt, ...) --\n"
+    "     the literal that a committed secret looks like.\n"
+    "ACT rotate and move to a secret manager; never commit the literal.\n"
+    "MISLEADS a format string or test fixture containing the WORD token/pass\n"
+    "     reads as a candidate (the filter is the literal's own text, not its\n"
+    "     use); values over 200 chars are truncated at capture; a secret\n"
+    "     built from parts or read from an env var is invisible here.\n"
+    "     This is a candidate list, not a verdict.",
+    """SELECT s.name, sc.value AS candidate, sc.line,
+        f.path || ':' || sc.line AS at
+    FROM secret_candidates sc
+    JOIN symbols s ON s.id = sc.symbol_id
+    JOIN files f ON f.id = sc.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_test = 0 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY length(sc.value) DESC LIMIT :lim"""),
+(
+    "untrusted-deserialization",
+    "from_str / from_slice / from_reader deserialization sites (OWASP G19)",
+    "ANSWERS functions that deserialize (serde_json, bincode, ron, toml all\n"
+    "     spell from_str/from_slice/from_reader/from_bytes) -- the surface\n"
+    "     where an untrusted payload becomes a value.\n"
+    "ACT validate the payload schema and size before deserializing; never\n"
+    "     deserialize into a permissive type from an untrusted source.\n"
+    "MISLEADS WHICH input is untrusted is not modeled: a from_str on a\n"
+    "     constant ranks the same as one on request data. The capture is the\n"
+    "     bare base name, so a serialization helper wrapping the call is\n"
+    "     invisible.",
+    """SELECT s.name, s.n_deserialize AS deserialize_calls,
+        s.sloc, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_deserialize > 0 AND f.is_test = 0 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_deserialize DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "zip-slip-surface",
+    "zip crate access sites (OWASP G29)",
+    "ANSWERS functions that touch the zip crate (ZipArchive) -- the surface\n"
+    "     where an entry name becomes a filesystem path.\n"
+    "ACT validate every entry name against a containment check before\n"
+    "     extraction; reject ../ and absolute paths.\n"
+    "MISLEADS the containment check is not modeled: a function that checks\n"
+    "     each name before extraction ranks the same as one that does not.\n"
+    "     The capture is the dotted ZipArchive:: name; a renamed zip helper\n"
+    "     is invisible.",
+    """SELECT s.name, s.n_zip_read AS zip_access,
+        s.sloc, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_zip_read > 0 AND f.is_test = 0 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_zip_read DESC, s.sloc DESC LIMIT :lim"""),
 (
     "unsafe-in-loop",
     "unsafe blocks inside loop bodies",
