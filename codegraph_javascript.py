@@ -5943,7 +5943,6 @@ JavaScriptAnalyzer.QUERIES = [
     SELECT s.name, s.n_fs_sync AS sync_io,
         s.n_sync_calls AS sync_calls,
         MIN(r.depth) AS hops_from_handler,
-        s.fan_in,
         f.path || ':' || s.line_start AS at
     FROM reach r
     JOIN symbols s ON s.id=r.sym
@@ -5952,7 +5951,7 @@ JavaScriptAnalyzer.QUERIES = [
     WHERE s.n_fs_sync > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
-    ORDER BY hops_from_handler ASC, s.n_fs_sync DESC LIMIT :lim"""),
+    ORDER BY s.n_fs_sync DESC, s.sloc DESC LIMIT :lim"""),
 (
     "import-cycle",
     "Circular import dependencies (madge/circular)",
