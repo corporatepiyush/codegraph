@@ -1066,6 +1066,7 @@ BASE_INDEXES = r"""
 -- package-state-concurrent 2.73s -> 0.037s. `files` is small, so the index
 -- costs almost nothing to carry.
 CREATE INDEX idx_files_test ON files(is_test);
+CREATE INDEX idx_files_gen ON files(is_generated);
 CREATE INDEX idx_sym_name ON symbols(name);
 CREATE INDEX idx_sym_qual ON symbols(qual_name);
 CREATE INDEX idx_sym_file_line ON symbols(file_id, line_start);
