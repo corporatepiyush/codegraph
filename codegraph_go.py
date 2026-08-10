@@ -2218,6 +2218,10 @@ class BodyStats:
     #: (callee_text, line, is_dynamic, in_loop)
     calls: list[tuple[str, int, bool, bool]] = dc_field(default_factory=list)
     literals: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
+    #: (var_text, kind, line, in_loop) -- http.Request input reads
+    input_sites: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
+    #: (value, line) -- G07 credential-shaped string literals
+    secrets: list[tuple[str, int]] = dc_field(default_factory=list)
 
     def bump(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -2445,6 +2449,7 @@ class TreeSitterAnalyzer(Analyzer):
                 continue
             self.add_pending(sid, rec.fid, rec.mid, text, line, "")
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_input_sites(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -2564,6 +2569,7 @@ class TreeSitterAnalyzer(Analyzer):
             self.add_pending(sid, rec.fid, rec.mid, text, line,
                                  scope.type_name)
         self.emit_hazards(stats, sid, rec, bufs)
+        self.emit_input_sites(stats, sid, rec, bufs)
         for kindl, value, line, magic in stats.literals:
             bufs.literals.append((sid, rec.fid, kindl, value[:200], line,
                                   int(magic)))
@@ -2867,6 +2873,35 @@ class TreeSitterAnalyzer(Analyzer):
             return
         name = text_of(fn, src).strip()
         base = name.rsplit(".", 1)[-1]
+        if "." in name and name.split(".", 1)[0] in REQUEST_RECEIVERS:
+            kind = REQUEST_METHOD_KINDS.get(base)
+            if name.endswith(".URL.Query"):       # r.URL.Query() -> query;
+                kind = "query"                    # base "Query" is also db/sql
+            if kind is not None:
+                st.input_sites.append(
+                    (text_of(node, src)[:120], kind,
+                     node.start_point[0] + 1, bool(loop_depth)))
+        if name == "http.Redirect":
+            st.bump("n_redirect")                 # G26 open-redirect sink
+        if (name.startswith("json.") and base in ("Unmarshal", "NewDecoder")) \
+                or base == "Decode":
+            # G19/G30: deserialization -- json.Unmarshal / NewDecoder().Decode
+            # of whatever reaches the call; whether the input is untrusted is
+            # the query's question, not this counter's.
+            st.bump("n_deserialize")
+        if name.startswith(("os.Open", "os.ReadFile", "os.WriteFile",
+                            "os.Create")):
+            args = node.child_by_field_name("arguments")
+            first = args.named_children[0] if args is not None \
+                and args.named_children else None
+            if first is not None and first.type not in (
+                    "interpreted_string_literal", "raw_string_literal"):
+                # G12: os.* with a non-literal path -- the traversal sink
+                st.bump("n_dynamic_open")
+        if name.startswith("zip."):
+            # G29: archive/zip access -- entry containment is a check, not a
+            # name; this ranks where archives are opened.
+            st.bump("n_zip_read")
 
         # -- facts golangci-lint checks, recorded rather than judged ---------
         # Counters, never verdicts. `n_http_no_timeout` says the code built a
@@ -3001,6 +3036,15 @@ class TreeSitterAnalyzer(Analyzer):
     def emit_attributes(self, node: Any, rec: FileRec, sid: int,
                         bufs: Buffers) -> None:
         """Hook: annotations, decorators, derives, struct tags."""
+
+    def emit_input_sites(self, stats: BodyStats, sid: int, rec: FileRec,
+                         bufs: Buffers) -> None:
+        for var, kind, line, in_loop in stats.input_sites:
+            bufs.rows("user_input_sites").append(
+                (sid, rec.fid, var, kind, line, int(in_loop)))
+        for sval, sline in stats.secrets:
+            bufs.rows("secret_candidates").append(
+                (sid, rec.fid, sval, sline))
 
     def emit_hazards(self, stats: BodyStats, sid: int, rec: FileRec,
                      bufs: Buffers) -> None:
@@ -3258,6 +3302,24 @@ HAZARD_CATEGORIES = (
     "goroutine", "channel", "defer", "lock", "atomic", "context", "io", "net",
     "sql", "exec", "unsafe", "reflect", "cgo", "alloc", "panic", "time",
 )
+
+#: Request-object receivers for user_input_sites. `w` is a ResponseWriter --
+#: w.Header() SETS response headers and is not input -- so it is excluded.
+REQUEST_RECEIVERS = frozenset(("r", "req", "request"))
+REQUEST_METHOD_KINDS = {
+    "FormValue": "query", "PostFormValue": "form",
+    "Cookie": "cookie", "MultipartReader": "form",
+}
+REQUEST_FIELD_KINDS = {"Form": "form", "PostForm": "form",
+                       "Header": "header", "Body": "body"}
+
+#: G07: a string literal that names a credential (mirrors the other packs).
+SECRET_RE = re.compile(
+    r'(api[_-]?key|apikey|secret|password|passwd|pwd|token|bearer|'
+    r'access[_-]?key|private[_-]?key|client[_-]?secret|'
+    r'auth[_-]?token|jwt|credential|smtp[_-]?pass|db[_-]?pass|'
+    r'sk_live|rk_live|pk_live|ghp_|xoxb-|AKIA)', re.I)
+SECRET_MIN_LEN = 12
 
 HAZARD_CALLS: dict[str, str] = {
     # goroutine / sync -- staticcheck SA2000, go vet waitgroup
@@ -3545,6 +3607,11 @@ class GoAnalyzer(TreeSitterAnalyzer):
     ("n_weak_crypto", "INT NOT NULL DEFAULT 0"),           # G401/G403/G405
     ("n_readall_in_loop", "INT NOT NULL DEFAULT 0"),
     ("n_env_read", "INT NOT NULL DEFAULT 0"),
+    ("n_redirect", "INT NOT NULL DEFAULT 0"),            # G26 http.Redirect
+    # -- OWASP P2 pack: sinks for the input-surface family ---------------
+    ("n_deserialize", "INT NOT NULL DEFAULT 0"),         # G19/G30 decode
+    ("n_dynamic_open", "INT NOT NULL DEFAULT 0"),        # G12 os.* with var
+    ("n_zip_read", "INT NOT NULL DEFAULT 0"),            # G29 archive/zip
     ("n_decode_call", "INT NOT NULL DEFAULT 0"),
     ("n_waitgroup_add", "INT NOT NULL DEFAULT 0"),
     ("n_lock_call", "INT NOT NULL DEFAULT 0"),
@@ -3663,6 +3730,24 @@ CREATE TABLE build_tags(
      symbol_id INT NOT NULL PRIMARY KEY REFERENCES symbols(id),
      max_depth INT NOT NULL DEFAULT 0
  ) WITHOUT ROWID, STRICT;
+
+ CREATE TABLE user_input_sites(
+     id INTEGER PRIMARY KEY,
+     symbol_id INT REFERENCES symbols(id),
+     file_id INT NOT NULL REFERENCES files(id),
+     var TEXT NOT NULL DEFAULT '',
+     kind TEXT NOT NULL DEFAULT 'query',
+     line INT NOT NULL,
+     in_loop INT NOT NULL DEFAULT 0
+ ) STRICT;
+
+ CREATE TABLE secret_candidates(
+     id INTEGER PRIMARY KEY,
+     symbol_id INT REFERENCES symbols(id),
+     file_id INT NOT NULL REFERENCES files(id),
+     value TEXT NOT NULL,
+     line INT NOT NULL
+ ) STRICT;
  """
 
     INDEX_EXT = r"""
@@ -3683,6 +3768,9 @@ CREATE INDEX idx_fn_errign ON symbols(n_err_ignored DESC, name)
     WHERE n_err_ignored>0;
 CREATE INDEX idx_errchain ON error_chain_depth(max_depth DESC)
     WHERE max_depth > 1;
+CREATE INDEX idx_uinput_sym ON user_input_sites(symbol_id, kind);
+CREATE INDEX idx_uinput_kind ON user_input_sites(kind, line) WHERE in_loop=1;
+CREATE INDEX idx_secret_sym ON secret_candidates(symbol_id);
 """
 
     VIEW_EXT = r"""
@@ -3901,6 +3989,24 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
             if loop_depth and (txt.startswith("string(")
                                or txt.startswith("[]byte")):
                 st.bump("n_conv_in_loop")
+        elif t == "selector_expression":
+            op = node.child_by_field_name("operand")
+            fld = node.child_by_field_name("field")
+            if op is None or fld is None:
+                return
+            o = _txt(op, src).strip()
+            f = _txt(fld, src).strip()
+            if o not in REQUEST_RECEIVERS or f not in REQUEST_FIELD_KINDS:
+                return
+            if f == "URL":
+                par = node.parent
+                if par is not None and par.type == "call_expression":
+                    fn = par.child_by_field_name("function")
+                    if fn is not None and fn.id == node.id:
+                        return        # r.URL.Query() handled as a call
+            st.input_sites.append(
+                (text_of(node, src)[:120], REQUEST_FIELD_KINDS[f],
+                 node.start_point[0] + 1, bool(loop_depth)))
         elif t == "type_assertion_expression":
             parent = node.parent
             if parent is None or parent.type not in (
@@ -3917,6 +4023,9 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
 
     def on_string(self, node: Any, text: str, src: bytes, st: BodyStats,
                   loop_depth: int) -> None:
+        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+            # G07: credential-shaped literal -- candidate, not verdict
+            st.secrets.append((text[:200], node.start_point[0] + 1))
         if SQL_RE.search(text):
             st.bump("n_sql_literal")
             parent = node.parent
@@ -4286,6 +4395,12 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
              "has_ctx_field,n_tagged_fields) VALUES(?,?,?,?,?,?,?,?,?,?)"),
             ("build_tags",
              "INSERT INTO build_tags(file_id,expr,line) VALUES(?,?,?)"),
+            ("user_input_sites",
+             "INSERT INTO user_input_sites(symbol_id,file_id,var,kind,line,"
+             "in_loop) VALUES(?,?,?,?,?,?)"),
+            ("secret_candidates",
+             "INSERT INTO secret_candidates(symbol_id,file_id,value,line) "
+             "VALUES(?,?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
             if rows:
@@ -5246,10 +5361,10 @@ WITH RECURSIVE down(root, sym, depth) AS (
     "     the count is per declared receiver, not per call, so a hot value\n"
     "     receiver is not weightened by its call frequency here.",
     """SELECT s.receiver_type AS receiver,
-        COUNT(CASE WHEN s.receiver_is_pointer=1 THEN 1 END) AS ptr_methods,
-        COUNT(CASE WHEN s.receiver_is_pointer=0 THEN 1 END) AS value_methods,
+        COUNT(*) FILTER (WHERE s.receiver_is_pointer=1) AS ptr_methods,
+        COUNT(*) FILTER (WHERE s.receiver_is_pointer=0) AS value_methods,
         COUNT(*) AS total_methods,
-        CAST(100.0 * COUNT(CASE WHEN s.receiver_is_pointer=1 THEN 1 END)
+        CAST(100.0 * COUNT(*) FILTER (WHERE s.receiver_is_pointer=1)
              / NULLIF(COUNT(*), 0) AS INT) AS pct_ptr,
         MAX(f.path) AS sample_path
     FROM symbols s JOIN files f ON f.id=s.file_id
@@ -5386,6 +5501,170 @@ WITH RECURSIVE down(root, sym, depth) AS (
       AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.fan_in DESC, h.n DESC
     LIMIT :lim"""),
+(
+    "sensitive-log-surface",
+    "Fatal/panic logging in functions that read environment (OWASP G21)",
+    "ANSWERS functions that reach the log.Fatal family AND read environment\n"
+    "     variables -- the shape of a secret or credential finding its way\n"
+    "     into a log line (log.Println(os.Getenv(\"TOKEN\"))).\n"
+    "ACT log the redacted value, or nothing; keep tokens out of every log\n"
+    "     sink, not just the fatal ones.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the env value\n"
+    "     may never reach the log call. os.Getenv is environment, not user\n"
+    "     input. Only the log.Fatal/Print family is hazard-captured;\n"
+    "    logrus/klog/zap and plain log.Print are invisible to name matching,\n"
+    "     and log.Fatal in main() or a startup path is correct.",
+    """SELECT f.path, s.name AS caller, h.pattern AS sink, h.n AS sites,
+        s.n_env_read AS env_reads
+    FROM hazards h
+    JOIN symbols s ON s.id = h.symbol_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE h.pattern IN ('log.Fatal','log.Fatalf','log.Fatalln',
+                        'log.Panic','log.Panicf')
+      AND s.n_env_read > 0
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY h.n DESC, s.n_env_read DESC
+    LIMIT :lim"""),
+(
+    "open-redirect-surface",
+    "http.Redirect calls in handlers that read request input (OWASP G26)",
+    "ANSWERS functions that call http.Redirect AND read request input\n"
+    "     (r.URL.Query / r.FormValue / r.Cookie / r.Form) -- the shape of an\n"
+    "     unvalidated redirect: http.Redirect(w, r, r.URL.Query().Get(\"next\"), 302).\n"
+    "ACT validate the target against an allowlist; never forward a\n"
+    "     user-supplied URL.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the redirect, and a constant redirect beside an\n"
+    "     unrelated input read reads as a violation. The argument text is not\n"
+    "     captured, so a fixed target cannot be told from an open one; a\n"
+    "     wrapper around http.Redirect is invisible to the exact-name capture;"
+    "     a request flow through an alias (rr := r) is invisible to the\n"
+    "     receiver set {r, req, request}.",
+    """SELECT s.name, s.n_redirect AS redirect_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_redirect > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.fan_in DESC, s.n_redirect DESC LIMIT :lim"""),
+(
+    "hardcoded-secret-candidates",
+    "Credential-shaped string literals (OWASP G07)",
+    "ANSWERS string literals at least 12 chars long whose text names a\n"
+    "     credential (password, token, api_key, secret, bearer, jwt, ...) --\n"
+    "     the literal that a committed secret looks like.\n"
+    "ACT rotate and move to a secret manager; never commit the literal.\n"
+    "MISLEADS a format string or test fixture containing the WORD token/pass\n"
+    "     reads as a candidate (the filter is the literal's own text, not its\n"
+    "     use); values over 200 chars are truncated at capture; a secret\n"
+    "     built from parts or read from an env var is invisible here.\n"
+    "     This is a candidate list, not a verdict.",
+    """SELECT s.name, sc.value AS candidate, sc.line,
+        f.path || ':' || sc.line AS at
+    FROM secret_candidates sc
+    JOIN symbols s ON s.id = sc.symbol_id
+    JOIN files f ON f.id = sc.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY length(sc.value) DESC LIMIT :lim"""),
+(
+    "untrusted-deserialization",
+    "json decode sites in functions that read request input (OWASP G19)",
+    "ANSWERS functions that call json.Unmarshal / Decoder.Decode AND read\n"
+    "     request input -- the shape of deserializing an untrusted payload:\n"
+    "     json.NewDecoder(r.Body).Decode(&user).\n"
+    "ACT validate the payload schema and size before decoding; never decode\n"
+    "     into an interface{} from an untrusted source.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the decoded\n"
+    "     value may not come from the request, and a constant decode beside\n"
+    "     an unrelated input read reads as a violation. The Decode capture is\n"
+    "     the bare base name, so encoding/json's Decode and a totally\n"
+    "     different library's Decode are indistinguishable here.",
+    """SELECT s.name, s.n_deserialize AS decode_calls,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_deserialize > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_deserialize DESC, input_sites DESC LIMIT :lim"""),
+(
+    "path-traversal-surface",
+    "os.* with a non-literal path in input-reading functions (OWASP G12)",
+    "ANSWERS functions that call os.Open/ReadFile/WriteFile/Create with a\n"
+    "     variable path AND read request input -- the shape of path\n"
+    "     traversal: os.ReadFile(r.URL.Query().Get(\"f\")).\n"
+    "ACT validate the resolved path stays under a configured root; use\n"
+    "     filepath.Clean and a prefix check.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the input value\n"
+    "     may never reach the open, and a constant-open beside an unrelated\n"
+    "     input read reads as a violation. The path is not analyzed: a\n"
+    "     variable path is assumed suspicious, a literal is not; a\n"
+    "     wrapped-open helper is invisible to the os. capture.",
+    """SELECT s.name, s.n_dynamic_open AS open_sites,
+        COUNT(DISTINCT u.id) AS input_sites,
+        GROUP_CONCAT(DISTINCT u.kind) AS kinds,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+    WHERE s.n_dynamic_open > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_dynamic_open DESC, input_sites DESC LIMIT :lim"""),
+(
+    "zip-slip-surface",
+    "archive/zip access sites (OWASP G29)",
+    "ANSWERS functions that touch archive/zip -- the surface where an entry\n"
+    "     name becomes a filesystem path.\n"
+    "ACT validate every entry name against a containment check before\n"
+    "     extraction; reject ../ and absolute paths.\n"
+    "MISLEADS the containment check is not modeled: a function that checks\n"
+    "     each name before extraction ranks the same as one that does not.\n"
+    "     The capture is the dotted zip. name; a renamed zip helper is\n"
+    "     invisible.",
+    """SELECT s.name, s.n_zip_read AS zip_access,
+        s.sloc, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.n_zip_read > 0 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_zip_read DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "mass-assignment-surface",
+    "Decode into request-body readers (OWASP G30)",
+    "ANSWERS functions that decode JSON in functions that read the request\n"
+    "     BODY -- the shape of mass assignment: json.NewDecoder(r.Body)\n"
+    "     .Decode(&user) maps every request field onto the struct.\n"
+    "ACT bind to a DTO with only the fields you accept; never decode a\n"
+    "     request body into a persistent model.\n"
+    "MISLEADS same-function co-occurrence is NOT data flow -- the decoded\n"
+    "     source may not be the body, and a body read beside an unrelated\n"
+    "     decode reads as a violation. Which struct fields the body can set\n"
+    "     is not modeled; a schema-validated decode ranks the same as an\n"
+    "     unchecked one.",
+    """SELECT s.name, s.n_deserialize AS decode_calls,
+        COUNT(DISTINCT u.id) AS body_reads,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    LEFT JOIN user_input_sites u ON u.symbol_id = s.id AND u.kind = 'body'
+    WHERE s.n_deserialize > 0 AND u.kind IS NOT NULL
+      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_deserialize DESC, body_reads DESC LIMIT :lim"""),
 (
     "deprecated-stdlib-calls",
     "Call sites of deprecated stdlib entry points (staticcheck SA1019)",
