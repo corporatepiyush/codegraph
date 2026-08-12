@@ -3928,6 +3928,7 @@ CREATE INDEX idx_cache_leak ON module_caches(n_writes DESC)
     WHERE n_drops=0 AND is_weak=0;
 CREATE INDEX idx_exp_name ON exports(name, file_id);
 CREATE INDEX idx_exp_file ON exports(file_id, kind);
+CREATE INDEX idx_exp_src ON exports(source_id, is_star);
 CREATE INDEX idx_impn_name ON import_names(name, source);
 CREATE INDEX idx_impn_src ON import_names(source_id, name);
 CREATE INDEX idx_jsx_sym ON jsx_components(symbol_id, tag);
@@ -4555,11 +4556,13 @@ UPDATE exports AS e SET symbol_id = x.id FROM
                   loop_depth: int) -> None:
         if node.type == "template_string":
             return
-        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+        val = text.strip('"\'')
+        if len(val) >= SECRET_MIN_LEN and " " not in val \
+            and SECRET_RE.search(val):
             # G07: credential-shaped literal -- candidate, not verdict.
             # Template strings return above, so a secret interpolated into
             # one is invisible here.
-            st.secrets.append((text[:200], node.start_point[0] + 1))
+            st.secrets.append((val[:200], node.start_point[0] + 1))
         low = text[:200].lower()
         if "<script" in low or "<div" in low or "<span" in low or "</" in low:
             st.bump("n_innerhtml") if len(text) > 24 else None
@@ -4635,7 +4638,7 @@ UPDATE exports AS e SET symbol_id = x.id FROM
         binds: dict[str, tuple[str, str, int]] = {}
         self.bindings[rec.fid] = binds
 
-        for n in walk(root):
+        for n, _depth in walk_cursor(root):
             t = n.type
             if t == "import_statement":
                 self._import_stmt(n, rec, bufs, here, binds)
@@ -6104,6 +6107,8 @@ JavaScriptAnalyzer.QUERIES = [
     JOIN files f ON f.id = sc.file_id
     LEFT JOIN modules m ON m.id = s.module_id
     WHERE f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND sc.value NOT LIKE '/%' AND instr(sc.value, '|') = 0
+      AND instr(sc.value, '%') = 0
     ORDER BY length(sc.value) DESC LIMIT :lim"""),
 (
     "path-traversal-surface",
@@ -6597,15 +6602,14 @@ JavaScriptAnalyzer.QUERIES = [
     "     internal (no import statement) reads as unused; devDependencies\n"
     "     used only by scripts (no source import) are the dominant\n"
     "     legitimate row.",
-    """SELECT d.name, d.version, d.is_dev,
-        (SELECT COUNT(*) FROM imports i
-          WHERE i.target = d.name
-             OR substr(i.target, 1, length(d.name) + 1) = d.name || '/')
-            AS used
+    """WITH used(dn) AS (
+        SELECT d.name FROM deps d JOIN imports i ON i.target = d.name
+        UNION
+        SELECT d.name FROM deps d JOIN imports i
+          ON i.target >= d.name || '/' AND i.target < d.name || '/' || X'FF')
+    SELECT d.name, d.version, d.is_dev, 0 AS used
     FROM deps d
-    WHERE (SELECT COUNT(*) FROM imports i
-            WHERE i.target = d.name
-               OR substr(i.target, 1, length(d.name) + 1) = d.name || '/') = 0
+    WHERE NOT EXISTS (SELECT 1 FROM used u WHERE u.dn = d.name)
     ORDER BY d.is_dev, d.name
     LIMIT :lim"""),
 (

@@ -4442,9 +4442,11 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
         # this signal found 55 sites in a codebase that has thousands. The
         # count lives in `_scan_body`, which tracks BLOCK depth, because in
         # Ruby the loop is the block.
-        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+        val = text.strip('"\'')
+        if len(val) >= SECRET_MIN_LEN and " " not in val \
+            and SECRET_RE.search(val):
             # G07: credential-shaped literal -- candidate, not verdict
-            st.secrets.append((text[:200], node.start_point[0] + 1))
+            st.secrets.append((val[:200], node.start_point[0] + 1))
         if not SQL_RE.search(text):
             return
         st.bump("n_sql_literal")
@@ -4540,7 +4542,7 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
         """
         out: set[int] = set()
         src = rec.data
-        for n in walk(body):
+        for n, _depth in walk_cursor(body):
             if n.type not in ("do_block", "block"):
                 continue
             call = n.parent
@@ -4593,7 +4595,7 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
     # -- imports -----------------------------------------------------------
     def parse_imports(self, root: Any, rec: FileRec, bufs: Buffers) -> None:
         src = rec.data
-        for n in walk(root):
+        for n, _depth in walk_cursor(root):
             if n.type != "call":
                 continue
             m = n.child_by_field_name("method")
@@ -5513,7 +5515,7 @@ RubyAnalyzer.QUERIES = [
     "     ActiveSupport or with a gem is invisible for the same reason.\n"
     "     Matching is on the module's short name, so two different `Trackable`\n"
     "     modules in different namespaces are wrongly treated as one.",
-    """WITH mod_defs AS (
+    """WITH mod_defs AS MATERIALIZED (
         SELECT ms.id AS mod_id, ms.name AS mod_name, md.name AS meth,
                md.id AS meth_id, md.sloc
         FROM symbols ms JOIN symbols md ON md.parent_id = ms.id
@@ -6331,6 +6333,8 @@ RubyAnalyzer.QUERIES = [
     LEFT JOIN modules m ON m.id = s.module_id
     WHERE f.is_generated = 0 AND f.is_test = 0
       AND COALESCE(m.name,'') LIKE :mod
+      AND sc.value NOT LIKE '/%' AND instr(sc.value, '|') = 0
+      AND instr(sc.value, '%') = 0
     ORDER BY length(sc.value) DESC LIMIT :lim"""),
 (
     "xxe-parser-surface",

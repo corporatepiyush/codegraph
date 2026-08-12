@@ -1066,6 +1066,7 @@ BASE_INDEXES = r"""
 CREATE INDEX idx_files_test ON files(is_test);
 CREATE INDEX idx_files_gen ON files(is_generated);
 CREATE INDEX idx_sym_deprecated ON symbols(is_deprecated) WHERE is_deprecated=1;
+CREATE INDEX idx_sym_class ON symbols(class_name);
 CREATE INDEX idx_sym_name ON symbols(name);
 CREATE INDEX idx_sym_qual ON symbols(qual_name);
 CREATE INDEX idx_sym_file_line ON symbols(file_id, line_start);
@@ -3883,6 +3884,7 @@ CREATE TABLE dynamic_sites(
 -- parse-coverage joins namespaces by file; the planner was building this.
 CREATE INDEX idx_ns_file ON namespaces(file_id);
 CREATE INDEX idx_cls_kind ON classes(kind, name);
+CREATE INDEX idx_cls_name ON classes(name);
 CREATE INDEX idx_cls_ns ON classes(namespace, name);
 CREATE INDEX idx_cls_gadget ON classes(symbol_id)
     WHERE has_destruct=1 OR has_wakeup=1 OR has_tostring=1;
@@ -3898,6 +3900,7 @@ CREATE INDEX idx_sql_unsafe ON sql_sites(symbol_id)
     WHERE build_kind IN ('interp','concat','format') AND is_sanitized=0;
 CREATE INDEX idx_hook_class ON property_hooks(class_id, property);
 CREATE INDEX idx_magic_gadget ON magic_methods(method) WHERE is_gadget=1;
+CREATE INDEX idx_mm_class ON magic_methods(class_id);
 CREATE INDEX idx_dyn_sym ON dynamic_sites(symbol_id, kind);
 CREATE INDEX idx_dyn_kind ON dynamic_sites(kind, file_id);
 CREATE INDEX idx_fn_super ON symbols(n_superglobal_reads DESC, name)
@@ -4332,9 +4335,11 @@ UPDATE namespaces AS n SET n_classes = (
 
     def on_string(self, node: Any, text: str, src: bytes, st: BodyStats,
                   loop_depth: int) -> None:
-        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+        val = text.strip('"\'')
+        if len(val) >= SECRET_MIN_LEN and " " not in val \
+            and SECRET_RE.search(val):
             # G07: credential-shaped literal -- candidate, not verdict
-            st.secrets.append((text[:200], node.start_point[0] + 1))
+            st.secrets.append((val[:200], node.start_point[0] + 1))
         if not SQL_RE.search(text):
             return
         st.bump("n_sql_literal")
@@ -4656,7 +4661,7 @@ UPDATE namespaces AS n SET n_classes = (
         strict = False
         uses: dict[str, str] = {}
 
-        for n in walk(root):
+        for n, _depth in walk_cursor(root):
             t = n.type
             if t == "namespace_definition":
                 nm = n.child_by_field_name("name")
@@ -5861,6 +5866,8 @@ PhpAnalyzer.QUERIES = [
     JOIN files f ON f.id = sc.file_id
     LEFT JOIN modules m ON m.id = s.module_id
     WHERE f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+      AND sc.value NOT LIKE '/%' AND instr(sc.value, '|') = 0
+      AND instr(sc.value, '%') = 0
     ORDER BY length(sc.value) DESC LIMIT :lim"""),
 (
     "xxe-parser-surface",
@@ -6122,7 +6129,7 @@ PhpAnalyzer.QUERIES = [
     "MISLEADS attribution is via the calling function's class; a function in\n"
     "     a namespace with no class (plain function) has no home and is not\n"
     "     counted, so namespace-level numbers undercount plain-function code.",
-    """WITH ce AS (
+    """WITH ce AS MATERIALIZED (
         SELECT ca.namespace AS caller_ns, cb.namespace AS callee_ns
         FROM edges e
         JOIN symbols sa ON sa.id=e.caller_id
@@ -6241,11 +6248,18 @@ PhpAnalyzer.QUERIES = [
     "     (PHP does not require `implements`) has no row at all; and a\n"
     "     class that declares the interface but never uses it is counted\n"
     "     the same as one fully implementing it.",
-    """SELECT i.name AS iface, i.namespace,
-        (SELECT COUNT(*) FROM classes c
-          WHERE instr(',' || c.implements || ',', ',' || i.name || ',') > 0
-            OR instr(',' || c.implements || ',',
-                     ',' || substr(i.fqn, 2) || ',') > 0)
+    """WITH RECURSIVE split(cid, rest, tok) AS (
+        SELECT symbol_id, implements, '' FROM classes c WHERE c.implements <> ''
+        UNION ALL
+        SELECT cid,
+               CASE WHEN instr(rest, ',') > 0
+                    THEN substr(rest, instr(rest, ',') + 1) ELSE '' END,
+               CASE WHEN instr(rest, ',') > 0
+                    THEN substr(rest, 1, instr(rest, ',') - 1) ELSE rest END
+        FROM split WHERE rest <> '')
+    SELECT i.name AS iface, i.namespace,
+        (SELECT COUNT(DISTINCT cid) FROM split
+          WHERE tok = i.name OR tok = substr(i.fqn, 2))
             AS implementors,
         i.n_methods AS iface_methods,
         f.path || ':' || i.line AS at
@@ -6545,7 +6559,8 @@ PhpAnalyzer.METRICS = [
     "     of pure value objects with no scalar parameters gains nothing.",
     """SELECT m.name AS namespace_,
         COUNT(DISTINCT f.id) AS files,
-        SUM(DISTINCT_STRICT.n) AS strict_files,
+        COUNT(DISTINCT CASE WHEN DISTINCT_STRICT.n = 1 THEN f.id END)
+            AS strict_files,
         COUNT(DISTINCT s.id) AS fns,
         COALESCE(SUM(s.n_type_declarations),0) AS typed_slots,
         COALESCE(SUM(s.n_untyped_params),0) AS untyped_params,

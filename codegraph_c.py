@@ -2532,6 +2532,10 @@ SECRET_RE = re.compile(
     r'sk_live|rk_live|pk_live|ghp_|xoxb-|AKIA)', re.I)
 SECRET_MIN_LEN = 12
 
+#: Symbols are buffered and written in batches of this many (bounded so the
+#: buffer never shows up in peak RSS), then flushed once after the parse loop.
+SYMBOL_BATCH = 4000
+
 _STORAGE = (r'(?:const[ \t]+|volatile[ \t]+|_Atomic[ \t]+|atomic_\w+[ \t]+|'
             r'unsigned[ \t]+|signed[ \t]+|long[ \t]+|short[ \t]+|struct[ \t]+|'
             r'enum[ \t]+|union[ \t]+)*')
@@ -3472,6 +3476,10 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
         self.pend_cnt: array.array = array.array("i")
         self.pend_name: list[str] = []
         self.pend_lines: list[list[int]] = []
+        #: buffered symbol rows, bucketed by column shape (go-style batching)
+        self._sym_buckets: dict[tuple[str, ...], list[tuple[Any, ...]]] = {}
+        self._sym_sqls: dict[tuple[str, ...], str] = {}
+        self._n_sym = 0
         #: basename -> file_id, built once, for #include resolution
         self.by_basename: dict[str, int] = {}
         self.n_edges = self.n_macro = self.n_extern = self.n_unres = 0
@@ -3500,7 +3508,7 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
 
         self._includes(rec, raw, bufs)
         self._config_blocks(rec, raw, db)
-        self._macros(rec, raw, db)
+        self._macros(rec, raw, db, bufs)
         self._typedefs(rec, raw, db)
         self._tags(rec, raw, blank, db, bufs)
 
@@ -3557,19 +3565,19 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                 "INSERT INTO config_blocks(file_id,directive,expr,line,is_config)"
                 " VALUES(?,?,?,?,?)", rows)
 
-    def _macros(self, rec: FileRec, raw: str, db: sqlite3.Connection) -> None:
+    def _macros(self, rec: FileRec, raw: str, db: sqlite3.Connection,
+                bufs: Buffers) -> None:
         for m in DEFINE.finditer(raw):
             name, args, body = m.group(1), m.group(2), (m.group(3) or "")
             ln = line_of(raw, m.start())
-            sid = db.execute(
-                "INSERT INTO symbols(file_id,module_id,name,qual_name,kind,"
-                "line_start,line_end,n_lines,signature,visibility) "
-                "VALUES(?,?,?,?,'macro',?,?,1,?,'')",
-                (rec.fid, rec.mid, name, name, ln, ln,
-                 m.group(0)[:200])).lastrowid
-            db.execute(
-                "INSERT INTO macros(symbol_id,is_functionlike,n_params,body,"
-                "body_len,is_multiline) VALUES(?,?,?,?,?,?)",
+            sid = self._new_symbol(
+                db,
+                ["file_id", "module_id", "name", "qual_name", "kind",
+                 "line_start", "line_end", "n_lines", "signature",
+                 "visibility"],
+                [rec.fid, rec.mid, name, name, "macro", ln, ln, 1,
+                 m.group(0)[:200], ""])
+            bufs.rows("macros").append(
                 (sid, 1 if args else 0,
                  len([a for a in (args or "()")[1:-1].split(",") if a.strip()]),
                  body[:500], len(body),
@@ -3581,12 +3589,13 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
             if "(" in m.group(1):
                 continue
             ln = line_of(raw, m.start())
-            db.execute(
-                "INSERT INTO symbols(file_id,module_id,name,qual_name,kind,"
-                "line_start,line_end,n_lines,return_type,is_public) "
-                "VALUES(?,?,?,?,'typedef',?,?,1,?,1)",
-                (rec.fid, rec.mid, m.group(2), m.group(2), ln, ln,
-                 re.sub(r'\s+', ' ', m.group(1)).strip()[:120]))
+            self._new_symbol(
+                db,
+                ["file_id", "module_id", "name", "qual_name", "kind",
+                 "line_start", "line_end", "n_lines", "return_type",
+                 "is_public"],
+                [rec.fid, rec.mid, m.group(2), m.group(2), "typedef", ln, ln,
+                 1, re.sub(r'\\s+', ' ', m.group(1)).strip()[:120], 1])
 
     # -- aggregates: struct / union / enum ---------------------------------
     def _tags(self, rec: FileRec, raw: str, blank: str,
@@ -3602,12 +3611,13 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                 name = mm.group(1) if mm else "(anon@%d)" % line_of(raw, m.start())
             ln = line_of(raw, m.start())
             doc, ndoc = has_leading_comment(rec.text.splitlines(), ln)
-            sid = db.execute(
-                "INSERT INTO symbols(file_id,module_id,name,qual_name,kind,"
-                "line_start,line_end,n_lines,is_public,has_doc,n_doc_lines) "
-                "VALUES(?,?,?,?,?,?,?,?,1,?,?)",
-                (rec.fid, rec.mid, name, name, kind, ln, endline,
-                 endline - ln + 1, doc, ndoc)).lastrowid
+            sid = self._new_symbol(
+                db,
+                ["file_id", "module_id", "name", "qual_name", "kind",
+                 "line_start", "line_end", "n_lines", "is_public",
+                 "has_doc", "n_doc_lines"],
+                [rec.fid, rec.mid, name, name, kind, ln, endline,
+                 endline - ln + 1, 1, doc, ndoc])
 
             if kind in ("struct", "union"):
                 for f in flds:
@@ -3779,7 +3789,8 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                      v[:40], line_of(body, m2.start()) + ls - 1, 1))
             for sm in STRING_LIT.finditer(raw_body):
                 sl = sm.group(0)
-                if len(sl) >= SECRET_MIN_LEN and SECRET_RE.search(sl):
+                if len(sl) >= SECRET_MIN_LEN and " " not in sl \
+                        and SECRET_RE.search(sl):
                     # G07: credential-shaped literal -- candidate, not verdict
                     bufs.rows("secret_candidates").append(
                         (sid, rec.fid, sl[:200],
@@ -3854,23 +3865,72 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                 bufs.add_hazard(sid, pat, cat, c, 0)
 
     # -- insertion ---------------------------------------------------------
+    def _new_symbol(self, db: sqlite3.Connection, cols: list[str],
+                    vals: list[Any]) -> int:
+        """Buffer one symbol; ids come from a counter, not `lastrowid`.
+
+        `id INTEGER PRIMARY KEY` accepts an explicit value, and a counter from
+        1 hands out exactly the rowids SQLite would have assigned -- which is
+        what makes `executemany` possible at all (Python's sqlite3 refuses
+        `executemany` with `RETURNING`). Rows are bucketed by their column
+        shape (four shapes exist: function, macro, typedef, tag) and flushed
+        per bucket, so every INSERT in a batch is the same width -- the byte
+        identity of the graph is preserved because absent metric columns take
+        the DDL default either way.
+        """
+        self._n_sym += 1
+        sid = self._n_sym
+        key = tuple(cols)
+        rows = self._sym_buckets.setdefault(key, [])
+        rows.append((sid,) + tuple(vals))
+        if len(rows) >= SYMBOL_BATCH:
+            self._flush_sym_bucket(db, key)
+        return sid
+
+    def _flush_sym_bucket(self, db: sqlite3.Connection,
+                          key: tuple[str, ...]) -> None:
+        rows = self._sym_buckets.get(key)
+        if not rows:
+            return
+        sql = self._sym_sqls.get(key)
+        if sql is None:
+            sql = self._sym_sqls[key] = (
+                "INSERT INTO symbols(id,%s) VALUES(%s)"
+                % (",".join(key), ",".join("?" * (1 + len(key)))))
+        db.executemany(sql, rows)
+        self._sym_buckets[key] = []
+
     def _insert_symbol(self, db: sqlite3.Connection, rec: FileRec, name: str,
                        kind: str, line_start: int, line_end: int, qual: str,
                        signature: str, return_type: str, visibility: str,
                        m: dict[str, Any]) -> int:
+        """Buffer a function symbol (fixed column order, so one batch shape).
+
+        The metric columns are those the schema carries (`_SYMBOL_COLS`), in a
+        fixed order, defaulting absent metrics to 0 -- byte-identical to the
+        old variable-width per-row INSERT because every metric column is
+        `INT NOT NULL DEFAULT 0`.
+        """
         cols = ["file_id", "module_id", "name", "qual_name", "kind",
-                "line_start", "line_end", "n_lines", "signature", "return_type",
-                "visibility"]
-        vals: list[Any] = [rec.fid, rec.mid, name, qual, kind, line_start,
-                           line_end, line_end - line_start + 1,
-                           signature, return_type, visibility]
-        for k, v in m.items():
-            if k in _SYMBOL_COLS:
-                cols.append(k)
-                vals.append(int(v) if isinstance(v, bool) else v)
-        sql = ("INSERT INTO symbols(%s) VALUES(%s)"
-               % (",".join(cols), ",".join("?" * len(cols))))
-        return db.execute(sql, vals).lastrowid
+                "line_start", "line_end", "n_lines", "signature",
+                "return_type", "visibility"]
+        metric_cols = sorted(c for c in _SYMBOL_COLS
+                             if c not in cols and c != "id")
+        full_cols = cols + metric_cols
+        vals: list[Any] = [rec.fid, rec.mid, name, qual[:400], kind,
+                           line_start, line_end, line_end - line_start + 1,
+                           signature[:400], return_type[:200], visibility]
+        vals += [int(m.get(c, 0)) for c in metric_cols]
+        return self._new_symbol(db, full_cols, vals)
+
+    def flush_symbols(self, db: sqlite3.Connection) -> None:
+        """Write every buffered symbol row once, after the parse loop.
+
+        Called unconditionally by `build()` before anything counts the table;
+        a parser must never leave a buffered row unwritten or `n_syms` reads 0.
+        """
+        for key in list(self._sym_buckets):
+            self._flush_sym_bucket(db, key)
 
     # -- call resolution ---------------------------------------------------
     def resolve_calls(self, db: sqlite3.Connection, bufs: Buffers) -> None:
@@ -3948,6 +4008,15 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
 
         for sid, pat, cat, n, ln in alloc_hz:
             bufs.add_hazard(sid, pat, cat, n, ln)
+        # The buffered macros rows must hit the table before the n_uses
+        # UPDATE below, or the UPDATE matches nothing and every macro shows 0.
+        _macros_rows = bufs.rows("macros")
+        if _macros_rows:
+            db.executemany(
+                "INSERT INTO macros(symbol_id,is_functionlike,n_params,body,"
+                "body_len,is_multiline) VALUES(?,?,?,?,?,?)",
+                list(_macros_rows))
+            _macros_rows.clear()
         for col, data in (("n_external_calls", ext), ("n_macro_calls", mac),
                           ("n_extern_decl_calls", decl)):
             if data:
@@ -4825,25 +4894,28 @@ QUERIES: list[tuple[str, str, str, str]] = [
     "MISLEADS n_external_calls counts calls whose callee was declared but not\n"
     "     defined in the unit -- libc and POSIX calls dominate any realistic\n"
     "     file, so compare DENSITY across files, not the raw number.",
-    """SELECT f.path,
-        (SELECT COUNT(*) FROM globals g WHERE g.file_id=f.id
-          AND g.is_static=0 AND g.is_const=0) AS extern_globals,
-        (SELECT COALESCE(SUM(s.n_external_calls),0) FROM symbols s
-          WHERE s.file_id=f.id AND s.kind='function') AS extern_calls,
-        (SELECT COALESCE(SUM(s.n_calls),0) FROM symbols s
-          WHERE s.file_id=f.id AND s.kind='function') AS total_calls,
-        CAST(100.0 * (SELECT COALESCE(SUM(s.n_external_calls),0) FROM symbols s
-             WHERE s.file_id=f.id AND s.kind='function')
-             / NULLIF((SELECT COALESCE(SUM(s.n_calls),0) FROM symbols s
-               WHERE s.file_id=f.id AND s.kind='function'), 0) AS INT)
+     """WITH eg AS (
+        SELECT g.file_id AS fid, COUNT(*) AS n
+        FROM globals g WHERE g.is_static=0 AND g.is_const=0 GROUP BY g.file_id),
+    ec AS (
+        SELECT s.file_id AS fid, COALESCE(SUM(s.n_external_calls),0) AS ext,
+               COALESCE(SUM(s.n_calls),0) AS tot
+        FROM symbols s WHERE s.kind='function' GROUP BY s.file_id),
+    fc AS (
+        SELECT s.file_id AS fid, COUNT(*) AS n FROM symbols s GROUP BY s.file_id)
+    SELECT f.path,
+        COALESCE(eg.n, 0) AS extern_globals,
+        COALESCE(ec.ext, 0) AS extern_calls,
+        COALESCE(ec.tot, 0) AS total_calls,
+        CAST(100.0 * COALESCE(ec.ext,0) / NULLIF(COALESCE(ec.tot,0), 0) AS INT)
             AS pct_external
     FROM files f
     LEFT JOIN modules m ON m.id=f.module_id
-    WHERE (SELECT COUNT(*) FROM symbols s WHERE s.file_id=f.id) > 0
-      AND ((SELECT COALESCE(SUM(s.n_external_calls),0) FROM symbols s
-            WHERE s.file_id=f.id AND s.kind='function') > 0
-           OR (SELECT COUNT(*) FROM globals g WHERE g.file_id=f.id
-               AND g.is_static=0 AND g.is_const=0) > 0)
+    LEFT JOIN eg ON eg.fid = f.id
+    LEFT JOIN ec ON ec.fid = f.id
+    LEFT JOIN fc ON fc.fid = f.id
+    WHERE fc.n > 0
+      AND (COALESCE(ec.ext,0) > 0 OR COALESCE(eg.n,0) > 0)
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY extern_calls DESC LIMIT :lim"""),
 (
@@ -4946,7 +5018,9 @@ QUERIES: list[tuple[str, str, str, str]] = [
     JOIN symbols s ON s.id = sc.symbol_id
     JOIN files f ON f.id = sc.file_id
     LEFT JOIN modules m ON m.id = s.module_id
-    WHERE f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    WHERE f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND sc.value NOT LIKE '/%' AND instr(sc.value, '|') = 0
+      AND instr(sc.value, '%') = 0
     ORDER BY length(sc.value) DESC LIMIT :lim"""),
 (
     "include-cycles",

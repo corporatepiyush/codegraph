@@ -4326,10 +4326,12 @@ UPDATE symbols AS s SET n_mono_instantiations = x.c FROM
 
     def on_string(self, node: Any, text: str, src: bytes, st: BodyStats,
                   loop_depth: int) -> None:
-        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+        val = text.strip('"\'')
+        if len(val) >= SECRET_MIN_LEN and " " not in val \
+            and SECRET_RE.search(val):
             # G07: credential-shaped literal -- candidate, not verdict
-            st.secrets.append((text[:200], node.start_point[0] + 1))
-        if re.search(r'\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b',
+            st.secrets.append((val[:200], node.start_point[0] + 1))
+        if re.search(r'\b(SELECT\s|INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)\b',
                      text, re.I):
             st.bump("n_sql_literal")
             if loop_depth:
@@ -6061,6 +6063,8 @@ RustAnalyzer.QUERIES = [
     LEFT JOIN modules m ON m.id = s.module_id
     WHERE f.is_test = 0 AND f.is_generated = 0
       AND COALESCE(m.name,'') LIKE :mod
+      AND sc.value NOT LIKE '/%' AND instr(sc.value, '|') = 0
+      AND instr(sc.value, '%') = 0
     ORDER BY length(sc.value) DESC LIMIT :lim"""),
 (
     "untrusted-deserialization",
@@ -6384,22 +6388,36 @@ RustAnalyzer.METRICS = [
     "     derive macro is not seen, so a count of 1 means 'look', never\n"
     "     'delete'. is_generic flags blanket impls, which make the count\n"
     "     meaningless on their own.",
-    """SELECT t.name AS trait_, t.n_required AS required_methods,
+    """WITH RECURSIVE dt(sym, pos, rest) AS (
+        SELECT symbol_id, pos, type FROM params WHERE instr(type, 'dyn ') > 0
+        UNION ALL
+        SELECT sym, pos, substr(rest, instr(rest, 'dyn ') + 4)
+        FROM dt WHERE instr(rest, 'dyn ') > 0),
+    dw(sym, pos, word) AS MATERIALIZED (
+        SELECT sym, pos, substr(a, 1, length(a) - length(ltrim(a,
+                'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_')))
+        FROM (SELECT sym, pos, substr(rest, instr(rest, 'dyn ') + 4) AS a FROM dt)),
+    st(sk, rest) AS (
+        SELECT id, signature FROM symbols WHERE instr(signature, 'dyn ') > 0
+        UNION ALL
+        SELECT sk, substr(rest, instr(rest, 'dyn ') + 4)
+        FROM st WHERE instr(rest, 'dyn ') > 0),
+    sw(sk, word) AS MATERIALIZED (
+        SELECT sk, substr(a, 1, length(a) - length(ltrim(a,
+                'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_')))
+        FROM (SELECT sk, substr(rest, instr(rest, 'dyn ') + 4) AS a FROM st))
+    SELECT t.name AS trait_, t.n_required AS required_methods,
         t.n_provided AS default_methods, t.is_public AS pub_,
         t.has_assoc_type AS assoc_type,
         COUNT(DISTINCT i.id) AS impls_found,
         GROUP_CONCAT(DISTINCT i.type_name) AS implementors,
         MAX(i.is_generic) AS blanket_impl,
-        (SELECT COUNT(*) FROM params p
-         WHERE instr(p.type, 'dyn ' || t.name) > 0
-           AND (length(p.type) = instr(p.type,'dyn '||t.name)-1+length('dyn '||t.name)
-                OR instr('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_', substr(p.type,
-                     instr(p.type,'dyn '||t.name)+length('dyn '||t.name), 1)) = 0)) AS dyn_params,
+        (SELECT COUNT(*) FROM
+            (SELECT DISTINCT sym, pos FROM dw WHERE word = t.name))
+            AS dyn_params,
         (SELECT COALESCE(SUM(s2.n_box_dyn),0) FROM symbols s2
-         WHERE instr(s2.signature, 'dyn ' || t.name) > 0
-           AND (length(s2.signature) = instr(s2.signature,'dyn '||t.name)-1+length('dyn '||t.name)
-                OR instr('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_', substr(s2.signature,
-                     instr(s2.signature,'dyn '||t.name)+length('dyn '||t.name), 1)) = 0)) AS box_dyn_sites,
+         WHERE s2.id IN (SELECT sk FROM sw WHERE word = t.name))
+            AS box_dyn_sites,
         f.path || ':' || s.line_start AS at
     FROM traits t
     JOIN symbols s ON s.id=t.symbol_id

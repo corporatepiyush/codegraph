@@ -3713,6 +3713,7 @@ CREATE TABLE secret_candidates(
 
     INDEX_EXT = r"""
 CREATE INDEX idx_exp_file ON ts_exports(file_id, name);
+CREATE INDEX idx_exp_name ON ts_exports(name, is_type_only);
 CREATE INDEX idx_exp_star ON ts_exports(file_id) WHERE is_star=1;
 CREATE INDEX idx_sup_kind ON suppressions(kind, file_id);
 CREATE INDEX idx_sup_sym ON suppressions(symbol_id);
@@ -4114,11 +4115,13 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
                   loop_depth: int) -> None:
         if node.type == "template_string":
             return
-        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+        val = text.strip('"\'')
+        if len(val) >= SECRET_MIN_LEN and " " not in val \
+            and SECRET_RE.search(val):
             # G07: credential-shaped literal -- candidate, not verdict.
             # Template strings return above, so a secret interpolated into
             # one is invisible here.
-            st.secrets.append((text[:200], node.start_point[0] + 1))
+            st.secrets.append((val[:200], node.start_point[0] + 1))
 
     def hazard_of(self, callee: str) -> Optional[tuple[str, str]]:
         cat = HAZARD_CALLS.get(callee)
@@ -4169,7 +4172,7 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
             return
         src = rec.data
         loops = set(self.LOOP_NODES)
-        for n in walk(body):
+        for n, _depth in walk_cursor(body):
             if n.type != "call_expression":
                 if n.type == "member_expression":
                     obj = n.child_by_field_name("object")
@@ -4275,7 +4278,7 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
 
     def parse_imports(self, root: Any, rec: FileRec, bufs: Buffers) -> None:
         src = rec.data
-        for n in walk(root):
+        for n, _depth in walk_cursor(root):
             if n.type == "import_statement":
                 srcn = n.child_by_field_name("source")
                 target = _txt(srcn, src).strip('"\'`') if srcn is not None else ""
@@ -5318,12 +5321,19 @@ TypeScriptAnalyzer.QUERIES = [
     "MISLEADS extends_names is captured per declaration and matched\n"
     "     by name; a chain through re-exported or namespaced parents breaks\n"
     "     at the first unresolved hop, so chain depth is a floor.",
-    """SELECT s.name, t.n_extends AS extends, t.n_members,
+    """WITH RECURSIVE split(symbol_id, rest, tok) AS (
+        SELECT t.symbol_id, t.extends_names, '' FROM type_defs t WHERE t.extends_names <> ''
+        UNION ALL
+        SELECT symbol_id,
+               CASE WHEN instr(rest, ',') > 0
+                    THEN substr(rest, instr(rest, ',') + 1) ELSE '' END,
+               CASE WHEN instr(rest, ',') > 0
+                    THEN substr(rest, 1, instr(rest, ',') - 1) ELSE rest END
+        FROM split WHERE rest <> '')
+    SELECT s.name, t.n_extends AS extends, t.n_members,
         t.extends_names, t.n_index_signatures AS idx_sigs,
-        (SELECT COUNT(*) FROM symbols s3 JOIN type_defs t3
-           ON t3.symbol_id=s3.id
-          WHERE instr(',' || t3.extends_names || ',',
-                             ',' || s.name || ',') > 0) AS inherited_by,
+        (SELECT COUNT(DISTINCT symbol_id) FROM split WHERE tok = s.name)
+            AS inherited_by,
         f.path || ':' || s.line_start AS at
     FROM type_defs t JOIN symbols s ON s.id=t.symbol_id
     JOIN files f ON f.id=s.file_id
@@ -5516,15 +5526,18 @@ TypeScriptAnalyzer.QUERIES = [
     "     internal (no import statement) reads as unused; devDependencies\n"
     "     used only by scripts (no source import) are the dominant\n"
     "     legitimate row.",
-    """SELECT d.name, d.version, d.is_dev, d.dir AS package_dir,
-        (SELECT COUNT(*) FROM imports i
-          WHERE i.target = d.name
-             OR substr(i.target, 1, length(d.name) + 1) = d.name || '/')
-            AS used
+    """WITH used(dn, dv, dd, pdir) AS (
+        SELECT d.name, d.version, d.is_dev, d.dir FROM deps d
+        JOIN imports i ON i.target = d.name
+        UNION
+        SELECT d.name, d.version, d.is_dev, d.dir FROM deps d
+        JOIN imports i
+          ON i.target >= d.name || '/' AND i.target < d.name || '/' || X'FF')
+    SELECT d.name, d.version, d.is_dev, d.dir AS package_dir, 0 AS used
     FROM deps d
-    WHERE (SELECT COUNT(*) FROM imports i
-            WHERE i.target = d.name
-               OR substr(i.target, 1, length(d.name) + 1) = d.name || '/') = 0
+    WHERE NOT EXISTS (SELECT 1 FROM used u
+                      WHERE u.dn = d.name AND u.dv = d.version
+                        AND u.dd = d.is_dev AND u.pdir = d.dir)
     ORDER BY d.is_dev, d.name
     LIMIT :lim"""),
 (
@@ -5694,6 +5707,8 @@ TypeScriptAnalyzer.QUERIES = [
     JOIN files f ON f.id = sc.file_id
     LEFT JOIN modules m ON m.id = s.module_id
     WHERE f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND sc.value NOT LIKE '/%' AND instr(sc.value, '|') = 0
+      AND instr(sc.value, '%') = 0
     ORDER BY length(sc.value) DESC LIMIT :lim"""),
 (
     "path-traversal-surface",

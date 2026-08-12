@@ -3945,6 +3945,7 @@ CREATE INDEX idx_secret_sym ON secret_candidates(symbol_id);
 CREATE INDEX idx_tr_child ON type_relations(child_name);
 CREATE INDEX idx_tr_sym ON type_relations(child_id);
 CREATE INDEX idx_ovr_name ON overrides(method_name, owner_type);
+CREATE INDEX idx_ovr_parent ON overrides(parent_type);
 CREATE INDEX idx_ovr_sym ON overrides(symbol_id);
 CREATE INDEX idx_exc_sym ON exceptions(symbol_id, kind);
 CREATE INDEX idx_exc_broad ON exceptions(type) WHERE is_broad=1;
@@ -4265,7 +4266,8 @@ UPDATE symbols SET arity_rank = CASE
             st.bump("n_parse_no_radix")
         if _b in ("equals",) and loop_depth:
             st.bump("n_equals_in_loop")
-        if _b in ("getInstance",) and "Random" in full:
+        if _b in ("getInstance",) and "Random" in full \
+                and full.startswith("Random"):
             st.bump("n_weak_random")             # find-sec-bugs PREDICTABLE_RANDOM
         if full in ("Math.random", "Random.nextInt", "Random.nextLong"):
             st.bump("n_weak_random")
@@ -4406,9 +4408,11 @@ UPDATE symbols SET arity_rank = CASE
                   loop_depth: int) -> None:
         if node.type == "character_literal":
             return
-        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+        val = text.strip('"\'')
+        if len(val) >= SECRET_MIN_LEN and " " not in val \
+            and SECRET_RE.search(val):
             # G07: credential-shaped literal -- candidate, not verdict
-            st.secrets.append((text[:200], node.start_point[0] + 1))
+            st.secrets.append((val[:200], node.start_point[0] + 1))
         if node.type == "string_literal" and text.startswith('"""'):
             # modern-idiom-candidates: a text block.
             st.bump("n_modern_idioms")
@@ -4657,7 +4661,7 @@ UPDATE symbols SET arity_rank = CASE
             bufs.imports.append(
                 (rec.fid, m.group(1)[:300], None, None, "import module",
                  line, 1, 0, 1, 0, 0, 1))
-        for n in walk(root):
+        for n, _depth in walk_cursor(root):
             if n.type == "requires_module_directive":
                 mod = n.child_by_field_name("module")
                 txt = _txt(n, src)
@@ -4912,7 +4916,7 @@ UPDATE symbols SET arity_rank = CASE
         n_tl_remove = 0
         acq = 0
 
-        for n in walk(body):
+        for n, _depth in walk_cursor(body):
             t = n.type
             if t == "synchronized_statement":
                 depth = _ancestor_loop_depth(n, body, loop_types)
@@ -6166,6 +6170,8 @@ WITH fld AS (
     JOIN files f ON f.id = sc.file_id
     LEFT JOIN modules m ON m.id = s.module_id
     WHERE f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND sc.value NOT LIKE '/%' AND instr(sc.value, '|') = 0
+      AND instr(sc.value, '%') = 0
     ORDER BY length(sc.value) DESC LIMIT :lim"""),
 (
     "xxe-parser-surface",
@@ -6213,22 +6219,26 @@ WITH fld AS (
     "ACT add the security annotation or auth check; verify the route is in\n"
     "     the protected group.\n"
     "MISLEADS auth usually lives on a SECURITY FILTER, an @PreAuthorize\n"
-    "     annotation, or a base controller -- this query sees the method\n"
-    "     body only, so a fully-protected app still ranks every method as\n"
-    "     open. A login or public endpoint legitimately has no auth. The\n"
-    "     markers are name-based substrings; annotations are invisible.\n"
+    "     annotation, or a base controller -- annotations ARE visible\n"
+    "     (attributes table) and exclude a method; a filter-chain or base-\n"
+    "     class check still reads as open. A login or public endpoint\n"
+    "     legitimately has no auth. The markers are name-based substrings.\n"
     "     Resolution is name-based.",
     """SELECT s.name, COUNT(DISTINCT u.id) AS input_sites,
         GROUP_CONCAT(DISTINCT u.kind) AS kinds,
         f.path || ':' || s.line_start AS at
-    FROM symbols s
-    JOIN files f ON f.id = s.file_id
-    LEFT JOIN modules m ON m.id = s.module_id
-    LEFT JOIN user_input_sites u ON u.symbol_id = s.id
-    WHERE u.kind IS NOT NULL AND s.n_auth_call = 0
-      AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
-    GROUP BY s.id
-    ORDER BY input_sites DESC, s.sloc DESC LIMIT :lim"""),
+     FROM symbols s
+     JOIN files f ON f.id = s.file_id
+     LEFT JOIN modules m ON m.id = s.module_id
+     LEFT JOIN user_input_sites u ON u.symbol_id = s.id
+     WHERE u.kind IS NOT NULL AND s.n_auth_call = 0
+       AND NOT EXISTS (SELECT 1 FROM attributes a WHERE a.symbol_id = s.id
+                       AND (a.name LIKE '%PreAuthorize%'
+                            OR a.name LIKE '%Secured%'
+                            OR a.name LIKE '%RolesAllowed%'))
+       AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
+     GROUP BY s.id
+     ORDER BY input_sites DESC, s.sloc DESC LIMIT :lim"""),
 (
     "overridden-not-annotated",
     "Method overrides a parent but @Override annotation is missing (PMD/sonar)",

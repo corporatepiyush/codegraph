@@ -2545,11 +2545,10 @@ class FunctionMetrics(ast.NodeVisitor):
         # dispatch table in the repo outranks every genuinely nested loop --
         # which is exactly backwards. Cognitive complexity agrees: `else if`
         # scores one point and does not raise the nesting level.
+        # The set is filled lazily: an If's first orelse element is an elif and
+        # is visited immediately after the parent, so generic_visit marks it
+        # just before the descent finds it. No separate full-subtree pre-walk.
         self.elifs: set[int] = set()
-        for n in ast.walk(fn):
-            if isinstance(n, ast.If) and len(n.orelse) == 1 \
-                    and isinstance(n.orelse[0], ast.If):
-                self.elifs.add(id(n.orelse[0]))
 
     def bump(self, key: str, n: int = 1) -> None:
         self.m[key] = self.m.get(key, 0) + n
@@ -2575,6 +2574,13 @@ class FunctionMetrics(ast.NodeVisitor):
             self.bump("n_loops")
             if node.orelse:
                 self.bump("n_loop_else")
+
+        if isinstance(node, ast.If) and len(node.orelse) == 1 \
+                and isinstance(node.orelse[0], ast.If):
+            # The orelse[0] child is an elif and is visited right after this
+            # node, so marking it here (before the descent) is equivalent to
+            # the old full-subtree pre-walk.
+            self.elifs.add(id(node.orelse[0]))
 
         self._measure(node)
 
@@ -2776,7 +2782,7 @@ class FunctionMetrics(ast.NodeVisitor):
         elif isinstance(v, float):
             self.bump("n_float_lit")
         if isinstance(v, str) and len(v) >= SECRET_MIN_LEN \
-                and SECRET_RE.search(v):
+                and " " not in v and SECRET_RE.search(v):
             # G07: keyword-named string of credential length. The value is
             # kept whole (up to the 200-char truncation at flush) so the
             # query can show the candidate without re-reading source.
@@ -3194,6 +3200,7 @@ CREATE INDEX idx_dyn_kind ON dynamic_sites(kind, symbol_id);
 CREATE INDEX idx_comp_sym ON comprehensions(symbol_id, kind);
 CREATE INDEX idx_mv_mutable ON module_vars(file_id) WHERE is_mutable_container=1;
 CREATE INDEX idx_uinput_kind ON user_input_sites(kind, symbol_id);
+CREATE INDEX idx_uinput_sym ON user_input_sites(symbol_id);
 CREATE INDEX idx_uinput_var ON user_input_sites(var);
 CREATE INDEX idx_fn_mutdef ON symbols(n_mutable_default DESC, name, file_id)
     WHERE n_mutable_default>0;
@@ -4207,24 +4214,29 @@ QUERIES: list[tuple[str, str, str, str]] = [
     "     auth check this cannot see. Depth capped at 5; deeper paths are missed.",
     """WITH RECURSIVE reach(root, sym, depth) AS (
         SELECT s.id, s.id, 0 FROM symbols s
-        WHERE s.is_public=1 AND s.kind IN ('function','method')
+        JOIN files f0 ON f0.id=s.file_id
+        WHERE (s.n_exec + s.n_deserialize + s.n_shell_true) > 0
+          AND f0.is_test=0 AND f0.is_generated=0
         UNION
-        SELECT r.root, e.callee_id, r.depth+1
-        FROM reach r JOIN edges e ON e.caller_id=r.sym
+        SELECT r.root, e.caller_id, r.depth+1
+        FROM reach r JOIN edges e ON e.callee_id=r.sym
         WHERE r.depth < 5 AND e.is_self=0)
     SELECT sink.name AS sink, sink.n_exec AS exec_, sink.n_deserialize AS unpickle,
         sink.n_shell AS shell, sink.n_shell_true AS shell_true,
-        MIN(r.depth) AS hops_from_public,
-        COUNT(DISTINCT r.root) AS reachable_from,
+        MIN(CASE WHEN anc.is_public=1 AND anc.kind IN ('function','method')
+                 THEN r.depth END) AS hops_from_public,
+        COUNT(DISTINCT CASE WHEN anc.is_public=1 AND anc.kind IN ('function','method')
+                            THEN r.sym END) AS reachable_from,
         f.path || ':' || sink.line_start AS at
     FROM reach r
-    JOIN symbols sink ON sink.id=r.sym
-    JOIN files f ON f.id=sink.file_id
-    LEFT JOIN modules m ON m.id=sink.module_id
-    WHERE (sink.n_exec + sink.n_deserialize + sink.n_shell_true) > 0
-      AND f.is_test=0 AND f.is_generated=0
+    JOIN symbols sink ON sink.id = r.root
+    JOIN symbols anc ON anc.id = r.sym
+    JOIN files f ON f.id = sink.file_id
+    LEFT JOIN modules m ON m.id = sink.module_id
+    WHERE f.is_test=0 AND f.is_generated=0
       AND COALESCE(m.name,'') LIKE :mod
     GROUP BY sink.id
+    HAVING reachable_from > 0
     ORDER BY hops_from_public ASC, reachable_from DESC LIMIT :lim"""),
 (
     "sql-built-by-hand",
@@ -4571,10 +4583,12 @@ QUERIES: list[tuple[str, str, str, str]] = [
     "     comes along unchanged -- a pickle of a constant is still counted.",
     """WITH RECURSIVE walk(root, sym, depth) AS (
         SELECT s.id, s.id, 0 FROM symbols s
-        WHERE s.is_entrypoint = 1 OR s.is_public = 1
+        JOIN files f0 ON f0.id=s.file_id
+        WHERE (s.n_pickle_load + s.n_yaml_load + s.n_eval_exec) > 0
+          AND f0.is_test = 0
         UNION
-        SELECT w.root, e.callee_id, w.depth + 1
-        FROM walk w JOIN edges e ON e.caller_id = w.sym
+        SELECT w.root, e.caller_id, w.depth + 1
+        FROM walk w JOIN edges e ON e.callee_id = w.sym
         WHERE w.depth < 4 AND e.is_self = 0),      -- depth bound: 4 hops
     reach(root, sym, depth) AS (
         SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
@@ -4584,11 +4598,11 @@ QUERIES: list[tuple[str, str, str, str]] = [
         s.fan_in, m.name AS module_,
         f.path || ':' || s.line_start AS at
     FROM reach r
-    JOIN symbols s ON s.id = r.sym
-    JOIN symbols src ON src.id = r.root
+    JOIN symbols s ON s.id = r.root
+    JOIN symbols src ON src.id = r.sym
     JOIN files f ON f.id = s.file_id
     LEFT JOIN modules m ON m.id = s.module_id
-    WHERE (s.n_pickle_load + s.n_yaml_load + s.n_eval_exec) > 0
+    WHERE (src.is_entrypoint = 1 OR src.is_public = 1)
       AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id, src.id
     ORDER BY hops ASC, (s.n_pickle_load + s.n_eval_exec) DESC LIMIT :lim"""),
@@ -4978,7 +4992,7 @@ QUERIES: list[tuple[str, str, str, str]] = [
     LEFT JOIN modules m ON m.id = s.module_id
     LEFT JOIN user_input_sites u ON u.symbol_id = s.id
     WHERE s.n_redirect > 0 AND u.kind IS NOT NULL
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY s.fan_in DESC, s.n_redirect DESC LIMIT :lim"""),
 (
@@ -5003,7 +5017,7 @@ QUERIES: list[tuple[str, str, str, str]] = [
     LEFT JOIN modules m ON m.id = s.module_id
     LEFT JOIN user_input_sites u ON u.symbol_id = s.id
     WHERE s.n_fetch > 0 AND u.kind IS NOT NULL
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY s.n_fetch DESC, input_sites DESC LIMIT :lim"""),
 (
@@ -5024,7 +5038,9 @@ QUERIES: list[tuple[str, str, str, str]] = [
     JOIN symbols s ON s.id = sc.symbol_id
     JOIN files f ON f.id = sc.file_id
     LEFT JOIN modules m ON m.id = s.module_id
-    WHERE f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    WHERE f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND sc.value NOT LIKE '/%' AND instr(sc.value, '|') = 0
+      AND instr(sc.value, '%') = 0
     ORDER BY length(sc.value) DESC, s.fan_in DESC LIMIT :lim"""),
 (
     "xxe-parser-surface",
@@ -5040,7 +5056,7 @@ QUERIES: list[tuple[str, str, str, str]] = [
         s.sloc, f.path || ':' || s.line_start AS at
     FROM symbols s JOIN files f ON f.id = s.file_id
     LEFT JOIN modules m ON m.id = s.module_id
-    WHERE s.n_xxe_parser > 0 AND f.is_generated = 0
+    WHERE s.n_xxe_parser > 0 AND f.is_test = 0 AND f.is_generated = 0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.n_xxe_parser DESC, s.sloc DESC LIMIT :lim"""),
 (
@@ -5065,7 +5081,7 @@ QUERIES: list[tuple[str, str, str, str]] = [
     LEFT JOIN modules m ON m.id = s.module_id
     LEFT JOIN user_input_sites u ON u.symbol_id = s.id
     WHERE s.n_dynamic_open > 0 AND u.kind IS NOT NULL
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY s.n_dynamic_open DESC, input_sites DESC LIMIT :lim"""),
 (
@@ -5088,7 +5104,7 @@ QUERIES: list[tuple[str, str, str, str]] = [
     LEFT JOIN modules m ON m.id = s.module_id
     LEFT JOIN user_input_sites u ON u.symbol_id = s.id AND u.kind = 'form'
     WHERE s.n_upload_save > 0 AND u.kind IS NOT NULL
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY s.n_upload_save DESC, form_reads DESC LIMIT :lim"""),
 (
@@ -5106,7 +5122,7 @@ QUERIES: list[tuple[str, str, str, str]] = [
         s.fan_in, f.path || ':' || s.line_start AS at
     FROM symbols s JOIN files f ON f.id = s.file_id
     LEFT JOIN modules m ON m.id = s.module_id
-    WHERE s.n_zip_read > 0 AND f.is_generated = 0
+    WHERE s.n_zip_read > 0 AND f.is_test = 0 AND f.is_generated = 0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.fan_in DESC, s.n_zip_read DESC LIMIT :lim"""),
 (
@@ -5132,7 +5148,7 @@ QUERIES: list[tuple[str, str, str, str]] = [
     LEFT JOIN modules m ON m.id = s.module_id
     LEFT JOIN user_input_sites u ON u.symbol_id = s.id
     WHERE s.n_log_call > 0 AND u.kind IS NOT NULL
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY s.n_log_call DESC, input_sites DESC LIMIT :lim"""),
 (
@@ -5145,11 +5161,11 @@ QUERIES: list[tuple[str, str, str, str]] = [
     "ACT add the auth/decorator check; verify the endpoint is in the\n"
     "     protected route group.\n"
     "MISLEADS auth may live on a DECORATOR, a base view class, or a\n"
-    "     middleware -- same-function co-occurrence only, so a protected\n"
-    "     handler whose check lives outside the body reads as open. A login\n"
-    "     or registration endpoint legitimately has no auth. The markers are\n"
-    "     name-based substrings, so a helper wrapping the auth call is\n"
-    "     invisible and counts as open.",
+    "     middleware -- decorators ARE visible (attributes table) and exclude\n"
+    "     a symbol; a base-class or middleware check still reads as open. A\n"
+    "     login or registration endpoint legitimately has no auth. The\n"
+    "     markers are name-based substrings, so a helper wrapping the auth\n"
+    "     call is invisible and counts as open.",
     """SELECT s.name, COUNT(DISTINCT u.id) AS input_sites,
         GROUP_CONCAT(DISTINCT u.kind) AS kinds,
         f.path || ':' || s.line_start AS at
@@ -5158,7 +5174,11 @@ QUERIES: list[tuple[str, str, str, str]] = [
     LEFT JOIN modules m ON m.id = s.module_id
     LEFT JOIN user_input_sites u ON u.symbol_id = s.id
     WHERE u.kind IS NOT NULL AND s.n_auth_call = 0
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND NOT EXISTS (SELECT 1 FROM attributes a WHERE a.symbol_id = s.id
+                      AND (a.name LIKE '%login_required%'
+                           OR a.name LIKE '%permission_required%'))
+      AND f.is_test = 0 AND f.is_generated = 0
+      AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY input_sites DESC, s.sloc DESC LIMIT :lim"""),
 (
@@ -5393,17 +5413,20 @@ METRICS = [
     "MISLEADS a resolved call can still be wrong -- name-based resolution picks\n"
     "     the unique definition of a name, and two classes with the same method\n"
     "     name are refused rather than guessed, landing here instead.",
-    """SELECT m.name AS module,
+    """WITH ds AS (
+        SELECT s2.module_id AS mid, COUNT(*) AS n
+        FROM dynamic_sites d JOIN symbols s2 ON s2.id=d.symbol_id
+        GROUP BY s2.module_id)
+    SELECT m.name AS module,
         COUNT(DISTINCT s.id) AS fns,
         COALESCE(SUM(s.n_calls),0) AS calls,
         COALESCE(SUM(s.n_unresolved_calls),0) AS unresolved,
         COALESCE(SUM(s.n_dynamic_calls),0) AS computed,
-        (SELECT COUNT(*) FROM dynamic_sites d
-         JOIN symbols s2 ON s2.id=d.symbol_id
-         WHERE s2.module_id=m.id) AS reflect_sites,
+        COALESCE(ds.n, 0) AS reflect_sites,
         CAST(100.0 * SUM(s.n_unresolved_calls)
              / NULLIF(SUM(s.n_calls),0) AS INT) AS pct_blind
     FROM symbols s JOIN modules m ON m.id=s.module_id
+    LEFT JOIN ds ON ds.mid = m.id
     WHERE s.kind IN ('function','method') AND m.name LIKE :mod
     GROUP BY m.id HAVING calls > 0
     ORDER BY unresolved DESC LIMIT :lim"""),

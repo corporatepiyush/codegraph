@@ -37,3 +37,8 @@ test_repos/
 _*.py
 PLAN.md
 .audit-probes/
+
+# local measurement tooling (like qharness.py / truthcheck.py above)
+sqltime.py
+issuescan.py
+.fixscratch/

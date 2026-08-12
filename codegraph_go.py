@@ -1094,6 +1094,7 @@ CREATE INDEX idx_imp_target ON imports(target);
 CREATE INDEX idx_imp_file ON imports(file_id, target);
 CREATE INDEX idx_imp_resolved ON imports(target_id) WHERE target_id IS NOT NULL;
 CREATE INDEX idx_imp_external ON imports(target) WHERE is_external=1;
+CREATE INDEX idx_imp_intra ON imports(file_id) WHERE is_external=0;
 
 CREATE INDEX idx_params_sym ON params(symbol_id, pos);
 CREATE INDEX idx_params_type ON params(type);
@@ -4032,9 +4033,11 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
 
     def on_string(self, node: Any, text: str, src: bytes, st: BodyStats,
                   loop_depth: int) -> None:
-        if len(text) >= SECRET_MIN_LEN and SECRET_RE.search(text):
+        val = text.strip('"\'')
+        if len(val) >= SECRET_MIN_LEN and " " not in val \
+            and SECRET_RE.search(val):
             # G07: credential-shaped literal -- candidate, not verdict
-            st.secrets.append((text[:200], node.start_point[0] + 1))
+            st.secrets.append((val[:200], node.start_point[0] + 1))
         if SQL_RE.search(text):
             st.bump("n_sql_literal")
             parent = node.parent
@@ -4072,7 +4075,7 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
         src = rec.data
         loop_types = set(self.LOOP_NODES)
 
-        for n in walk(body):
+        for n, _depth in walk_cursor(body):
             if n.type == "go_statement":
                 depth = _ancestor_loop_depth(n, body, loop_types)
                 inner = n.named_children[0] if n.named_children else None
@@ -4179,7 +4182,7 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
 
     def parse_imports(self, root: Any, rec: FileRec, bufs: Buffers) -> None:
         src = rec.data
-        for n in walk(root):
+        for n, _depth in walk_cursor(root):
             if n.type != "import_spec":
                 continue
             p = n.child_by_field_name("path")
@@ -4249,12 +4252,14 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
         that uses this says so.
         """
         methods_by_type: dict[str, set[str]] = {}
+        types_by_method: dict[str, set[str]] = {}
         test_types: set[str] = set()
         for name, recv, in_test in db.execute(
                 "SELECT s.name, s.receiver_type, f.is_test FROM symbols s "
                 "JOIN files f ON f.id=s.file_id "
                 "WHERE s.kind='method' AND s.receiver_type <> ''"):
             methods_by_type.setdefault(recv, set()).add(name)
+            types_by_method.setdefault(name, set()).add(recv)
             if in_test:
                 test_types.add(recv)
 
@@ -4266,8 +4271,15 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
             want = {m for m in mstr.split(",") if m}
             if not want:
                 continue
-            for tname, have in methods_by_type.items():
-                if want <= have:
+            # Drive from the method side: only types that have EVERY interface
+            # method can possibly satisfy it, so intersect the per-method type
+            # sets first; the exact subset check then runs over a few
+            # candidates, not all 25k types. Same pair set, ~3.5x faster.
+            it = iter(types_by_method.get(m, set()) for m in want)
+            cand = set(next(it))
+            cand.intersection_update(*it)
+            for tname in cand:
+                if want <= methods_by_type[tname]:
                     rows.append((tname, iid, iname, len(want),
                                  int(tname in test_types)))
         if rows:
@@ -5532,7 +5544,7 @@ WITH RECURSIVE down(root, sym, depth) AS (
     WHERE h.pattern IN ('log.Fatal','log.Fatalf','log.Fatalln',
                         'log.Panic','log.Panicf')
       AND s.n_env_read > 0
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     ORDER BY h.n DESC, s.n_env_read DESC
     LIMIT :lim"""),
 (
@@ -5559,7 +5571,7 @@ WITH RECURSIVE down(root, sym, depth) AS (
     LEFT JOIN modules m ON m.id = s.module_id
     LEFT JOIN user_input_sites u ON u.symbol_id = s.id
     WHERE s.n_redirect > 0 AND u.kind IS NOT NULL
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY s.fan_in DESC, s.n_redirect DESC LIMIT :lim"""),
 (
@@ -5580,7 +5592,9 @@ WITH RECURSIVE down(root, sym, depth) AS (
     JOIN symbols s ON s.id = sc.symbol_id
     JOIN files f ON f.id = sc.file_id
     LEFT JOIN modules m ON m.id = s.module_id
-    WHERE f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+    WHERE f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND sc.value NOT LIKE '/%' AND instr(sc.value, '|') = 0
+      AND instr(sc.value, '%') = 0
     ORDER BY length(sc.value) DESC LIMIT :lim"""),
 (
     "untrusted-deserialization",
@@ -5604,7 +5618,7 @@ WITH RECURSIVE down(root, sym, depth) AS (
     LEFT JOIN modules m ON m.id = s.module_id
     LEFT JOIN user_input_sites u ON u.symbol_id = s.id
     WHERE s.n_deserialize > 0 AND u.kind IS NOT NULL
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY s.n_deserialize DESC, input_sites DESC LIMIT :lim"""),
 (
@@ -5629,7 +5643,7 @@ WITH RECURSIVE down(root, sym, depth) AS (
     LEFT JOIN modules m ON m.id = s.module_id
     LEFT JOIN user_input_sites u ON u.symbol_id = s.id
     WHERE s.n_dynamic_open > 0 AND u.kind IS NOT NULL
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY s.n_dynamic_open DESC, input_sites DESC LIMIT :lim"""),
 (
@@ -5647,7 +5661,7 @@ WITH RECURSIVE down(root, sym, depth) AS (
         s.sloc, f.path || ':' || s.line_start AS at
     FROM symbols s JOIN files f ON f.id = s.file_id
     LEFT JOIN modules m ON m.id = s.module_id
-    WHERE s.n_zip_read > 0 AND f.is_generated = 0
+    WHERE s.n_zip_read > 0 AND f.is_test = 0 AND f.is_generated = 0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.n_zip_read DESC, s.sloc DESC LIMIT :lim"""),
 (
@@ -5671,7 +5685,7 @@ WITH RECURSIVE down(root, sym, depth) AS (
     LEFT JOIN modules m ON m.id = s.module_id
     LEFT JOIN user_input_sites u ON u.symbol_id = s.id AND u.kind = 'body'
     WHERE s.n_deserialize > 0 AND u.kind IS NOT NULL
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY s.n_deserialize DESC, body_reads DESC LIMIT :lim"""),
 (
@@ -5695,7 +5709,7 @@ WITH RECURSIVE down(root, sym, depth) AS (
     LEFT JOIN modules m ON m.id = s.module_id
     LEFT JOIN user_input_sites u ON u.symbol_id = s.id
     WHERE u.kind IS NOT NULL AND s.n_auth_call = 0
-      AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
+      AND f.is_test = 0 AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY s.id
     ORDER BY input_sites DESC, s.sloc DESC LIMIT :lim"""),
 (
@@ -5928,13 +5942,16 @@ GoAnalyzer.METRICS = [
     "     type with Close() error matches an interface wanting Close() even\n"
     "     where the Go compiler would not. It also sees only types in THIS\n"
     "     tree, so an implementor in another module is invisible.",
-    """SELECT s.name AS iface, i.n_methods AS methods,
+    """WITH t AS (
+        SELECT substr(type,
+                length(rtrim(type, 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_')) + 1)
+            AS tail_ident, COUNT(*) AS n
+        FROM params
+        GROUP BY tail_ident)
+    SELECT s.name AS iface, i.n_methods AS methods,
         i.n_embedded AS embedded, i.is_exported AS exported,
         i.is_constraint AS type_constraint,
-        (SELECT COUNT(*) FROM params p
-         WHERE substr(p.type, -length(s.name)) = s.name
-           AND (length(p.type) = length(s.name)
-                OR instr('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_', substr(p.type, -length(s.name)-1, 1)) = 0)) AS used_as_param,
+        COALESCE(SUM(t.n), 0) AS used_as_param,
         (SELECT COUNT(*) FROM implements im
          WHERE im.interface_id=s.id AND im.in_test=0) AS impls,
         (SELECT COUNT(*) FROM implements im2
@@ -5947,6 +5964,7 @@ GoAnalyzer.METRICS = [
     JOIN symbols s ON s.id=i.symbol_id
     JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
+    LEFT JOIN t ON t.tail_ident = s.name
     WHERE i.is_constraint=0 AND i.n_methods > 0
       AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
       AND (SELECT COUNT(*) FROM implements im4
