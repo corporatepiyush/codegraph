@@ -6299,15 +6299,18 @@ RustAnalyzer.QUERIES = [
     "     (no textual use path) reads as unused; workspace members and\n"
     "     target-specific deps in non-root manifests are included only if\n"
     "     the member Cargo.toml was read.",
-    """    SELECT d.name, d.version, d.is_dev,
-        (SELECT COUNT(*) FROM imports i
-          WHERE i.target = d.name
-             OR substr(i.target, 1, length(d.name) + 2) = d.name || '::')
-            AS used
+    """    WITH used(dn, dv, dd) AS (
+        SELECT d.name, d.version, d.is_dev FROM deps d
+        JOIN imports i ON i.target = d.name
+        UNION
+        SELECT d.name, d.version, d.is_dev FROM deps d
+        JOIN imports i ON i.target >= d.name || '::'
+                       AND i.target < d.name || '::' || X'FF')
+    SELECT d.name, d.version, d.is_dev, 0 AS used
     FROM deps d
-    WHERE (SELECT COUNT(*) FROM imports i
-            WHERE i.target = d.name
-               OR substr(i.target, 1, length(d.name) + 2) = d.name || '::') = 0
+    WHERE NOT EXISTS (SELECT 1 FROM used u
+                      WHERE u.dn = d.name AND u.dv = d.version
+                        AND u.dd = d.is_dev)
     ORDER BY d.is_dev, d.name
     LIMIT :lim""")
 ]

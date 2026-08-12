@@ -3601,8 +3601,11 @@ WHERE x.id = c.symbol_id;
             sloc=sum(1 for l in src_lines if l.strip()),
             is_generated=int(rec.is_generated),
             is_test=int(rec.is_test),
-            has_doc=1 if docstring_lines(tree) else 0,
-            n_doc_lines=docstring_lines(tree),
+        )
+        doc_n = docstring_lines(tree)
+        m.update(
+            has_doc=1 if doc_n else 0,
+            n_doc_lines=doc_n,
             is_entrypoint=1 if is_dunder_main(tree) else 0,
         )
         sid = self._insert_symbol(
@@ -3636,6 +3639,7 @@ WHERE x.id = c.symbol_id;
                  + [(a, "kwonly") for a in args.kwonlyargs])
         n_pos = len(args.posonlyargs) + len(args.args)
         defaults_start = n_pos - len(args.defaults)
+        kw_idx = 0
 
         for a, kind in named:
             default: Optional[ast.expr] = None
@@ -3644,9 +3648,11 @@ WHERE x.id = c.symbol_id;
                 if 0 <= idx < len(args.defaults):
                     default = args.defaults[idx]
             elif kind == "kwonly":
-                idx = args.kwonlyargs.index(a)
-                if idx < len(args.kw_defaults):
-                    default = args.kw_defaults[idx]
+                # kw_defaults aligns with kwonlyargs by position; the old
+                # `args.kwonlyargs.index(a)` was an O(kwonly) scan per arg.
+                if kw_idx < len(args.kw_defaults):
+                    default = args.kw_defaults[kw_idx]
+                kw_idx += 1
 
             mutable = default is not None and (
                 isinstance(default, (ast.List, ast.Dict, ast.Set))

@@ -3935,6 +3935,13 @@ CREATE TABLE secret_candidates(
     value TEXT NOT NULL,
     line INT NOT NULL
 ) STRICT;
+
+CREATE TABLE reach(
+    root INT NOT NULL,
+    sym INT NOT NULL,
+    min_depth INT NOT NULL,
+    PRIMARY KEY(root, sym)
+) WITHOUT ROWID, STRICT;
 """
 
     INDEX_EXT = r"""
@@ -3945,6 +3952,7 @@ CREATE INDEX idx_secret_sym ON secret_candidates(symbol_id);
 CREATE INDEX idx_tr_child ON type_relations(child_name);
 CREATE INDEX idx_tr_sym ON type_relations(child_id);
 CREATE INDEX idx_ovr_name ON overrides(method_name, owner_type);
+CREATE INDEX ix_reach_sym ON reach(sym, root);
 CREATE INDEX idx_ovr_parent ON overrides(parent_type);
 CREATE INDEX idx_ovr_sym ON overrides(symbol_id);
 CREATE INDEX idx_exc_sym ON exceptions(symbol_id, kind);
@@ -4059,6 +4067,26 @@ UPDATE symbols SET arity_rank = CASE
     WHEN n_params <= 1 THEN 0 WHEN n_params <= 3 THEN 1
     WHEN n_params <= 6 THEN 2 ELSE 3 END
     WHERE kind IN ('function','method','constructor','closure');
+
+-- Shared 4-hop reachability closure for the sink-frontier family
+-- (native-surface-reachable, reflection-frontier, deserialization-reachability,
+-- vt-pinning-frontier). Built BACKWARD from the union of all four sinks so it
+-- captures exactly the (root, sink) pairs those queries emit: ~5k rows instead
+-- of ~147k for the forward closure, ~74ms instead of ~278ms on netty. The sink
+-- predicate below MUST stay a superset of the four queries' sink WHERE clauses
+-- -- if a query adds a sink column, extend this OR or that query silently
+-- loses rows.
+WITH RECURSIVE back(sym, root, depth) AS (
+    SELECT s.id, s.id, 0 FROM symbols s
+    WHERE (n_reflection>0 OR n_setaccessible>0 OR n_serialization>0
+           OR n_runtime_exec>0 OR n_read_object>0 OR n_load_library>0
+           OR n_raw_statement>0 OR n_jni>0 OR n_native_calls>0 OR n_ffm_downcall>0)
+    UNION
+    SELECT b.sym, e.caller_id, b.depth+1 FROM back b
+    JOIN edges e ON e.callee_id = b.root
+    WHERE b.depth < 4 AND e.is_self = 0)
+INSERT INTO reach(root, sym, min_depth)
+SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
 """
 
     RISK_SQL = (
@@ -5377,28 +5405,23 @@ JavaAnalyzer.QUERIES = [
     "     this is a floor, never a ceiling. Reflection that goes through a\n"
     "     framework -- which is most of it -- has no edge at all and cannot\n"
     "     appear. Check graph-blindspots for the module first.",
-    """WITH RECURSIVE roots(id) AS (
-        SELECT id FROM symbols
-        WHERE (is_handler=1 OR is_entrypoint=1 OR (is_public=1 AND fan_in=0))
-          AND kind IN ('function','method','constructor')),
-    down(sym, depth) AS (
-        SELECT id, 0 FROM roots
-        UNION
-        SELECT e.callee_id, d.depth+1 FROM down d
-        JOIN edges e ON e.caller_id=d.sym
-        WHERE d.depth < 4 AND e.is_self=0),   -- depth bound: 4 hops
-    best AS (SELECT sym, MIN(depth) AS depth FROM down GROUP BY sym)
-    SELECT s.name, s.owner_type AS owner, b.depth AS hops_from_api,
+    """SELECT s.name, s.owner_type AS owner, MIN(r.min_depth) AS hops_from_api,
         s.n_reflection AS reflect_ops, s.n_setaccessible AS set_accessible,
         s.n_serialization AS deser_ops, s.n_jni AS jni,
         s.fan_in, s.is_public AS public_,
         f.path || ':' || s.line_start AS at
-    FROM best b JOIN symbols s ON s.id=b.sym
+    FROM reach r
+    JOIN symbols root ON root.id=r.root
+    JOIN symbols s ON s.id=r.sym
     JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
-    WHERE (s.n_reflection > 0 OR s.n_setaccessible > 0)
+    WHERE (root.is_handler=1 OR root.is_entrypoint=1
+           OR (root.is_public=1 AND root.fan_in=0))
+      AND root.kind IN ('function','method','constructor')
+      AND (s.n_reflection > 0 OR s.n_setaccessible > 0)
       AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY b.depth ASC, s.n_setaccessible DESC, s.n_reflection DESC
+    GROUP BY s.id
+    ORDER BY hops_from_api ASC, s.n_setaccessible DESC, s.n_reflection DESC
     LIMIT :lim"""),
 (
     "deserialization-reachability",
@@ -5414,18 +5437,7 @@ JavaAnalyzer.QUERIES = [
     "     not a vulnerability: it is a vulnerability when the bytes are\n"
     "     attacker-controlled, which this cannot see. Jackson without\n"
     "     enableDefaultTyping is not the gadget-chain shape.",
-    """WITH RECURSIVE roots(id) AS (
-        SELECT id FROM symbols
-        WHERE (is_handler=1 OR is_entrypoint=1 OR (is_public=1 AND fan_in=0))
-          AND kind IN ('function','method','constructor')),
-    down(sym, depth) AS (
-        SELECT id, 0 FROM roots
-        UNION
-        SELECT e.callee_id, d.depth+1 FROM down d
-        JOIN edges e ON e.caller_id=d.sym
-        WHERE d.depth < 4 AND e.is_self=0),   -- depth bound: 4 hops
-    best AS (SELECT sym, MIN(depth) AS depth FROM down GROUP BY sym)
-    SELECT s.name, s.owner_type AS owner, b.depth AS hops_from_api,
+    """SELECT s.name, s.owner_type AS owner, MIN(r.min_depth) AS hops_from_api,
         s.n_serialization AS deser_ops, s.n_reflection AS reflect_ops,
         (SELECT GROUP_CONCAT(DISTINCT h.pattern) FROM hazards h
          WHERE h.symbol_id=s.id AND h.category='serialization') AS sinks,
@@ -5433,12 +5445,18 @@ JavaAnalyzer.QUERIES = [
          WHERE t.module_id=s.module_id AND t.is_serializable=1
            AND t.has_serial_uid=0) AS serial_types_no_uid,
         s.fan_in, f.path || ':' || s.line_start AS at
-    FROM best b JOIN symbols s ON s.id=b.sym
+    FROM reach r
+    JOIN symbols root ON root.id=r.root
+    JOIN symbols s ON s.id=r.sym
     JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
-    WHERE s.n_serialization > 0 AND f.is_test=0
+    WHERE (root.is_handler=1 OR root.is_entrypoint=1
+           OR (root.is_public=1 AND root.fan_in=0))
+      AND root.kind IN ('function','method','constructor')
+      AND s.n_serialization > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY b.depth ASC, s.n_serialization DESC LIMIT :lim"""),
+    GROUP BY s.id
+    ORDER BY hops_from_api ASC, s.n_serialization DESC LIMIT :lim"""),
 (
     "resource-open-never-closed",
     "Opened here, closed somewhere else -- or nowhere",
@@ -5558,26 +5576,21 @@ JavaAnalyzer.QUERIES = [
     "     meta.java_release first: below 21 there are no virtual threads and\n"
     "     every row here is inapplicable; below 24 synchronized pins too and\n"
     "     this query is then INCOMPLETE rather than wrong.",
-    """WITH RECURSIVE down(root, sym, depth) AS (
-        SELECT id, id, 0 FROM symbols WHERE is_virtual_thread_root=1
-        UNION
-        SELECT d.root, e.callee_id, d.depth+1 FROM down d
-        JOIN edges e ON e.caller_id=d.sym
-        WHERE d.depth < 4 AND e.is_self=0)    -- depth bound: 4 hops
-    SELECT r.name AS vt_root, r.owner_type AS root_owner,
+    """SELECT r.name AS vt_root, r.owner_type AS root_owner,
         s.name AS pins_in, s.owner_type AS owner,
-        MIN(d.depth) AS hops,
+        MIN(rr.min_depth) AS hops,
         s.n_jni AS jni_ops, s.n_native_calls AS native_,
         s.n_ffm_downcall AS ffm_downcall, s.n_ffm_arena AS ffm_arena,
         s.n_unsafe_calls AS unsafe_,
         s.n_synchronized_blocks AS synchronized_not_a_finding,
         f.path || ':' || s.line_start AS at
-    FROM down d
-    JOIN symbols s ON s.id=d.sym
-    JOIN symbols r ON r.id=d.root
+    FROM reach rr
+    JOIN symbols s ON s.id=rr.sym
+    JOIN symbols r ON r.id=rr.root
     JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
-    WHERE (s.n_jni > 0 OR s.n_native_calls > 0 OR s.n_ffm_downcall > 0)
+    WHERE r.is_virtual_thread_root=1
+      AND (s.n_jni > 0 OR s.n_native_calls > 0 OR s.n_ffm_downcall > 0)
       AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY r.id, s.id
     ORDER BY hops ASC, s.n_ffm_downcall DESC, s.n_jni DESC LIMIT :lim"""),
@@ -5886,16 +5899,7 @@ WITH fld AS (
     "MISLEADS reachability is not taint. A method may reach exec() and pass it\n"
     "     only a constant. Depth is bounded at 4 hops, so a deeper path is not\n"
     "     seen, and reflection or a DI container breaks the edge entirely.",
-    """WITH RECURSIVE walk(root, sym, depth) AS (
-        SELECT s.id, s.id, 0 FROM symbols s
-        WHERE (s.is_entrypoint = 1 OR s.is_public = 1 OR s.is_handler = 1)
-        UNION
-        SELECT w.root, e.callee_id, w.depth + 1
-        FROM walk w JOIN edges e ON e.caller_id = w.sym
-        WHERE w.depth < 4 AND e.is_self = 0),      -- depth bound: 4 hops
-    reach(root, sym, depth) AS (
-        SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
-    SELECT s.name, entry.name AS reached_from, MIN(r.depth) AS hops,
+    """SELECT s.name, entry.name AS reached_from, r.min_depth AS hops,
         s.n_runtime_exec AS exec_calls, s.n_read_object AS deserializes,
         s.n_load_library AS loads_native, s.n_raw_statement AS raw_sql,
         s.fan_in, f.path || ':' || s.line_start AS at
@@ -5905,11 +5909,11 @@ WITH fld AS (
     JOIN files f ON f.id = s.file_id
     JOIN files ef ON ef.id = entry.file_id
     LEFT JOIN modules m ON m.id = s.module_id
-    WHERE (s.n_runtime_exec > 0 OR s.n_read_object > 0
+    WHERE (entry.is_entrypoint=1 OR entry.is_public=1 OR entry.is_handler=1)
+      AND (s.n_runtime_exec > 0 OR s.n_read_object > 0
            OR s.n_load_library > 0 OR s.n_raw_statement > 0)
-      AND r.depth > 0 AND f.is_test = 0 AND ef.is_test = 0
-      AND COALESCE(m.name,\'\') LIKE :mod
-    GROUP BY s.id, entry.id
+      AND r.min_depth > 0 AND f.is_test = 0 AND ef.is_test = 0
+      AND COALESCE(m.name,'') LIKE :mod
     ORDER BY hops ASC, exec_calls DESC, deserializes DESC,
         s.fan_in DESC LIMIT :lim"""),
 (
