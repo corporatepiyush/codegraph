@@ -2540,6 +2540,9 @@ class FunctionMetrics(ast.NodeVisitor):
         self.input_sites: list[tuple[int, str, str, int]] = []
         #: (value, line) -- G07 credential-shaped string literals
         self.secrets: list[tuple[str, int]] = []
+        #: (kind, line, n_generators, n_ifs, is_async) per comprehension --
+        #: collected during the main walk so no second subtree pass is needed
+        self.comp_rows: list[tuple[str, int, int, int, int]] = []
         # `elif` is `If` inside the parent's `orelse`, so a flat 30-arm chain
         # looks 30 levels deep to a naive AST walk. Left uncorrected, every
         # dispatch table in the repo outranks every genuinely nested loop --
@@ -2698,6 +2701,15 @@ class FunctionMetrics(ast.NodeVisitor):
                 self.bump("n_comp_ifs", len(g.ifs))
                 if g.is_async:
                     self.bump("n_async_comprehension")
+            # Site row for `comprehensions`, collected here so the writer no
+            # longer re-walks the whole subtree looking for COMP_NODES.
+            self.comp_rows.append(
+                (kind := {ast.ListComp: "list", ast.SetComp: "set",
+                          ast.DictComp: "dict",
+                          ast.GeneratorExp: "genexp"}[t],
+                 node.lineno, len(node.generators),
+                 sum(len(g.ifs) for g in node.generators),
+                 int(any(g.is_async for g in node.generators))))
             if t is ast.GeneratorExp:
                 self.bump("n_genexp")
         elif t is ast.Assign:
@@ -3271,6 +3283,12 @@ WHERE x.id = c.symbol_id;
     def __init__(self) -> None:
         super().__init__()
         self.ts_fallback: Optional[ParserHandle] = None
+        #: lazily built from file_id: `.py` basename suffixes + path segments,
+        #: so `_external` is O(1) instead of O(files) per import (24M genexpr
+        #: iterations measured on django -- the single biggest python-side
+        #: cost). Built on first use, after file discovery has run.
+        self._py_heads: Optional[set[str]] = None
+        self._segments: Optional[set[str]] = None
         #: name -> [(symbol_id, file_id, module_id, parent_class)]
         self.by_name: dict[str, list[tuple[int, int, int, str]]] = {}
         self.by_qual: dict[str, int] = {}
@@ -3340,6 +3358,7 @@ WHERE x.id = c.symbol_id;
     # -- imports -----------------------------------------------------------
     def _imports(self, tree: ast.Module, rec: FileRec, bufs: Buffers) -> None:
         alias_map = self.aliases.setdefault(rec.fid, {})
+        has_if = any(isinstance(p, ast.If) for p in ast.walk(tree))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
@@ -3364,8 +3383,7 @@ WHERE x.id = c.symbol_id;
                      None, "from", node.lineno,
                      int(rel == 0 and self._external(mod)), int(rel > 0),
                      int(wildcard),
-                     int(any(isinstance(p, ast.If) for p in ast.walk(tree))
-                         and mod == "typing"),
+                     int(has_if and mod == "typing"),
                      0, len(node.names)))
                 root = mod.split(".")[0]
                 if root in HAZARD_IMPORTS:
@@ -3373,13 +3391,38 @@ WHERE x.id = c.symbol_id;
                         (rec.fid, root, HAZARD_IMPORTS[root], node.lineno))
 
     def _external(self, mod: str) -> bool:
-        """Best-effort: a module we did not find a file for is third-party."""
+        """Best-effort: a module we did not find a file for is third-party.
+
+        O(1) after first use: the basename-suffix and path-segment sets are
+        built once from the file inventory instead of a full scan per import
+        (the old `any(p.endswith(cand) or "/head/" in p for p in file_id)` was
+        O(imports x files), 24M genexpr iterations on django). `mod`'s head is
+        in-tree iff some file basename ENDS WITH `head.py` (a suffix match,
+        so `django/utils/_os.py` classifies `os` as in-tree) or some repo-
+        relative path has head as a mid/later directory.
+        """
         if not mod:
             return False
         head = mod.split(".")[0]
-        cand = head + ".py"
-        return not any(p.endswith(cand) or ("/%s/" % head) in p
-                       for p in self.file_id)
+        if self._py_heads is None:
+            py_heads: set[str] = set()
+            seg: set[str] = set()
+            for p in self.file_id:
+                parts = p.split("/")
+                if parts:
+                    b = parts[-1]
+                    if b.endswith(".py"):
+                        # every suffix of the basename that itself ends in
+                        # ".py" is a head that `endswith(head+'.py')` hits
+                        for i in range(len(b) - 2):
+                            if b[i:].endswith(".py"):
+                                py_heads.add(b[i:-3])
+                for part in parts[1:]:
+                    seg.add(part)
+            self._py_heads = py_heads
+            self._segments = seg
+        return head not in self._py_heads \
+            and head not in self._segments
 
     # -- module-level state ------------------------------------------------
     def _module_vars(self, tree: ast.Module, rec: FileRec, bufs: Buffers) -> None:
@@ -3552,7 +3595,9 @@ WHERE x.id = c.symbol_id;
             bufs.attributes.append(
                 (sid, rec.fid, dn or "?", type_str(d)[:200], d.lineno))
         self._handlers(node, sid, bufs)
-        self._comprehensions(node, sid, rec, bufs)
+        for ckind, cline, cgen, cifs, casync in fm.comp_rows:
+            bufs.rows("comprehensions").append(
+                (sid, rec.fid, ckind, cline, cgen, cifs, casync, 0))
         self._hazards_and_calls(fm, sid, rec, bufs)
         self._dynamic_sites(node, sid, rec, bufs)
         for lkind, lval, lline, lmagic in fm.literals:
@@ -3731,18 +3776,6 @@ WHERE x.id = c.symbol_id;
                 else:
                     walk(h, in_loop)
         walk(node, 0)
-
-    def _comprehensions(self, node: ast.AST, sid: int, rec: FileRec,
-                        bufs: Buffers) -> None:
-        for c in ast.walk(node):
-            if not isinstance(c, COMP_NODES):
-                continue
-            kind = {ast.ListComp: "list", ast.SetComp: "set",
-                    ast.DictComp: "dict", ast.GeneratorExp: "genexp"}[type(c)]
-            bufs.rows("comprehensions").append(
-                (sid, rec.fid, kind, c.lineno, len(c.generators),
-                 sum(len(g.ifs) for g in c.generators),
-                 int(any(g.is_async for g in c.generators)), 0))
 
     def _dynamic_sites(self, node: ast.AST, sid: int, rec: FileRec,
                        bufs: Buffers) -> None:
