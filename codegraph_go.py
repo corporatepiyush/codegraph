@@ -2223,6 +2223,9 @@ class BodyStats:
     input_sites: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
     #: (value, line) -- G07 credential-shaped string literals
     secrets: list[tuple[str, int]] = dc_field(default_factory=list)
+    #: (kind, node, loop_depth) -- language tables filled during the SAME walk
+    #: (goroutines/defers/channels) instead of a second traversal per symbol.
+    extra_rows: list[tuple[str, Any, int]] = dc_field(default_factory=list)
 
     def bump(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -4030,6 +4033,16 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
         elif t == "field_declaration":
             if "`" in _txt(node, src):
                 st.bump("n_struct_tags")
+        elif t == "go_statement":
+            st.extra_rows.append(("go", node, loop_depth))
+        elif t == "defer_statement":
+            st.extra_rows.append(("defer", node, loop_depth))
+        elif t == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn is not None and _txt(fn, src) == "make":
+                a = node.child_by_field_name("arguments")
+                if a is not None and "chan" in _txt(a, src):
+                    st.extra_rows.append(("chan", node, 0))
 
     def on_string(self, node: Any, text: str, src: bytes, st: BodyStats,
                   loop_depth: int) -> None:
@@ -4069,15 +4082,12 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
     def function_extra(self, node: Any, rec: FileRec, db: sqlite3.Connection,
                        bufs: Buffers, sid: int, scope: Scope,
                        stats: BodyStats) -> None:
-        body = node.child_by_field_name(self.BODY_FIELD)
-        if body is None:
-            return
+        # Rows are captured during measure's single body walk (see on_node),
+        # which tracks loop_depth itself -- this used to re-walk the whole body
+        # per symbol, 50% of the analyzer's wall time on kubernetes.
         src = rec.data
-        loop_types = set(self.LOOP_NODES)
-
-        for n, _depth in walk_cursor(body):
-            if n.type == "go_statement":
-                depth = _ancestor_loop_depth(n, body, loop_types)
+        for kind, n, depth in stats.extra_rows:
+            if kind == "go":
                 inner = n.named_children[0] if n.named_children else None
                 target = ""
                 closure = 0
@@ -4098,28 +4108,24 @@ UPDATE symbols AS s SET n_defer_close = x.c FROM
                      int("<-" in btxt),
                      int(depth > 0), depth,
                      btxt.count("\n") + 1))
-            elif n.type == "defer_statement":
-                depth = _ancestor_loop_depth(n, body, loop_types)
+            elif kind == "defer":
                 dtxt = _txt(n, src)[:160]
                 bufs.rows("defers").append(
                     (sid, n.start_point[0] + 1, dtxt[:120],
                      int(depth > 0), depth,
                      int(".Close()" in dtxt),
                      int(".Unlock()" in dtxt or ".RUnlock()" in dtxt)))
-            elif n.type == "call_expression":
-                fn = n.child_by_field_name("function")
-                if fn is not None and _txt(fn, src) == "make":
-                    a = n.child_by_field_name("arguments")
-                    if a is not None and "chan" in _txt(a, src):
-                        kids = list(a.named_children)
-                        cap_ = 0
-                        if len(kids) > 1:
-                            ct = _txt(kids[1], src).strip()
-                            cap_ = int(ct) if ct.isdigit() else -1
-                        bufs.rows("channels").append(
-                            (sid, rec.fid, "",
-                             _txt(kids[0], src)[:80] if kids else "",
-                             cap_, n.start_point[0] + 1, 0))
+            elif kind == "chan":
+                a = n.child_by_field_name("arguments")
+                kids = list(a.named_children)
+                cap_ = 0
+                if len(kids) > 1:
+                    ct = _txt(kids[1], src).strip()
+                    cap_ = int(ct) if ct.isdigit() else -1
+                bufs.rows("channels").append(
+                    (sid, rec.fid, "",
+                     _txt(kids[0], src)[:80] if kids else "",
+                     cap_, n.start_point[0] + 1, 0))
 
     def type_extra(self, node: Any, rec: FileRec, db: sqlite3.Connection,
                    bufs: Buffers, sid: int, scope: Scope) -> None:
