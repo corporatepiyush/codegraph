@@ -2496,19 +2496,10 @@ INTRIN_NAME_RE = re.compile(
     r'^(?:v[a-z0-9_]+q?_[a-z0-9_]+|_mm\d*_[a-z0-9_]+|sv[a-z0-9_]+_[a-z0-9_]+'
     r'|vec_[a-z0-9_]+|_bit_[a-z0-9_]+)$')
 
-CTRL_KW = re.compile(r'\b(if|for|while|case|catch)\b')
-
-LOOP_KW = re.compile(r'\b(for|while|do)\b')
-
-BRANCH_KW = re.compile(r'\b(if|switch|case)\b')
-
-SWITCH_KW = re.compile(r'\bswitch\b')
-
-LOGIC = re.compile(r'&&|\|\||\?')
-
-RETURN_KW = re.compile(r'\breturn\b')
-
-GOTO_KW = re.compile(r'\bgoto\b')
+# One alternation scan replaces the seven per-keyword scans metrics() used to
+# run; the tokens are disjoint so a single pass counts every category exactly.
+METRIC_KW = re.compile(
+    r'\b(for|while|do|if|switch|case|goto|return|catch)\b|&&|\|\||\?')
 
 IDENT = re.compile(r'[A-Za-z_]\w*')
 
@@ -2934,14 +2925,14 @@ def expr_counts(body: str) -> dict[str, int]:
         n_cast=len(re.findall(r'\(\s*(?:const\s+)?[A-Za-z_]\w*\s*\*+\s*\)', body)),
         n_sizeof=len(re.findall(r'\bsizeof\b', body)),
         n_ternary=body.count('?'),
-        n_bitop=len(re.findall(r'[&|^~]', body)),
-        n_shift=len(re.findall(r'<<|>>', body)),
-        n_arith=len(re.findall(r'[+\-*/%]', body)),
+        n_bitop=sum(body.count(c) for c in '&|^~'),
+        n_shift=body.count('<<') + body.count('>>'),
+        n_arith=sum(body.count(c) for c in '+-*/%'),
         n_cmp=len(re.findall(r'==|!=|<=|>=|(?<![=<])<(?![<=])|(?<![=>])>(?![>=])', body)),
         n_assign=len(re.findall(r'(?<![+\-*/%&|^<>!=])=(?!=)', body)),
-        n_compound_assign=len(re.findall(r'[+\-*/%&|^]=|<<=|>>=', body)),
-        n_incdec=len(re.findall(r'\+\+|--', body)),
-        n_logical=len(re.findall(r'&&|\|\|', body)),
+        n_compound_assign=sum(body.count(s) for s in ('+=','-=','*=','/=','%=','&=','|=','^=','<<=','>>=')),
+        n_incdec=body.count('++') + body.count('--'),
+        n_logical=body.count('&&') + body.count('||'),
         n_float_lit=len(re.findall(r'\b\d+\.\d+', body)),
         n_null_check=len(re.findall(r'(?:==|!=)\s*NULL|\bif\s*\(\s*!\s*\w+\s*\)', body)),
         n_intrinsic=len(INTRIN_RE.findall(body)),
@@ -3075,7 +3066,25 @@ def loop_analysis(body: str) -> dict[str, int]:
 
 def metrics(body: str) -> dict[str, int]:
     """Size and control-flow shape."""
-    cyclo = 1 + len(CTRL_KW.findall(body)) + len(LOGIC.findall(body))
+    nl = nb = ns = ng = nr = nc = nlog = 0
+    for m in METRIC_KW.finditer(body):
+        t = m.group(0)
+        if t == '&&' or t == '||' or t == '?':
+            nlog += 1
+            continue
+        if t in ('if', 'for', 'while', 'case', 'catch'):
+            nc += 1
+        if t in ('for', 'while', 'do'):
+            nl += 1
+        if t == 'if' or t == 'switch' or t == 'case':
+            nb += 1
+        if t == 'switch':
+            ns += 1
+        if t == 'goto':
+            ng += 1
+        if t == 'return':
+            nr += 1
+    cyclo = 1 + nc + nlog
     depth = mx = cog = 0
     for ch in body:
         if ch == "{":
@@ -3094,16 +3103,15 @@ def metrics(body: str) -> dict[str, int]:
             cog += max(1, d)
     idents = IDENT.findall(body)
     ops = OPERATOR.findall(body)
-    n_ret = len(RETURN_KW.findall(body))
     return dict(
         cyclomatic=cyclo, cognitive=cog, max_nesting=mx,
         sloc=sum(1 for l in body.splitlines() if l.strip()),
-        n_loops=len(LOOP_KW.findall(body)),
-        n_branches=len(BRANCH_KW.findall(body)),
-        n_switch=len(SWITCH_KW.findall(body)),
-        n_returns=n_ret,
-        n_early_returns=max(0, n_ret - 1),
-        n_gotos=len(GOTO_KW.findall(body)),
+        n_loops=nl,
+        n_branches=nb,
+        n_switch=ns,
+        n_returns=nr,
+        n_early_returns=max(0, nr - 1),
+        n_gotos=ng,
         n_tokens=len(idents) + len(ops),
         n_operators=len(ops),
         n_operands=len(idents),
