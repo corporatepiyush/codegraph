@@ -4740,7 +4740,7 @@ UPDATE namespaces AS n SET n_classes = (
         loops = set(self.LOOP_NODES)
         funcs = set(self.FUNC_KINDS)
 
-        for n in walk(root):
+        for n, _depth in walk_cursor(root):
             t = n.type
             if t == "variable_name":
                 var = _txt(n, src)

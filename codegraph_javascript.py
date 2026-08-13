@@ -4903,7 +4903,7 @@ UPDATE exports AS e SET symbol_id = x.id FROM
         cache_writers: dict[str, set[str]] = {n: set() for n in caches}
         handler_spans: list[int] = []
 
-        for n in walk(root):
+        for n, _depth in walk_cursor(root):
             t = n.type
             if t == "call_expression" or t == "new_expression":
                 self._call_row(n, rec, bufs, caches, cache_use, cache_writers,
@@ -5083,7 +5083,7 @@ UPDATE exports AS e SET symbol_id = x.id FROM
         dies with the call.
         """
         out: dict[str, tuple] = {}
-        for n in walk(root):
+        for n, _depth in walk_cursor(root):
             if n.type != "variable_declarator":
                 continue
             if not _at_module_scope(n):

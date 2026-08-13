@@ -4195,7 +4195,7 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
                               and body.type not in ("body_statement", "do")),
             "is_test": int(name.startswith("test_") or name.startswith("test ")
                            or rec.is_test),
-            "is_generator": int(_has_yield(node)),
+            "is_generator": 0,
             "is_entrypoint": int(name in ("perform", "perform_now", "call",
                                           "run", "execute", "main")
                                  or (ctrl and vis == "public")),
@@ -4207,6 +4207,10 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
             "is_abstract": int(_raises_not_implemented(node, rec.data)),
         }
         out.update(self._scan_body(node, rec, vis))
+        # is_generator comes from the SAME body walk as the rest of _scan_body
+        # (yield detection folded in; _has_yield used to walk the body a
+        # second time per function).
+        out["is_generator"] = int(self._pend_has_yield)
         # DEFINING method_missing is what blinds the graph, not calling it: a
         # class with method_missing answers to names that appear nowhere, so
         # every "nothing calls this" claim about its callers is void. Counting
@@ -4702,6 +4706,18 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
         self._pend_blocks = []
         self._pend_meta = []
         self._pend_ar = []
+        self._pend_has_yield = False
+        # The old _has_yield walked the WHOLE node, so a 12-byte call method
+        # in a default argument (role: Base.current_role) counted too --
+        # signature params are part of the node, only the body isn't. Scan the
+        # small params subtree here for exact equivalence.
+        params = node.child_by_field_name("parameters")
+        if params is not None:
+            for pn, _pd in walk_cursor(params):
+                if pn.type == "call":
+                    pm = pn.child_by_field_name("method")
+                    if pm is not None and pm.end_byte - pm.start_byte == 12:
+                        self._pend_has_yield = True
         body = node.child_by_field_name("body")
         if body is None:
             return {}
@@ -4754,8 +4770,14 @@ WHERE n_thread_new > 0 OR n_ractor > 0 OR is_job = 1
                 mn = n.child_by_field_name("method")
                 if mn is not None:
                     meth = text_of(mn, src)
+                    # the 12-char method-name heuristic from _has_yield:
+                    # a bare `yield`-equivalent call this tree cannot see
+                    if mn.end_byte - mn.start_byte == 12:
+                        self._pend_has_yield = True
                     self._call_detail(n, meth, src, rec, idepth, singleton,
                                       bump)
+            elif t == "yield":
+                self._pend_has_yield = True
             elif t in ("array", "hash", "string_array", "symbol_array"):
                 if idepth:
                     bump("n_collection_lit_in_loop")
@@ -5117,16 +5139,6 @@ def _in_singleton_class(node: Any) -> bool:
             return False
         cur = cur.parent
         hops += 1
-    return False
-
-def _has_yield(node: Any) -> bool:
-    for n in walk(node):
-        if n.type == "yield":
-            return True
-        if n.type == "call":
-            m = n.child_by_field_name("method")
-            if m is not None and m.end_byte - m.start_byte == 12:
-                return True
     return False
 
 def _raises_not_implemented(node: Any, src: bytes) -> bool:
