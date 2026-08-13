@@ -2230,6 +2230,9 @@ class BodyStats:
     input_sites: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
     #: (value, line) -- G07 credential-shaped string literals
     secrets: list[tuple[str, int]] = dc_field(default_factory=list)
+    #: ("listener"/"input", ...) -- extra-table rows captured on the SAME walk
+    #: as measure, instead of function_extra re-walking the body per symbol.
+    extra_rows: list[tuple[Any, ...]] = dc_field(default_factory=list)
 
     def bump(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -4079,6 +4082,20 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
                     st.bump("n_innerhtml")
                 elif p in ("__proto__", "constructor", "prototype"):
                     st.bump("n_proto_write")
+            # user_input_sites rows: captured on THIS walk instead of a second
+            # pass per symbol (function_extra used to re-walk the whole body).
+            obj = node.child_by_field_name("object")
+            if obj is not None and prop is not None:
+                base_obj = _txt(obj, src)
+                kind = USER_INPUT_MEMBERS.get(_txt(prop, src))
+                if base_obj in REQ_BASES and kind is not None:
+                    var = _txt(node, src)[:120]
+                    par = node.parent
+                    if par is not None and par.type == "member_expression":
+                        var = _txt(par, src)[:120]
+                    st.extra_rows.append(
+                        ("input", var, kind, int(loop_depth > 0),
+                         node.start_point[0] + 1))
         elif t == "call_expression":
             fn = node.child_by_field_name("function")
             if fn is None:
@@ -4110,6 +4127,23 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
             if parent is not None and parent.type == "expression_statement" \
                     and base in ("then", "catch", "finally"):
                 st.bump("n_floating_promise")
+            # listeners rows: captured on THIS walk instead of a second pass
+            # per symbol (function_extra used to re-walk the whole body).
+            op = ""
+            if base in ("addEventListener", "addListener", "on", "subscribe",
+                        "observe", "once"):
+                op = "add"
+            elif base in ("removeEventListener", "removeListener", "off",
+                          "unsubscribe", "disconnect"):
+                op = "remove"
+            if op:
+                args = node.child_by_field_name("arguments")
+                ev = ""
+                if args is not None and args.named_children:
+                    ev = _txt(args.named_children[0], src).strip('"\'`')[:60]
+                st.extra_rows.append(
+                    ("listener", name.rsplit(".", 1)[0][:80], ev, op,
+                     node.start_point[0] + 1, int(loop_depth > 0)))
 
     def on_string(self, node: Any, text: str, src: bytes, st: BodyStats,
                   loop_depth: int) -> None:
@@ -4167,52 +4201,22 @@ UPDATE symbols AS s SET n_listener_add = x.a, n_listener_remove = x.r FROM
     def function_extra(self, node: Any, rec: FileRec, db: sqlite3.Connection,
                        bufs: Buffers, sid: int, scope: Scope,
                        stats: BodyStats) -> None:
-        body = node.child_by_field_name(self.BODY_FIELD)
-        if body is None:
+        if node.child_by_field_name(self.BODY_FIELD) is None:
             return
+        # Rows are captured during measure's single body walk (see on_node),
+        # which already knows loop_depth; this used to re-walk the whole body
+        # per symbol (~7% of wall time on playwright).
         src = rec.data
-        loops = set(self.LOOP_NODES)
-        for n, _depth in walk_cursor(body):
-            if n.type != "call_expression":
-                if n.type == "member_expression":
-                    obj = n.child_by_field_name("object")
-                    prop = n.child_by_field_name("property")
-                    if obj is None or prop is None:
-                        continue
-                    base = _txt(obj, src)
-                    kind = USER_INPUT_MEMBERS.get(_txt(prop, src))
-                    if base not in REQ_BASES or kind is None:
-                        continue
-                    var = _txt(n, src)[:120]        # e.g. "req.query" (1 hop)
-                    par = n.parent
-                    if par is not None and par.type == "member_expression":
-                        var = _txt(par, src)[:120]  # 2-hop: req.body.name
-                    bufs.rows("user_input_sites").append(
-                        (sid, rec.fid, var, kind, n.start_point[0] + 1,
-                         int(_in_loop(n, body, loops))))
-                continue
-            fn = n.child_by_field_name("function")
-            if fn is None:
-                continue
-            nm = _txt(fn, src)
-            base = nm.rsplit(".", 1)[-1]
-            op = ""
-            if base in ("addEventListener", "addListener", "on", "subscribe",
-                        "observe", "once"):
-                op = "add"
-            elif base in ("removeEventListener", "removeListener", "off",
-                          "unsubscribe", "disconnect"):
-                op = "remove"
-            if not op:
-                continue
-            args = n.child_by_field_name("arguments")
-            ev = ""
-            if args is not None and args.named_children:
-                ev = _txt(args.named_children[0], src).strip('"\'`')[:60]
-            bufs.rows("listeners").append(
-                (sid, rec.fid, op, nm.rsplit(".", 1)[0][:80], ev,
-                 n.start_point[0] + 1,
-                 int(_in_loop(n, body, loops))))
+        for row in stats.extra_rows:
+            if row[0] == "listener":
+                _, recv, ev, op, line, in_loop = row
+                bufs.rows("listeners").append(
+                    (sid, rec.fid, op, recv, ev,
+                     line, in_loop))
+            elif row[0] == "input":
+                _, var, kind, in_loop, line = row
+                bufs.rows("user_input_sites").append(
+                    (sid, rec.fid, var, kind, line, in_loop))
 
     def type_extra(self, node: Any, rec: FileRec, db: sqlite3.Connection,
                    bufs: Buffers, sid: int, scope: Scope) -> None:
