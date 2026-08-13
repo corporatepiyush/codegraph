@@ -8,7 +8,7 @@ file.
 python3 codegraph_javascript.py /path/to/repo --report   # what does it know?
 python3 codegraph_javascript.py /path/to/repo --list     # what can it answer?
 python3 codegraph_javascript.py /path/to/repo 7 11       # ask it those
-python3 codegraph_javascript.py /path/to/repo 7 --csv    # machine-readable
+python3 codegraph_javascript.py /path/to/repo --csv 7    # machine-readable
 ```
 
 One self-contained Python script per language. No server, no daemon, no index
@@ -37,13 +37,37 @@ or agent — gets an actionable row instead of having to re-derive the analysis.
 
 ## Quickstart (no clone needed)
 
-Each analyzer is standalone. Grab only the language you need:
+Each analyzer is standalone. Grab only the language you need.
 
+**Download once, then run:**
 ```bash
 curl -O https://raw.githubusercontent.com/corporatepiyush/codegraph/master/codegraph_javascript.py
 python3 codegraph_javascript.py --install-deps       # installs its grammar
 python3 codegraph_javascript.py /path/to/repo --report
 ```
+
+**Or fetch and execute in one pipe** — no file to manage, the raw GitHub copy is
+the script:
+```bash
+# one-off: analyze a repo without saving anything to disk
+curl -sL https://raw.githubusercontent.com/corporatepiyush/codegraph/master/codegraph_javascript.py \
+  | python3 - /path/to/repo --report
+
+# install that language's grammar into the running interpreter, then keep going
+curl -sL https://raw.githubusercontent.com/corporatepiyush/codegraph/master/codegraph_c.py \
+  | python3 - --install-deps
+```
+
+The pipe form brings two things to know:
+
+- **`--install-deps` inside a pipe** installs into the interpreter you are
+  piping *into* (`python3` from your PATH), exactly as if you had run the file.
+  It does not need the file on disk. Grammar-free analyzers (`codegraph_c.py`,
+  `codegraph_python.py`) skip the step entirely.
+- **Re-running repeatedly from a pipe re-downloads.** For many queries over one
+  snapshot, pipe once is fine, but `--save out.db` is the better pattern — and
+  if you are going to `--save` anyway, `curl -O` once is the honest choice
+  because the next run needs no network at all.
 
 Swap the filename for `codegraph_{c,python,go,rust,java,typescript,php,ruby}.py`.
 Nothing else to clone — no package, no config file. `codegraph_python.py`
@@ -61,7 +85,7 @@ thinner graph that looks complete.
 Every analyzer ships **two** query lists, because a bug-fixing loop and a
 maintainability review want different things.
 
-**`QUERIES` — the "act on it" list (245 across nine languages).**
+**`QUERIES` — the "act on it" list (456 across nine languages).**
 Rows are *defects or defect risks*: an error swallowed, a lock held across an
 I/O call, an alloc without a free, an unbounded regex reaching a handler. These
 are what a coding agent should act on.
@@ -119,10 +143,10 @@ it from an error via the exit code, which stays `0`.
 
 **Machine output**
 ```bash
-codegraph_go.py /repo 3 --json     # array of objects, one per row
-codegraph_go.py /repo 3 --csv      # header row of column names, then rows
+codegraph_go.py /repo --json 3     # array of objects, one per row
+codegraph_go.py /repo --csv 3      # header row of column names, then rows
 codegraph_go.py /repo --sql "SELECT ..."   # ad-hoc against the graph
-codegraph_go.py /repo --save out.db        # persist the graph, e.g. to run many queries
+codegraph_go.py /repo --save out.db        # persist the graph for your own tooling
 ```
 `--csv` and `--json` emit *only* the payload on stdout (no progress), and imply
 `--quiet`. Every query is executed with bound `:mod` (module filter) and `:lim`
@@ -175,6 +199,85 @@ measures its own blindness and reports it before anything else:
 
 `--report` prints a **HOW MUCH OF THIS TO TRUST** section, and `graph-blindspots`
 (likely in `METRICS`) is the one to read first.
+
+---
+
+## Typical workflows
+
+The whole tool is one command, so the "workflows" are really arguments, but the
+shape of a good session is worth spelling out.
+
+**A bug-fixing agent, one shot.** Run the act-list, filter to what it can own,
+and verify each row's `MISLEADS` before acting:
+
+```bash
+python3 codegraph_go.py /repo --list                 # see what's on the table
+python3 codegraph_go.py /repo --json 1               # one query, as JSON
+python3 codegraph_go.py /repo 1 3 7                  # a few queries, plain rows
+python3 codegraph_go.py /repo --module pkg/util       # one package
+python3 codegraph_go.py /repo --no-tests             # prod code only
+```
+
+Rows carry an `at` column of `path:line`. An agent reads `at`, opens the file,
+applies the fix, and re-runs the same number to confirm the row is gone.
+
+**A human review.** Start with `--metrics --list`, read `graph-blindspots`,
+then read the whole weighing list — it prints every metric with its top rows:
+
+```bash
+python3 codegraph_java.py /repo --metrics --list   # names + one-line meaning
+python3 codegraph_java.py /repo --metrics          # every metric, top rows
+python3 codegraph_java.py /repo --metrics --csv 1  # one metric, as CSV
+```
+
+**One snapshot, many questions.** Every run re-parses, because a graph file goes
+stale the moment code changes — and `root` must be a directory, not a saved
+file. To ask many questions without re-parsing per question, save once and then
+query the saved copy from your own tooling (it is ordinary SQLite) while the
+analyzer keeps re-parsing per run:
+
+```bash
+python3 codegraph_rust.py /repo --save snapshot.db --force
+python3 codegraph_rust.py /repo --csv 7        # one query, as CSV
+sqlite3 snapshot.db "SELECT name, fan_in FROM symbols ORDER BY fan_in DESC LIMIT 10"
+```
+
+The saved file is ordinary SQLite — point any tool at it. It is a snapshot for
+offline or repeated analysis in *your* tooling, not a way to make the analyzer
+skip parsing.
+
+**An ad-hoc question the canned list does not ask.** The graph is queryable
+directly. `--schema` tells you the tables; `--sql` runs anything against them:
+
+```bash
+python3 codegraph_python.py /repo --schema
+python3 codegraph_python.py /repo --sql \
+  "SELECT name, fan_in FROM symbols ORDER BY fan_in DESC LIMIT 15"
+```
+
+## Performance
+
+Every run re-reads and re-parses the whole tree into an in-memory graph, then
+answers. There is no warm index to keep and no server — the cost is paid in
+full each time, and it is dominated by parsing, not by asking questions.
+
+Measured on this machine (CPython 3.14, one run each):
+
+| corpus | language | wall |
+|---|---|---|
+| flask (small) | python | ~0.8 s |
+| redis/src | c (regex) | ~7 s |
+| playwright | typescript | ~15 s |
+
+A large monorepo (e.g. the Kubernetes tree) is around a minute. The
+practical trade-off is deliberate: correctness and simplicity beat a fast stale
+index. When the same snapshot is queried repeatedly, `--save` removes the
+re-parse cost from every question after the first for that revision.
+
+Parsing is single-process and, for grammar-backed languages, tree-sitter holds
+the GIL for the whole of `parse()` — measured at 3.8x wall time for 4x work
+with threads, so it is not parallelised. There is no network and no external
+service to warm; the cost is the parse itself, paid once per run.
 
 ---
 
