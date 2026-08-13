@@ -315,6 +315,306 @@ service to warm; the cost is the parse itself, paid once per run.
 
 ---
 
+## What each language answers
+
+The queries are listed in full by `--list` / `--metrics --list`; here is the
+shape of each catalogue, by language. Every query name below is real — it
+appears in that language's `--list` output, where each entry carries its
+number for `python3 codegraph_<lang>.py /repo <number>`.
+
+**Every language ships the same recurring core**, so it appears once here and
+not under each heading:
+
+- in **all nine** — `graph-blindspots`, `parse-coverage`, `dead-code`,
+  `hot-multipliers`, `risk-ranked`, `scattered-concerns`
+- in **eight of nine** (all but Go) — some `deep-nesting` variant: TypeScript
+  and Python name it `deep-nesting-excessive`, Python also carries the plain
+  name; and `too-many-params` appears in eight (Go alone uses
+  `too-many-return-paths` and `unused-params`, Python prefers
+  `too-many-locals`).
+- in **some** — `markers` and `god-functions` (Go, TypeScript, Python),
+  `module-coupling` (Go, TypeScript, Python, C), `god-module` (Go only)
+
+The sections below list what is *distinctive* to each language.
+
+### Go (59 act, 17 weigh)
+
+Concurrency is the first citizen — goroutines, locks, contexts:
+
+- **Goroutine lifecycle** — `goroutine-leak-frontier`, `goroutine-under-handler`,
+  `package-state-concurrent`, `concurrency-hotspots`, `select-without-default`,
+  `channel-topology`
+- **Defer discipline** — `defer-lifetime`, `defer-in-loop`
+- **Context discipline** — `ctx-propagation-break`, `context-not-propagated`,
+  `context-severed-by-caller`, `nil-context-deep`, `context-built-in-loop`,
+  `http-request-no-context`
+- **Error handling** — `unchecked-errors`, `error-handling-drift`,
+  `error-not-wrapped`, `error-fan-out`, `nil-error-after-check`,
+  `deferred-close-unchecked`, `resource-close-cross-layer`
+- **Locking** — `lock-copied-by-value`, `lock-over-crosspkg-call`,
+  `lock-release-imbalance-reachable`
+- **Perf / allocation** — `n-plus-one`, `slice-growth-and-copies`,
+  `string-concat-in-loop`, `time-after-in-loop`, `readall-in-loop`,
+  `file-read-surface`, `loopvar-rebind-dead`, `heap-pressure-loops` (M),
+  `range-value-copy` (M)
+- **Type & error discipline** — `unchecked-type-assertions`,
+  `log-fatal-in-handler`, `env-read-in-handler`, `wrapper-function` (M),
+  `naked-return-complex` (M), `too-many-return-paths` (M), `unused-params` (M)
+- **Security** — `unsafe-cgo-frontier`, `unsafe-pointer-arith`,
+  `weak-random-security`, `weak-crypto-security`, `insecure-tls-config`,
+  `command-exec-surface`, `sql-injection-build`, `reflect-call-surface`,
+  `hardcoded-secret-candidates`, plus the OWASP input-surface family
+  (`open-redirect-surface`, `path-traversal-surface`,
+  `unauthenticated-input-surface`, `mass-assignment-surface`,
+  `untrusted-deserialization`, `zip-slip-surface`, `sensitive-log-surface`,
+  `deprecated-stdlib-calls`)
+- **Architecture** — `single-impl-interface` (M), `iface-satisfaction-breadth`,
+  `abstraction-reach`, `receiver-pointer-mix`, `internal-package-leak`,
+  `module-dependency-depth`, `import-cycle`, `module-coupling` (M),
+  `god-functions` (M), `god-module` (M), `hot-multipliers` (M),
+  `scattered-concerns` (M), `deep-call-chain` (M), `unused-exported`,
+  `dead-code`, `risk-ranked` (M)
+
+### Java (50 act, 17 weigh)
+
+Concurrency under the JVM, resource discipline, and framework/type design:
+
+- **Concurrency & executors** — `vt-pinning-frontier`,
+  `threadlocal-leak-on-pooled`, `shared-mutable-statics`, `lock-order-inversion`,
+  `lock-held-across-io`, `thread-sleep-in-lock`, `parallel-stream-hazard`,
+  `executor-without-shutdown`, `submit-in-loop`, `lock-on-boxed`,
+  `false-sharing-and-escape`
+- **Correctness smells** — `equals-hashcode-mismatch`, `double-checked-locking`,
+  `null-return-ignore`, `reference-equality`, `narrow-calculation`,
+  `static-mutable-state`, `missing-super-call`, `overridden-not-annotated`,
+  `modern-idiom-candidates`
+- **Resources & exceptions** — `resource-open-never-closed`, `files-stream-leak`,
+  `exception-contract-drift`, `empty-catch-by-fanin`, `dead-exception`,
+  `try-in-loop`, `static-write-in-ctor`, `n-plus-one`
+- **Security** — `reflection-frontier`, `deserialization-reachability`,
+  `native-surface-reachable`, `banned-api-surface`, `weak-random-surface`,
+  `sql-concat-surface`, `xxe-parser-surface`, `zip-slip-surface`,
+  `hardcoded-secret-candidates`, `open-redirect-surface`,
+  `unauthenticated-input-surface`
+- **Design / architecture** — `hierarchy-depth`, `di-bottleneck`,
+  `overload-density`, `iface-impl-ratio`, `package-cycle`,
+  `annotation-coupling`, `abstract-fanout`, `layer-violations`,
+  `megamorphic-callsites` (M), `raw-types-and-unchecked` (M),
+  `per-element-cost` (M), `boxing-in-hot-loop` (M), `string-concat-in-loop`,
+  `regex-and-format-per-call` (M), `platform-charset-across-module-boundary` (M),
+  `serializable-no-uid` (M), `print-stacktrace-leak` (M), `god-class` (M),
+  `setaccessible-and-finalizers` (M), `deep-nesting` (M), `too-many-params` (M),
+  `suppressed-warnings` (M)
+
+### JavaScript (41 act, 14 weigh)
+
+Event-loop health, listener/timer lifetime, and browser/Node security:
+
+- **Event loop** — `event-loop-block-frontier`, `sync-io-below-a-handler`,
+  `sync-io-under-handler`, `await-in-loop-serialized`,
+  `floating-promise-crossmodule`, `then-without-catch`,
+  `async-colour-frontier`, `process-exit-in-handler`
+- **Leaks & lifetime** — `retention-leak-frontier`, `unbounded-module-cache`,
+  `timer-balance`, `hooks-rules-violations` (React rules of hooks)
+- **Security** — `proto-pollution-frontier`, `redos-frontier`, `dom-sink-frontier`,
+  `command-injection-surface`, `proto-mutation`, `object-injection-surface`,
+  `open-redirect-surface`, `ssrf-fetch-surface`, `path-traversal-surface`,
+  `unchecked-upload-surface`, `zip-slip-surface`, `mass-assignment-surface`,
+  `log-injection-surface`, `sensitive-log-surface`,
+  `unauthenticated-input-surface`, `hardcoded-secret-candidates`
+- **Dynamic dispatch** — `dynamic-import-and-eval`, `dynamic-require`
+- **Perf & dependencies** — `includes-in-loop`, `unused-dependencies`,
+  `spread-in-loop` (M), `quadratic-scan-in-hot-callee` (M),
+  `shape-deopt-surface` (M), `megamorphic-shapes` (M)
+- **Architecture** — `import-cycle`, `layer-crossings`,
+  `relative-import-depth`, `global-pollution`, `reexport-propagation`,
+  `anon-callback-depth`, `destructured-vs-default`, `duplicate-branch-conditions`,
+  `dead-exports-barrel-blast` (M), `jsx-component-complexity` (M)
+
+### TypeScript (51 act, 19 weigh)
+
+The type system is a first-class citizen — the any type's blast radius,
+suppressions, type-vs-value space:
+
+- **Type hygiene** — `any-blast-radius`, `any-escape-hatch`,
+  `assertion-density`, `assertion-escape-hatches`, `non-null-assertion`,
+  `unsafe-type-assertion`, `any-interpolation`, `type-vs-value-space`,
+  `orphan-types`, `path-alias-utilization`, `ambient-augmentation`,
+  `iface-inherit-chain`, `type-export-mismatch`, `type-import-misuse`,
+  `mutability-blast`, `weak-interfaces` (M), `index-signature-holes` (M),
+  `type-level-complexity` (M), `type-depth-blowup` (M),
+  `declaration-vs-implementation` (M)
+- **Suppressions** — `suppression-on-hot-code`, `suppression-debt`, `ts-ignore`,
+  `suppression-without-reason`, `strictness-map` (M)
+- **Async & events** — `floating-promise`, `async-in-loop`, `await-in-loop`,
+  `sync-under-handler`, `event-loop-block-below-entry`, `redos-reachable`,
+  `redos-surface`, `dom-sinks`, `dom-xss-sink`, `process-exit-in-handler`,
+  `listener-leak`, `timer-leak`, `listener-added-never-removed`,
+  `dead-service-methods`
+- **Security** — `child-process-surface`, `open-redirect-surface`,
+  `ssrf-fetch-surface`, `path-traversal-surface`, `unchecked-upload-surface`,
+  `zip-slip-surface`, `mass-assignment-surface`, `log-injection-surface`,
+  `sensitive-log-surface`, `unauthenticated-input-surface`,
+  `hardcoded-secret-candidates`
+- **Architecture** — `import-cycles`, `boundary-crossings`,
+  `unused-dependencies`, `barrel-blast` (M), `dead-exports` (M),
+  `module-coupling` (M), `ts7-breaking` (M), `deprecated-usage`,
+  `duplicate-enum-values`, `mixed-enums`
+
+### Python (57 act, 23 weigh)
+
+Async/event-loop honesty, mutable-state traps, and the dynamic-language escape
+hatches:
+
+- **Async** — `async-blocking`, `async-blocking-reachable`, `await-in-loop`
+- **Data & performance** — `n-plus-one`, `sql-built-by-hand`,
+  `loop-multiplied`, `quadratic-strings`, `append-in-loop-perf`,
+  `exception-in-loop`, `closure-in-loop`
+- **Error handling** — `swallowed-errors`, `bare-except`, `raise-without-from`,
+  `call-in-default-argument`, `resource-discipline`
+- **Mutable state & concurrency** — `mutable-defaults`, `shared-mutable-state`,
+  `unbounded-caches`, `global-statement`, `concurrency-surface`,
+  `name-shadowing`
+- **Security** — `untrusted-frontier`, `unsafe-decode-reachable`, `weak-crypto`,
+  `pickle-deserialization`, `yaml-unsafe-load`, `subprocess-shell-injection`,
+  `eval-exec-injection`, `assert-in-production`, `open-without-with`,
+  `datetime-naive`, `request-without-timeout`, `template-injection`,
+  `open-redirect-surface`, `ssrf-fetch-surface`, `path-traversal-surface`,
+  `unchecked-upload-surface`, `zip-slip-surface`, `log-injection-surface`,
+  `xxe-parser-surface`, `unauthenticated-input-surface`,
+  `hardcoded-secret-candidates`
+- **Reflection & structure** — `reflection-opacity`, `decorator-roots`,
+  `decorator-depth`, `import-cycles`, `import-workarounds`,
+  `relative-import-depth`, `wildcard-import-rank`, `all-reexports`,
+  `non-public-leak`, `method-kind-mix`, `undocumented-export`,
+  `suppression-burden`, `untested`, `broad-test-expectation`
+- **Design** — `typing-holes` (M), `class-shape` (M), `slots-candidates` (M),
+  `god-class` (M), `magic-numbers` (M), `module-coupling` (M),
+  `scattered-concerns` (M), `too-many-locals` (M), `too-many-branches` (M),
+  `too-many-return` (M), `line-too-long` (M), `untyped-params` (M),
+  `deep-nesting` (M), `nested-loops` (M), `latent-risk-density` (M),
+  `undocumented-complexity` (M)
+
+### Ruby (55 act, 9 weigh)
+
+Rails/ActiveRecord behaviour, metaprogramming, and the monkey-patch surface:
+
+- **ActiveRecord & DB** — `n-plus-one`, `callback-cascade`, `sql-interpolation`,
+  `sql-injection-ar`, `raw-sql-below-a-controller`, `write-per-iteration`,
+  `unscoped-find-params`, `mass-assignment`, `mass-assignment-weak-params`,
+  `save-without-bang`, `find-each-missed`
+- **Metaprogramming & dynamic dispatch** — `params-to-dynamic-dispatch`,
+  `eval-family-surface`, `eval-injection`, `send-injection`,
+  `constantize-injection`, `shell-out-surface`, `open-injection`,
+  `unsafe-deserialization`, `html-safe-xss`
+- **Monkey-patching** — `monkey-patch-blast-radius`, `monkey-patch-surface`,
+  `ancestor-chain-depth`, `mixin-method-collision`, `heavy-mixins`,
+  `super-overrides`, `yield-hubs`, `attr-coupling`
+- **Threads & state** — `class-state-under-threads`,
+  `threads-without-synchronisation`, `thread-coupling`
+- **Perf** — `string-churn-unfrozen`, `per-iteration-cost`,
+  `string-concat-in-loop`, `legacy-enumerable-idioms`, `block-vs-proc-cost` (M),
+  `frozen-literal-debt` (M)
+- **Smells & coverage** — `rescue-swallow`, `rescue-too-broad`,
+  `unused-private`, `nested-iterators`, `feature-envy`, `param-clumps`,
+  `debugger-surface`, `typing-coverage`, `timeout-blast-radius`,
+  `import-cycle`
+- **Security** — `open-redirect-surface`, `ssrf-fetch-surface`,
+  `path-traversal-surface`, `zip-slip-surface`, `log-injection-surface`,
+  `xxe-parser-surface`, `unauthenticated-input-surface`,
+  `hardcoded-secret-candidates`, `weak-hash`
+
+### PHP (49 act, 13 weigh)
+
+Superglobal taint tracking is the differentiator — input flows to sinks:
+
+- **Superglobal taint** — `superglobal-to-sql`, `superglobal-to-include`,
+  `superglobal-to-shell`, `superglobal-to-echo`, `ssrf-frontier`,
+  `type-juggling-auth`, `file-upload-surface`, `unchecked-upload-surface`,
+  `unauthenticated-input-surface`
+- **Injection & deserialization** — `unserialize-gadget-frontier`,
+  `deserialization-injection`, `command-injection`, `file-inclusion-injection`,
+  `header-redirect-open`, `open-redirect-surface`, `remote-fetch-ssrf`,
+  `extract-injection`, `loose-comparison-type-juggling`, `weak-hash`,
+  `session-fixation`, `csrf-missing`, `magic-method-surface`
+- **Errors & robustness** — `error-suppression`, `error-suppression-operator`,
+  `broad-catch-surface`, `magic-fallback-risk`
+- **DB** — `n-plus-one`, `unprepared-sql-hotspots`, `driver-split`
+- **Modernization** — `implicit-nullable-params`, `dynamic-property-writes`,
+  `bool-flag-methods`, `deprecated-api-frontier`, `dynamic-call-surface`
+- **Architecture** — `trait-adoption`, `namespace-instability`, `lsb-hotspots`,
+  `psr4-violations`, `iface-coverage`, `abstract-hooks`, `untyped-public-boundary`,
+  `npath-explosion`, `maintainability-index-worst`, `god-classes` (M),
+  `strict-types-coverage` (M), `strict-types-missing` (M), `untyped-params` (M),
+  `array-scan-in-a-hot-method` (M), `property-hooks` (M)
+- **Outbound surface** — `outbound-fetch-below-a-controller`
+- **Security (shared OWASP family)** — `hardcoded-secret-candidates`,
+  `path-traversal-surface`, `xxe-parser-surface`, `log-injection-surface`
+
+### Rust (51 act, 14 weigh)
+
+Unsafe reachability is the central question — what a safe API can pull in:
+
+- **Unsafe** — `unsafe-under-pub-api`, `unsafe-without-comment`,
+  `safety-doc-debt`, `transmute-and-raw-pointers`, `transmute-misuse`,
+  `static-mut-unsafe`, `unsafe-in-loop`, `ffi-raw-balance`, `ffi-crossings`,
+  `suppression-clusters`, `suppression-without-reason`
+- **Async** — `lock-held-across-await`, `refcell-across-await`,
+  `runtime-borrow-panic-surface`, `blocking-io-in-async`, `block-on-async`,
+  `spawn-without-join`, `async-task-hubs`, `dropped-futures`,
+  `blocking-work-below-public-api`
+- **Panic & error paths** — `panic-frontier`, `result-that-panics`,
+  `unwrap-in-prod`, `expect-in-prod`, `placeholder-panic-sites`,
+  `error-swallowing-sites`, `debug-print-residue`
+- **Memory & perf** — `rc-cycle-risk`, `rc-refcell-mutation`,
+  `arc-mutex-contention`, `clone-in-loop`, `vec-new-push-in-loop`, `len-in-loop`,
+  `indexing-slicing-surface`, `lossy-casts`, `float-equality`,
+  `atomic-ordering-audit`, `relaxed-ordering`, `clone-churn-per-iteration` (M),
+  `alloc-churn-collect-and-format` (M), `mono-blast-radius` (M),
+  `dynamic-dispatch-cost` (M), `box-dyn-overuse` (M), `dyn-with-one-impl` (M)
+- **Architecture & deps** — `trait-breadth`, `macro-density`,
+  `impl-fragmentation`, `deep-module-paths`, `import-cycle`,
+  `cfg-feature-nobody-builds` (M), `manifest-vs-usage`, `public-api-doc-debt`
+- **Security** — `sql-string-build`, `command-build-surface`,
+  `untrusted-deserialization`, `zip-slip-surface`,
+  `hardcoded-secret-candidates`
+
+### C (43 act, 26 weigh)
+
+Ownership and layout are measured byte-accurately — the regex scanner models
+structs, alignment and alloc/free pairs:
+
+- **Memory safety** — `ownership-review`, `memory-leak-surface`,
+  `double-free-surface`, `null-deref-surface`, `buffer-overflow-surface`,
+  `format-string-injection`, `integer-overflow-surface`,
+  `division-by-zero-surface`, `unchecked-conversion-on-an-io-path`,
+  `stack-exhaustion`, `toctou-access-open`
+- **Concurrency & races** — `race-surface`, `race-condition-surface`,
+  `nonreentrant-under-threads`, `signal-handler-unsafe`, `infinite-loop`
+- **Allocation** — `allocator-mixing`, `alloc-per-iteration`, `bypass-tax`,
+  `alloc-cost` (M)
+- **Loops & vectorisation** — `per-element-dispatch`, `loop-invariant-strlen`,
+  `nested-loops` (M), `vectorisation-blocked` (M), `explicit-simd` (M)
+- **Layout** — `struct-padding` (M), `cache-line-crossers` (M),
+  `cache-hostile-layout` (M), `stack-pressure` (M), `cast-density` (M),
+  `macro-machinery` (M)
+- **Structure & linkage** — `vtable-risk`, `fnptr-blindspot-callers`,
+  `recursion-loops`, `global-state-mutation`, `unreferenced-includes`,
+  `blast-radius`, `cross-file-struct-coupling`, `extern-linkage-density`,
+  `cross-tu-signature-drift`, `linkage-scope-mismatch`,
+  `extern-symbol-asymmetry`, `include-cycles`, `header-scope-ratio`,
+  `header-fanout` (M), `backend-parity` (M), `config-gated` (M),
+  `hand-linked-objects` (M), `profiler-invisible` (M), `module-coupling` (M),
+  `undocumented-complexity` (M)
+- **Standards (CERT/MISRA)** — `switch-no-default`, `unused-return-value`,
+  `macro-side-effect`, `const-cast-away`, `goto-spaghetti` (M),
+  `deep-nesting` (M), `too-many-params` (M), `magic-number` (M),
+  `error-shape-mix`
+- **Security** — `untrusted-frontier`, `risky-process-apis`,
+  `hardcoded-secret-candidates`
+
+---
+
 ## Correctness, and how it is checked
 
 Three classes of bug have been found and fixed here, none of which a test that
