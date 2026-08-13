@@ -326,16 +326,16 @@ number for `python3 codegraph_<lang>.py /repo <number>`.
 not under each heading:
 
 - in **all nine** — `graph-blindspots`, `parse-coverage`, `dead-code`,
-  `hot-multipliers`, `risk-ranked`, `scattered-concerns`
+  `hot-multipliers`, `risk-ranked`
+- in **eight of nine** (missing only from Java) — `scattered-concerns`
 - in **eight of nine** (all but Go) — some `deep-nesting` variant: TypeScript
   and Python name it `deep-nesting-excessive`, Python also carries the plain
-  name; and `too-many-params` appears in eight (Go alone uses
+  name; and a `too-many-params` sibling exists in eight (Go alone uses
   `too-many-return-paths` and `unused-params`, Python prefers
   `too-many-locals`).
-- in **some** — `markers` and `god-functions` (Go, TypeScript, Python),
-  `module-coupling` (Go, TypeScript, Python, C), `god-module` (Go only)
-
-The sections below list what is *distinctive* to each language.
+- in **some** — `markers` (Go, TypeScript, Python), `god-functions`
+  (Go, JavaScript, TypeScript, Python), `module-coupling`
+  (Go, TypeScript, Python, C), `god-module` (Go only)
 
 ### Go (59 act, 17 weigh)
 
@@ -447,19 +447,18 @@ suppressions, type-vs-value space:
 - **Suppressions** — `suppression-on-hot-code`, `suppression-debt`, `ts-ignore`,
   `suppression-without-reason`, `strictness-map` (M)
 - **Async & events** — `floating-promise`, `async-in-loop`, `await-in-loop`,
-  `sync-under-handler`, `event-loop-block-below-entry`, `redos-reachable`,
-  `redos-surface`, `dom-sinks`, `dom-xss-sink`, `process-exit-in-handler`,
-  `listener-leak`, `timer-leak`, `listener-added-never-removed`,
-  `dead-service-methods`
+  `sync-under-handler`, `event-loop-block-below-entry`, `process-exit-in-handler`,
+  `listener-leak`, `timer-leak`, `listener-added-never-removed`
 - **Security** — `child-process-surface`, `open-redirect-surface`,
   `ssrf-fetch-surface`, `path-traversal-surface`, `unchecked-upload-surface`,
   `zip-slip-surface`, `mass-assignment-surface`, `log-injection-surface`,
   `sensitive-log-surface`, `unauthenticated-input-surface`,
-  `hardcoded-secret-candidates`
+  `hardcoded-secret-candidates`, `redos-reachable`, `redos-surface`,
+  `dom-sinks`, `dom-xss-sink`
 - **Architecture** — `import-cycles`, `boundary-crossings`,
-  `unused-dependencies`, `barrel-blast` (M), `dead-exports` (M),
-  `module-coupling` (M), `ts7-breaking` (M), `deprecated-usage`,
-  `duplicate-enum-values`, `mixed-enums`
+  `unused-dependencies`, `dead-service-methods`, `barrel-blast` (M),
+  `dead-exports` (M), `module-coupling` (M), `ts7-breaking` (M),
+  `deprecated-usage`, `duplicate-enum-values`, `mixed-enums`
 
 ### Python (57 act, 23 weigh)
 
@@ -471,10 +470,10 @@ hatches:
   `loop-multiplied`, `quadratic-strings`, `append-in-loop-perf`,
   `exception-in-loop`, `closure-in-loop`
 - **Error handling** — `swallowed-errors`, `bare-except`, `raise-without-from`,
-  `call-in-default-argument`, `resource-discipline`
+  `resource-discipline`
 - **Mutable state & concurrency** — `mutable-defaults`, `shared-mutable-state`,
   `unbounded-caches`, `global-statement`, `concurrency-surface`,
-  `name-shadowing`
+  `name-shadowing`, `call-in-default-argument`
 - **Security** — `untrusted-frontier`, `unsafe-decode-reachable`, `weak-crypto`,
   `pickle-deserialization`, `yaml-unsafe-load`, `subprocess-shell-injection`,
   `eval-exec-injection`, `assert-in-production`, `open-without-with`,
@@ -532,7 +531,7 @@ Superglobal taint tracking is the differentiator — input flows to sinks:
   `superglobal-to-shell`, `superglobal-to-echo`, `ssrf-frontier`,
   `type-juggling-auth`, `file-upload-surface`, `unchecked-upload-surface`,
   `unauthenticated-input-surface`
-- **Injection & deserialization** — `unserialize-gadget-frontier`,
+- **Injection, auth & deserialization** — `unserialize-gadget-frontier`,
   `deserialization-injection`, `command-injection`, `file-inclusion-injection`,
   `header-redirect-open`, `open-redirect-surface`, `remote-fetch-ssrf`,
   `extract-injection`, `loose-comparison-type-juggling`, `weak-hash`,
@@ -566,7 +565,7 @@ Unsafe reachability is the central question — what a safe API can pull in:
 - **Panic & error paths** — `panic-frontier`, `result-that-panics`,
   `unwrap-in-prod`, `expect-in-prod`, `placeholder-panic-sites`,
   `error-swallowing-sites`, `debug-print-residue`
-- **Memory & perf** — `rc-cycle-risk`, `rc-refcell-mutation`,
+- **Memory, casts & perf** — `rc-cycle-risk`, `rc-refcell-mutation`,
   `arc-mutex-contention`, `clone-in-loop`, `vec-new-push-in-loop`, `len-in-loop`,
   `indexing-slicing-surface`, `lossy-casts`, `float-equality`,
   `atomic-ordering-audit`, `relaxed-ordering`, `clone-churn-per-iteration` (M),
