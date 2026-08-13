@@ -41,4 +41,5 @@ PLAN.md
 # local measurement tooling (like qharness.py / truthcheck.py above)
 sqltime.py
 issuescan.py
+allocs.py
 .fixscratch/
