@@ -467,6 +467,48 @@ def walk_cursor(node: Any) -> Iterator[tuple[Any, int]]:
                 return
             depth -= 1
 
+def walk_cursor_ctx(node: Any) -> Iterator[tuple[Any, int, int, int]]:
+    """(node, depth, in_loop, in_cond): like walk_cursor, but each node also
+    carries whether a loop / condition encloses it WITHOUT crossing a function
+    boundary -- exactly what _ancestor_of(n, LOOP/CONDITION_NODE_TYPES) answers.
+    One zigzag pass replaces a parent-chain walk per node, which was the
+    analyzer's #7 hotspot (2s, 193k calls on react).
+
+    A loop/condition mark is a depth pushed when descending INTO that node; it
+    stays active for every deeper node until depth returns to (or above) the
+    mark. Function bodies push a scope frame so loops outside a function never
+    count inside it."""
+    cursor = node.walk()
+    depth = 0
+    scopes: list[list[Any]] = []   # [fn_depth, saved_loops, saved_conds]
+    loops: list[int] = []
+    conds: list[int] = []
+    while True:
+        cur = cursor.node
+        while scopes and depth <= scopes[-1][0]:
+            loops, conds = scopes[-1][1], scopes[-1][2]
+            scopes.pop()
+        while loops and loops[-1] >= depth:
+            loops.pop()
+        while conds and conds[-1] >= depth:
+            conds.pop()
+        yield cur, depth, 1 if loops else 0, 1 if conds else 0
+        t = cur.type
+        if cursor.goto_first_child():
+            if t in FN_NODE_TYPES:
+                scopes.append([depth, list(loops), list(conds)])
+                loops, conds = [], []
+            if t in LOOP_NODE_TYPES:
+                loops.append(depth)
+            elif t in CONDITION_NODE_TYPES:
+                conds.append(depth)
+            depth += 1
+            continue
+        while not cursor.goto_next_sibling():
+            if not cursor.goto_parent():
+                return
+            depth -= 1
+
 def named_children(node: Any, *types: str) -> list[Any]:
     if not types:
         return [c for c in node.named_children]
@@ -4903,15 +4945,15 @@ UPDATE exports AS e SET symbol_id = x.id FROM
         cache_writers: dict[str, set[str]] = {n: set() for n in caches}
         handler_spans: list[int] = []
 
-        for n, _depth in walk_cursor(root):
+        for n, _depth, _in_loop, _in_cond in walk_cursor_ctx(root):
             t = n.type
             if t == "call_expression" or t == "new_expression":
                 self._call_row(n, rec, bufs, caches, cache_use, cache_writers,
-                               handler_spans)
+                               handler_spans, _in_loop, _in_cond)
             elif t == "member_expression" or t == "subscript_expression":
                 self._cache_touch(n, src, caches, cache_use, cache_writers)
             elif t == "jsx_opening_element" or t == "jsx_self_closing_element":
-                self._jsx_row(n, rec, bufs)
+                self._jsx_row(n, rec, bufs, _in_loop)
             elif t == "regex":
                 # `const RE = /(a+)+/` at module scope is the commonest place a
                 # regex lives, and the body-measuring pass never reaches it --
@@ -4948,7 +4990,8 @@ UPDATE exports AS e SET symbol_id = x.id FROM
 
     def _call_row(self, n: Any, rec: FileRec, bufs: Buffers,
                   caches: dict, cache_use: dict, cache_writers: dict,
-                  handler_spans: list[int]) -> None:
+                  handler_spans: list[int], in_loop: int,
+                  in_cond: int) -> None:
         src = rec.data
         line = n.start_point[0] + 1
         new = n.type == "new_expression"
@@ -4962,7 +5005,6 @@ UPDATE exports AS e SET symbol_id = x.id FROM
         kids = list(args.named_children) if args is not None else []
         sid = self._owner(n.start_byte)
         module_scope = int(sid is None)
-        in_loop = int(_ancestor_of(n, LOOP_NODE_TYPES) is not None)
 
         if new and base in OBSERVER_CTORS:
             bufs.rows("listeners").append(
@@ -5005,7 +5047,8 @@ UPDATE exports AS e SET symbol_id = x.id FROM
                  _arg_text(kids, 0, src)[:120], 0, 0, 0, 0,
                  module_scope, in_loop))
         elif HOOK_NAME_RE.match(base) and not new:
-            self._hook_row(n, rec, bufs, base, kids, sid, line)
+            self._hook_row(n, rec, bufs, base, kids, sid, line,
+                               in_loop, in_cond)
         elif base in ROUTE_METHODS and target and ROUTE_OBJECTS.match(target):
             first = _string_value(kids[0], src) if kids else ""
             if first.startswith("/") or base == "use":
@@ -5023,7 +5066,8 @@ UPDATE exports AS e SET symbol_id = x.id FROM
             cache_use[target][1] += 1
 
     def _hook_row(self, n: Any, rec: FileRec, bufs: Buffers, base: str,
-                  kids: list, sid: Optional[int], line: int) -> None:
+                  kids: list, sid: Optional[int], line: int,
+                  in_loop: int, in_cond: int) -> None:
         src = rec.data
         deps = -1
         has_deps = 0
@@ -5038,14 +5082,15 @@ UPDATE exports AS e SET symbol_id = x.id FROM
         bufs.rows("hooks").append(
             (rec.fid, sid, line, base[:120], int(base in BUILTIN_HOOKS),
              has_deps, deps, cleanup,
-             int(_ancestor_of(n, LOOP_NODE_TYPES) is not None),
-             int(_ancestor_of(n, CONDITION_NODE_TYPES) is not None),
+             in_loop,
+             in_cond,
              int("addEventListener" in cbtxt or ".on(" in cbtxt
                  or "subscribe" in cbtxt),
              int("setInterval" in cbtxt or "setTimeout" in cbtxt
                  or "requestAnimationFrame" in cbtxt)))
 
-    def _jsx_row(self, n: Any, rec: FileRec, bufs: Buffers) -> None:
+    def _jsx_row(self, n: Any, rec: FileRec, bufs: Buffers,
+                 in_loop: int) -> None:
         src = rec.data
         nm = n.child_by_field_name("name")
         tag = text_of(nm, src) if nm is not None else "<>"
@@ -5072,7 +5117,7 @@ UPDATE exports AS e SET symbol_id = x.id FROM
             (rec.fid, self._owner(n.start_byte), n.start_point[0] + 1,
              tag[:120], int(bool(tag) and (tag[0].isupper() or "." in tag)),
              len(attrs), n_spread, has_key, inline_obj, inline_fn, dangerous,
-             int(_ancestor_of(n, LOOP_NODE_TYPES) is not None)))
+             in_loop))
 
     def _module_cache_candidates(self, root: Any,
                                  src: bytes) -> dict[str, tuple]:
