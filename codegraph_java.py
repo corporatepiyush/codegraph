@@ -2243,6 +2243,9 @@ class BodyStats:
     input_sites: list[tuple[str, str, int, bool]] = dc_field(default_factory=list)
     #: (value, line) -- G07 credential-shaped string literals
     secrets: list[tuple[str, int]] = dc_field(default_factory=list)
+    #: (kind, node, loop_depth) -- lock/resources link rows captured on the
+    #: SAME walk as measure instead of a second body traversal per symbol.
+    extra_rows: list[tuple[str, Any, int]] = dc_field(default_factory=list)
 
     def bump(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -4539,6 +4542,10 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                     # Class.staticField = v -- the ctor-time static write
                     # shape; this.x is an instance write and is excluded.
                     st.bump("n_static_write_ctor")
+            # static_write rows: captured on THIS walk and replayed in
+            # function_extra, which used to re-walk the whole body.
+            st.extra_rows.append(("assignment_expression", node,
+                                  loop_depth))
         elif t == "cast_expression":
             ty = node.child_by_field_name("type")
             if ty is not None and ty.type in ("generic_type",):
@@ -4577,18 +4584,29 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                 if any(k in tname for k in ("Exception", "Error",
                                             "Throwable")):
                     st.bump("n_dead_exception")
+            # resources rows: captured on THIS walk and replayed in
+            # function_extra, which used to re-walk the whole body.
+            st.extra_rows.append(("object_creation_expression", node,
+                                  loop_depth))
         elif t == "synchronized_statement" and loop_depth:
             st.bump("lock_in_loop")
+            # lock_ops rows: captured on THIS walk and replayed in
+            # function_extra, which used to re-walk the whole body.
+            st.extra_rows.append((t, node, loop_depth))
+        elif t == "synchronized_statement":
+            st.extra_rows.append((t, node, loop_depth))
         elif t == "method_invocation" and loop_depth:
             nm = node.child_by_field_name("name")
             if nm is not None and _txt(nm, src) in ("lock", "tryLock",
                                                     "lockInterruptibly"):
                 st.bump("lock_in_loop")
+            st.extra_rows.append((t, node, loop_depth))
         elif t == "method_invocation":
             obj = node.child_by_field_name("object")
             if obj is not None and _txt(obj, src) == "super":
                 # missing-super-call: framework hooks that forget super.
                 st.bump("n_super_calls")
+            st.extra_rows.append((t, node, loop_depth))
         elif t in ("switch_expression", "switch_statement"):
             if "->" in _txt(node, src)[:2000]:
                 # modern-idiom-candidates: an arrow switch expression.
@@ -4598,6 +4616,13 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                 # modern-idiom-candidates: pattern matching instanceof -- the
                 # pattern variable is the `name` field of the expression.
                 st.bump("n_modern_idioms")
+        elif t in ("resource", "catch_clause", "throw_statement",
+                   "if_statement"):
+            # resources/exceptions rows: captured on THIS walk and replayed
+            # in function_extra, which used to re-walk the whole body.
+            st.extra_rows.append((t, node, loop_depth))
+        elif t == "identifier":
+            st.extra_rows.append(("identifier", node, 0))
 
     # -- hazards -----------------------------------------------------------
     def hazard_of(self, callee: str) -> Optional[tuple[str, str]]:
@@ -4934,7 +4959,6 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
         body = node.child_by_field_name(self.BODY_FIELD) or node
         btxt = _txt(body, src)
         closes = ".close()" in btxt or "closeQuietly" in btxt
-        loop_types = set(self.LOOP_NODES)
         volatiles = self.volatile_fields.get(owner, set())
         statics = self.static_fields.get(owner, set())
         tlocals = self.threadlocal_fields.get(owner, set())
@@ -4944,10 +4968,11 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
         n_tl_remove = 0
         acq = 0
 
-        for n, _depth in walk_cursor(body):
-            t = n.type
+        # Events are captured during measure's single body walk (see on_node),
+        # in the same DFS order -- this used to re-walk the whole body per
+        # symbol, 7% of wall time on netty.
+        for t, n, depth in stats.extra_rows:
             if t == "synchronized_statement":
-                depth = _ancestor_loop_depth(n, body, loop_types)
                 target = ""
                 for c in n.named_children:
                     if c.type == "parenthesized_expression":
@@ -4974,7 +4999,6 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                 recv = _txt(obj, src).strip()[:80] if (
                     obj is not None and obj.type in QUALIFIER_NODES) else ""
                 if mname in ("lock", "lockInterruptibly", "tryLock"):
-                    depth = _ancestor_loop_depth(n, body, loop_types)
                     region = _enclosing_region(n, body)
                     flags = _region_flags(region, src) if region is not None \
                         else (0, 0, 0, 0, 0)
@@ -4991,7 +5015,6 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                          max(0, acq - 1), 0, 0, 0, 0, 0, 0,
                          n.start_point[0] + 1))
                 elif _opens_resource(mname, recv):
-                    depth = _ancestor_loop_depth(n, body, loop_types)
                     bufs.rows("resources").append(
                         (sid, fid, "", mname[:80],
                          ("%s.%s" % (recv, mname) if recv else mname)[:120],
@@ -5006,7 +5029,6 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                 ty = n.child_by_field_name("type")
                 tname = _simple_type(_txt(ty, src)) if ty is not None else ""
                 if tname in RESOURCE_TYPES:
-                    depth = _ancestor_loop_depth(n, body, loop_types)
                     bufs.rows("resources").append(
                         (sid, fid, "", tname[:80], ("new " + tname)[:120],
                          int(_in_try_resources(n, body)), int(closes),
@@ -5029,7 +5051,6 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                 empty = int(cb is not None and not cb.named_children)
                 rethrow = int("throw " in ctxt)
                 logs = int("log" in ctxt.lower() or "printStackTrace" in ctxt)
-                depth = _ancestor_loop_depth(n, body, loop_types)
                 for c in n.named_children:
                     if c.type != "catch_formal_parameter":
                         continue
@@ -5048,7 +5069,6 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                 if kids and kids[0].type == "object_creation_expression":
                     ty = kids[0].child_by_field_name("type")
                     tn = _simple_type(_txt(ty, src)) if ty is not None else ""
-                depth = _ancestor_loop_depth(n, body, loop_types)
                 bufs.rows("exceptions").append(
                     (sid, fid, "throw", tn[:120],
                      int(tn in BROAD_EXCEPTIONS), 0, 0, 0, int(depth > 0),
