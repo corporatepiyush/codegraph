@@ -6008,15 +6008,17 @@ GoAnalyzer.METRICS = [
     "     compiler does -- but it pads for alignment, and nothing here computes\n"
     "     the exact size, which is why size_exact is 0 on every row. Anything\n"
     "     under about 32 bytes copies for free.",
-    """SELECT s.name AS in_fn, s.n_range_value_copy AS range_copies,
+    """WITH mod_struct_max AS (
+        SELECT ty.module_id AS mid, MAX(st.est_size) AS mx_est
+        FROM structs st JOIN symbols ty ON ty.id=st.symbol_id
+        GROUP BY ty.module_id)
+    SELECT s.name AS in_fn, s.n_range_value_copy AS range_copies,
         s.max_loop_depth AS depth, s.call_in_loop AS calls_in_loop,
-        s.fan_in, s.sloc,
-        (SELECT MAX(st.est_size) FROM structs st
-         JOIN symbols ty ON ty.id=st.symbol_id
-         WHERE ty.module_id=s.module_id) AS biggest_local_struct,
+        s.fan_in, s.sloc, mx.mx_est AS biggest_local_struct,
         f.path || ':' || s.line_start AS at
     FROM symbols s JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
+    LEFT JOIN mod_struct_max mx ON mx.mid = s.module_id
     WHERE s.n_range_value_copy > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.n_range_value_copy DESC, s.max_loop_depth DESC LIMIT :lim"""),
@@ -6169,19 +6171,24 @@ GoAnalyzer.METRICS = [
     "     The modules column lists the dependents.\n"
     "MISLEADS a utility like log.Printf is called from everywhere and is\n"
     "     intentionally stable; high fan_in from many modules is the design.",
-    """SELECT s.name, COUNT(DISTINCT m.id) AS n_caller_modules,
+    """SELECT s.name, agg.n AS n_caller_modules,
         s.fan_in, s.cyclomatic AS cyclo, s.sloc,
-        GROUP_CONCAT(DISTINCT m.name) AS modules,
+        agg.names AS modules,
         f.path || ':' || s.line_start AS at
     FROM symbols s
-    JOIN edges e ON e.callee_id=s.id
-    JOIN symbols caller ON caller.id=e.caller_id
-    LEFT JOIN modules m ON m.id=caller.module_id
+    JOIN (SELECT callee_id,
+                 COUNT(DISTINCT module_id) AS n,
+                 GROUP_CONCAT(DISTINCT module_name) AS names
+          FROM (SELECT e.callee_id, m.id AS module_id,
+                       m.name AS module_name
+                FROM edges e
+                JOIN symbols caller ON caller.id=e.caller_id
+                LEFT JOIN modules m ON m.id=caller.module_id
+                WHERE e.is_self=0 AND COALESCE(m.name,'') LIKE :mod) t
+          GROUP BY callee_id HAVING n > 5) agg
+      ON agg.callee_id = s.id
     JOIN files f ON f.id=s.file_id
     WHERE s.kind IN ('function','method') AND f.is_test=0
-      AND e.is_self=0 AND COALESCE(m.name,'') LIKE :mod
-    GROUP BY s.id
-    HAVING n_caller_modules > 5
     ORDER BY n_caller_modules DESC, s.fan_in DESC LIMIT :lim"""),
 (
     "god-module",
@@ -6217,14 +6224,13 @@ GoAnalyzer.METRICS = [
         UNION
         SELECT w.root, e.callee_id, w.depth+1
         FROM walk w JOIN edges e ON e.caller_id=w.sym
-        WHERE w.depth < 8 AND e.is_self=0),
-    reach(root, sym, depth) AS (
-        SELECT root, sym, MIN(depth) FROM walk GROUP BY root, sym)
-    SELECT s.name, MIN(r.depth) AS min_depth,
+        WHERE w.depth < 8 AND e.is_self=0)
+    SELECT s.name, MIN(r.min_depth) AS min_depth,
         COUNT(DISTINCT r.root) AS n_entrypoints,
         s.fan_in, s.cyclomatic AS cyclo, s.sloc,
         f.path || ':' || s.line_start AS at
-    FROM reach r
+    FROM (SELECT root, sym, MIN(depth) AS min_depth
+          FROM walk GROUP BY root, sym) r
     JOIN symbols s ON s.id=r.sym
     JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id

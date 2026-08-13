@@ -6283,12 +6283,19 @@ PhpAnalyzer.QUERIES = [
     "     namespaced aliases of the parent can undercount; a concrete\n"
     "     subclass that never overrides a given abstract method is counted\n"
     "     as a potential implementor, not a proven one.",
-    """SELECT c.name AS abstract_class, c.namespace,
+    """WITH RECURSIVE split(cid, rest, tok) AS (
+        SELECT symbol_id, extends, '' FROM classes c WHERE c.extends <> ''
+        UNION ALL
+        SELECT cid,
+               CASE WHEN instr(rest, ',') > 0
+                    THEN substr(rest, instr(rest, ',') + 1) ELSE '' END,
+               CASE WHEN instr(rest, ',') > 0
+                    THEN substr(rest, 1, instr(rest, ',') - 1) ELSE rest END
+        FROM split WHERE rest <> '')
+    SELECT c.name AS abstract_class, c.namespace,
         c.is_final AS final_,
-        (SELECT COUNT(*) FROM classes k
-          WHERE instr(',' || k.extends || ',', ',' || c.name || ',') > 0
-             OR instr(',' || k.extends || ',',
-                      ',' || substr(c.fqn, 2) || ',') > 0)
+        (SELECT COUNT(DISTINCT cid) FROM split
+          WHERE tok = c.name OR tok = substr(c.fqn, 2))
             AS concrete_subclasses,
         f.path || ':' || c.line AS at
     FROM classes c JOIN files f ON f.id=c.file_id
