@@ -298,17 +298,17 @@ service to warm; the cost is the parse itself, paid once per run.
 **Query counts (this revision):**
 
 | Script | QUERIES (act) | METRICS (weigh) | total |
-|---|---|---|---|---|
+|---|---|---|---|
 | `codegraph_python.py` | 57 | 23 | 80 |
 | `codegraph_go.py` | 59 | 17 | 76 |
-| `codegraph_c.py` | 43 | 26 | 69 |
+| `codegraph_c.py` | 53 | 33 | 86 |
 | `codegraph_java.py` | 50 | 17 | 67 |
 | `codegraph_typescript.py` | 51 | 19 | 70 |
 | `codegraph_ruby.py` | 55 | 9 | 64 |
 | `codegraph_rust.py` | 51 | 14 | 65 |
 | `codegraph_javascript.py` | 41 | 14 | 55 |
 | `codegraph_php.py` | 49 | 13 | 62 |
-| **All** | **456** | **152** | **608** |
+| **All** | **466** | **159** | **625** |
 
 (Single source of truth for these numbers: run `codegraph_<lang>.py --list` and
 `--metrics --list`. If the table disagrees with the scripts, the scripts win.)
@@ -578,7 +578,7 @@ Unsafe reachability is the central question — what a safe API can pull in:
   `untrusted-deserialization`, `zip-slip-surface`,
   `hardcoded-secret-candidates`
 
-### C (43 act, 26 weigh)
+### C (53 act, 33 weigh)
 
 Ownership and layout are measured byte-accurately — the regex scanner models
 structs, alignment and alloc/free pairs:
@@ -589,28 +589,37 @@ structs, alignment and alloc/free pairs:
   `division-by-zero-surface`, `unchecked-conversion-on-an-io-path`,
   `stack-exhaustion`, `toctou-access-open`
 - **Concurrency & races** — `race-surface`, `race-condition-surface`,
-  `nonreentrant-under-threads`, `signal-handler-unsafe`, `infinite-loop`
+  `nonreentrant-under-threads`, `signal-handler-unsafe`, `infinite-loop`,
+  `lock-imbalance`, `lock-under-io`
 - **Allocation** — `allocator-mixing`, `alloc-per-iteration`, `bypass-tax`,
-  `alloc-cost` (M)
+  `alloc-without-sizeof`, `error-path-frees`, `alloc-cost` (M),
+  `alloc-site-inventory` (M)
+- **Copy & truncation** — `memcpy-sizeof-mismatch`, `truncating-cast-flow`,
+  `signed-size-compare`, `copy-hotspots` (M)
 - **Loops & vectorisation** — `per-element-dispatch`, `loop-invariant-strlen`,
   `nested-loops` (M), `vectorisation-blocked` (M), `explicit-simd` (M)
 - **Layout** — `struct-padding` (M), `cache-line-crossers` (M),
   `cache-hostile-layout` (M), `stack-pressure` (M), `cast-density` (M),
-  `macro-machinery` (M)
+  `macro-machinery` (M), `struct-abi-surface` (M)
 - **Structure & linkage** — `vtable-risk`, `fnptr-blindspot-callers`,
-  `recursion-loops`, `global-state-mutation`, `unreferenced-includes`,
-  `blast-radius`, `cross-file-struct-coupling`, `extern-linkage-density`,
+  `dispatch-table-orphan`, `recursion-loops`, `global-state-mutation`,
+  `global-writer-concentration`, `unreferenced-includes`, `blast-radius`,
+  `cross-file-struct-coupling`, `extern-linkage-density`,
   `cross-tu-signature-drift`, `linkage-scope-mismatch`,
   `extern-symbol-asymmetry`, `include-cycles`, `header-scope-ratio`,
-  `header-fanout` (M), `backend-parity` (M), `config-gated` (M),
-  `hand-linked-objects` (M), `profiler-invisible` (M), `module-coupling` (M),
+  `header-fanout` (M), `backend-parity` (M), `hand-linked-objects` (M),
+  `profiler-invisible` (M), `module-coupling` (M),
   `undocumented-complexity` (M)
 - **Standards (CERT/MISRA)** — `switch-no-default`, `unused-return-value`,
   `macro-side-effect`, `const-cast-away`, `goto-spaghetti` (M),
   `deep-nesting` (M), `too-many-params` (M), `magic-number` (M),
-  `error-shape-mix`
+  `error-shape-mix`, `error-handling-density` (M)
 - **Security** — `untrusted-frontier`, `risky-process-apis`,
-  `hardcoded-secret-candidates`
+  `variadic-format-forwarder`, `hardcoded-secret-candidates`
+- **Graph shape** — `graph-blindspots` (M), `hot-multipliers` (M),
+  `risk-ranked` (M), `call-chain-depth` (M), `global-state-map` (M),
+  `scattered-concerns` (M), `config-gated` (M), `macro-reach` (M),
+  `dead-code`, `parse-coverage` (M)
 
 ---
 

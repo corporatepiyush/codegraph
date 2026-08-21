@@ -316,6 +316,8 @@ class ParserHandle:
                 self.runtime_version, self.grammar_pip, self.grammar_version)
         if self.mode == MODE_NATIVE:
             return "parser: %s" % self.note
+        if self.mode == MODE_BRACE_SCAN:
+            return "parser: %s" % self.note
         return "parser: REGEX FALLBACK (%s) -- spans and nesting are approximate" % self.note
 
 def load(lang_name: str, grammar_module: str, grammar_pip: str,
@@ -590,7 +592,7 @@ class Query:
 # every shared query to branch.
 # ==========================================================================
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 COMMON_SKIP_DIRS = {
     ".git", ".hg", ".svn", ".jj", ".idea", ".vscode", ".vs", ".claude",
@@ -2581,7 +2583,84 @@ TOCTOU_OPEN_RE = re.compile(r'\bopen\s*\(\s*([A-Za-z_]\w*)')
 #: is used even when no direct call edge exists.
 ADDR_TAKEN_RE = re.compile(r'&\s*([A-Za-z_]\w*)')
 
+#: File-scope reference in ARGUMENT or INITIALIZER position:
+#: `MAKE_CMD(...,clusterCommand,-3)`, `{&get, &set}`, `{ helper_b }` --
+#: how generated and hand-written dispatch tables spell "this function is
+#: used" without a call and sometimes without an `&`. The name is preceded
+#: by `(`,`,`,`&` or `{` and followed by `,` or `}` -- which excludes
+#: prototypes (`foo(`), calls, declarations (`foo;`, `foo =`), type uses
+#: (`struct foo {`) and casts (`(foo)x`). Joined against defined function
+#: names later, so non-function identifiers cost rows, not correctness.
+FILE_SCOPE_REF_RE = re.compile(
+    r'(?<=[(,&{])[ \t]*(&[ \t]*)?([A-Za-z_]\w*)[ \t]*(?=[,)}])')
+
 MEMBER_CALL_RE = re.compile(r'(?:->|(?<![.\d])\.)\s*\w+\s*\(')
+
+# -- deeper-insight captures ------------------------------------------------
+# Every pattern below runs on the BLANKED text (comments and literals are
+# spaces), so a match position always maps to the true line, and no string
+# literal can masquerade as code.
+
+#: pthread-style lock/unlock pairs. The pairing question is per function:
+#: every lock acquired on some path must be released on that path.
+LOCK_ACQUIRE_RE = re.compile(
+    r'\b((?:pthread_mutex|pthread_rwlock|pthread_spinlock)_lock'
+    r'|pthread_mutex_trylock|pthread_rwlock_tryrdlock|pthread_rwlock_trywrlock'
+    r'|sem_wait)\s*\(')
+LOCK_RELEASE_RE = re.compile(
+    r'\b(?:pthread_mutex_unlock|pthread_rwlock_unlock|pthread_spinlock_unlock'
+    r'|sem_post)\s*\(')
+
+#: `memcpy(dst, src, n)` -- first three argument texts. For the copy
+#: functions the SIZE lives in the third argument, and the CERT ARR38-C
+#: question is "does the size expression name the dst buffer, the src
+#: buffer, or neither?" -- so all three are captured. An argument may
+#: contain ONE level of parentheses (sizeof(buf), a->len) but not a
+#: nested call-with-call; anything deeper ends the capture rather than
+#: risk a wrong split. memset/sprintf/snprintf have their own shapes and
+#: only fill dst/src meaningfully.
+MEMOP_ARG_RE = re.compile(
+    r'\b(memcpy|memmove|strcpy|strncpy|strcat|strncat|memset|sprintf|'
+    r'snprintf)\s*\(\s*'
+    r'((?:[^(),]|\([^()]*\)){1,80})'
+    r'\s*,\s*'
+    r'((?:[^(),]|\([^()]*\)){1,80})'
+    r'(?:\s*,\s*'
+    r'((?:[^(),]|\([^()]*\)){1,80}))?')
+
+#: `malloc(n)` / `calloc(a,b)` -- the size expression text, so "multiplied by
+#: sizeof(T)" can be separated from "raw byte count" and "no sizeof at all".
+ALLOCSITE_RE = re.compile(r'\b(malloc|calloc|realloc|alloca)\s*\(')
+
+#: `(int)u32`, `(long)i8` -- casts between widths. A cast to a STRICTLY
+#: narrower type is where a value silently truncates; same-width casts are
+#: noise. Only fixed-width targets are matched: `int`/`long` are platform-
+#: dependent and would lie about the width. The cast must be APPLIED: the
+#: follower is an identifier, `(`, `*` (deref) or `&` (address-of) --
+#: which also keeps `sizeof(uint32_t)` out, since a `)` follows there.
+NARROW_CAST_RE = re.compile(
+    r'\(\s*(?:uint8_t|int8_t|uint16_t|int16_t|uint32_t|int32_t)\s*\)'
+    r'\s*\(?\s*[A-Za-z_&*]')
+
+#: `if (x < sizeof(b))` / `while (i <= len)` -- signed-vs-size_t comparison.
+#: The left operand is an identifier with no suffix; if it is a signed local
+#: this is the classic negative-value-becomes-huge wrap (CERT INT31-C).
+#: Two alternatives: against sizeof(...) directly, or against an
+#: identifier NAMED like a size (len/size/count/n...) compared in turn
+#: against another identifier. The broken `|\b(len|size|count|n)\w*...`
+#: alternative of the first version could never match (the operator group
+#: had already consumed past it) -- kept as one coherent second arm now.
+SIGN_CMP_SIZEOF_RE = re.compile(
+    r'\b(?:if|while|for)\s*\(\s*!?\s*([A-Za-z_]\w*)\s*(<=|>=|<|>|==|!=)\s*'
+    r'(?:sizeof\s*\(\s*\w+\s*\)|[A-Za-z_]\w*)'
+    r'|\b([A-Za-z_]\w*(?:len|size|cnt|count)|len|size|count|n_[a-z]\w+)\b'
+    r'\s*(<=|>=|<|>|==|!=)\s*[A-Za-z_]\w*')
+
+#: `snprintf(buf, n, fmt, ...)` inside a variadic function whose parameter
+#: list ends in `...`: the wrapper that forwards attacker-controlled format
+#: arguments without a format-string literal of its own.
+VARIADIC_FMT_WRAP_RE = re.compile(
+    r'\b(v?snprintf|v?sprintf|v?fprintf|v?printf|syslog)\s*\(')
 
 MAKE_RULE_RE = re.compile(r'^([A-Za-z0-9_./$()%-]+)\s*:[^=]')
 
@@ -2638,59 +2717,84 @@ def line_of(text: str, pos: int) -> int:
     """1-based line number for byte offset `pos` in `text`."""
     return bisect.bisect_right(_nl_index(text), pos) + 1
 
+class _BodyLines:
+    """Line numbers for offsets inside ONE function body, without caching.
+
+    The global cache is keyed on string identity; a function body is a fresh
+    slice used for a handful of lookups, so every lookup missed and rebuilt
+    the whole index -- 155k rebuilds on the profiling corpus (0.7s). This
+    counts the body's newlines once and answers by bisect over a list that
+    is usually tiny; `line_start` anchors offset 0 to its true line.
+    """
+    __slots__ = ("_offs", "_base")
+
+    def __init__(self, body: str, line_start: int) -> None:
+        offs = []
+        find = body.find
+        pos = find('\n')
+        while pos >= 0:
+            offs.append(pos + 1)
+            pos = find('\n', pos + 1)
+        self._offs = offs
+        self._base = line_start
+
+    def of(self, pos: int) -> int:
+        return bisect.bisect_right(self._offs, pos) + self._base
+
+#: One-pass tokenizer for blank_c. re.finditer scans at C speed; the first
+#: version walked every character in Python (0.56s of self-time on the
+#: profiling corpus). The pattern matches only token STARTS (a quote alone
+#: matches its quote char); the literal body is consumed in Python with the
+#: exact escape rules the original loop used, so edge cases keep their
+#: meaning: a newline inside an unterminated string ends it WITHOUT being
+#: blanked (it stays a real newline), and an escaped quote never closes.
+_BLANK_TOKEN = re.compile(r'/\*|//|"|\'')
+
 def blank_c(src: str) -> str:
     """Comments and string/char literals -> spaces.
 
-    Newlines are preserved so every byte offset in the result still maps to the
-    same line in the original. That invariant is what lets the whole rest of
-    this file scan the blanked text and still report exact line numbers.
+    Newlines are preserved so every byte offset in the result still maps to
+    the same line in the original. That invariant is what lets the whole
+    rest of this file scan the blanked text and still report exact line
+    numbers.
     """
     n = len(src)
-    i = 0
-    segments: list[str] = []
+    out: list[str] = []
     prev = 0
-
-    def emit_blank(start: int, end: int) -> None:
-        segments.append(src[prev:start])
-        segments.append(''.join('\n' if ch == '\n' else ' '
-                                for ch in src[start:end]))
-
-    while i < n:
-        two = src[i:i + 2]
-        if two == "/*":
-            j = src.find("*/", i + 2)
-            j = n if j < 0 else j + 2
-            emit_blank(i, j)
-            i = j
-            prev = i
-            continue
-        if two == "//":
-            j = src.find('\n', i)
-            j = n if j < 0 else j
-            emit_blank(i, j)
-            i = j
-            prev = i
-            continue
-        c = src[i]
-        if c in '"\'':
-            q, j = c, i + 1
+    pos = 0
+    for m in _BLANK_TOKEN.finditer(src):
+        if m.start() < pos:
+            continue                      # token inside an already-eaten span
+        start = m.start()
+        tok = m.group(0)
+        if tok == "/*":
+            j = src.find("*/", start + 2)
+            end = n if j < 0 else j + 2
+        elif tok == "//":
+            j = src.find('\n', start)
+            end = n if j < 0 else j
+        else:
+            q = tok                       # '"' or "'"
+            j = start + 1
             while j < n:
-                if src[j] == '\\':
+                c = src[j]
+                if c == '\\':
                     j += 2
                     continue
-                if src[j] == q:
+                if c == q:
                     j += 1
                     break
-                if src[j] == '\n':
-                    break
+                if c == '\n':
+                    break                 # unterminated: newline survives
                 j += 1
-            emit_blank(i, j)
-            i = j
-            prev = i
-            continue
-        i += 1
-    segments.append(src[prev:])
-    return ''.join(segments)
+            end = j
+        out.append(src[prev:start])
+        out.append(''.join('\n' if ch == '\n' else ' '
+                           for ch in src[start:end]))
+        prev = end
+        pos = end
+    out.append(src[prev:])
+    return ''.join(out)
 
 def scan_defects(raw: str, blank: str) -> tuple[int, int]:
     """(n_parse_errors, n_missing_nodes) for one file.
@@ -2913,38 +3017,87 @@ def layout_struct(flds: list[tuple[Any, ...]], is_union: bool) -> tuple[
     tail = (-off) % maxalign if maxalign else 0
     return out, off + tail, tail, all_exact, maxalign
 
+#: Precompiled for expr_counts. The first version passed pattern STRINGS to
+#: re.findall ~30 times per function; every call paid the re-cache lookup
+#: and 488k findall calls made this the single hottest line in the profile.
+_EC_DEREF = re.compile(r'(?<![->])\*\s*[A-Za-z_(]')
+_EC_MEMBER = re.compile(r'(?<![.\d])\.(?=[A-Za-z_])')
+_EC_ADDROF = re.compile(r'(?<!\w)&[A-Za-z_]')
+_EC_CAST = re.compile(r'\(\s*(?:const\s+)?[A-Za-z_]\w*\s*\*+\s*\)')
+_EC_CMP = re.compile(r'==|!=|<=|>=|(?<![=<])<(?![<=])|(?<![=>])>(?![>=])')
+_EC_ASSIGN = re.compile(r'(?<![+\-*/%&|^<>!=])=(?!=)')
+_EC_FLOAT = re.compile(r'\b\d+\.\d+')
+_EC_NULLCHK = re.compile(r'(?:==|!=)\s*NULL|\bif\s*\(\s*!\s*\w+\s*\)')
+#: Rare keyword scans merged into ONE pass. Nine separate findall calls
+#: over every body cost more than this single alternation, and each of
+#: them matches nothing in the overwhelming majority of functions.
+#: Group index -> metric name; the tally loop is branch-poor. The
+#: intrinsic branch wraps INTRIN_RE's pattern with its own group turned
+#: non-capturing, so group numbering stays 1..7.
+#: __builtin_expect belongs to TWO metrics (likely AND builtin), and one
+#: scan cannot count the same text twice -- so builtin keeps its own pass
+#: (it is rare; the cost is one C-level scan that usually finds nothing).
+_EC_BUILTIN = re.compile(r'__builtin_\w+')
+_EC_RARE = re.compile(
+    r'(atomic_\w+|__atomic_\w+|_Atomic\b)'      # 1 atomic
+    r'|\b(volatile)\b'                          # 2 volatile
+    r'|\b(restrict\b|__restrict)'               # 3 restrict
+    r'|\b(likely|unlikely|__builtin_expect)\b'  # 4 likely
+    r'|(_Static_assert|static_assert)'          # 5 static_assert
+    r'|\b('
+    + INTRIN_RE.pattern.removeprefix(r'\b').replace('(', '(?:', 1)
+    + r')')                                     # 6 intrinsic
+_EC_RARE_IDX = {1: "n_atomic", 2: "n_volatile", 3: "n_restrict",
+                4: "n_likely", 5: "n_static_assert", 6: "n_intrinsic"}
+_COMPOUND_OPS = ('+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=',
+                 '>>=')
+
 def expr_counts(body: str) -> dict[str, int]:
-    """Expression-level texture: what the code is made of, not how big it is."""
+    """Expression-level texture: what the code is made of, not how big it is.
+
+    `str.count` runs in C over the whole string and beats a regex for any
+    fixed token, so every fixed-token metric uses count(); only the ones
+    needing context (lookarounds, alternation) keep a precompiled regex.
+    The seven rare-keyword scans are one alternation pass.
+    """
     arrow = body.count("->")
-    return dict(
-        n_deref=len(re.findall(r'(?<![->])\*\s*[A-Za-z_(]', body)) + arrow,
+    out = dict(
+        n_deref=len(_EC_DEREF.findall(body)) + arrow,
         n_arrow=arrow,
         n_subscript=body.count("["),
-        n_member_access=arrow + len(re.findall(r'(?<![.\d])\.(?=[A-Za-z_])', body)),
-        n_addrof=len(re.findall(r'(?<!\w)&[A-Za-z_]', body)),
-        n_cast=len(re.findall(r'\(\s*(?:const\s+)?[A-Za-z_]\w*\s*\*+\s*\)', body)),
-        n_sizeof=len(re.findall(r'\bsizeof\b', body)),
+        n_member_access=arrow + len(_EC_MEMBER.findall(body)),
+        n_addrof=len(_EC_ADDROF.findall(body)),
+        n_cast=len(_EC_CAST.findall(body)),
+        n_sizeof=body.count("sizeof"),
         n_ternary=body.count('?'),
-        n_bitop=sum(body.count(c) for c in '&|^~'),
+        n_bitop=body.count('&') + body.count('|') + body.count('^')
+            + body.count('~'),
         n_shift=body.count('<<') + body.count('>>'),
-        n_arith=sum(body.count(c) for c in '+-*/%'),
-        n_cmp=len(re.findall(r'==|!=|<=|>=|(?<![=<])<(?![<=])|(?<![=>])>(?![>=])', body)),
-        n_assign=len(re.findall(r'(?<![+\-*/%&|^<>!=])=(?!=)', body)),
-        n_compound_assign=sum(body.count(s) for s in ('+=','-=','*=','/=','%=','&=','|=','^=','<<=','>>=')),
+        n_arith=body.count('+') + body.count('-') + body.count('*')
+            + body.count('/') + body.count('%'),
+        n_cmp=len(_EC_CMP.findall(body)),
+        n_assign=len(_EC_ASSIGN.findall(body)),
+        n_compound_assign=sum(body.count(s) for s in _COMPOUND_OPS),
         n_incdec=body.count('++') + body.count('--'),
         n_logical=body.count('&&') + body.count('||'),
-        n_float_lit=len(re.findall(r'\b\d+\.\d+', body)),
-        n_null_check=len(re.findall(r'(?:==|!=)\s*NULL|\bif\s*\(\s*!\s*\w+\s*\)', body)),
-        n_intrinsic=len(INTRIN_RE.findall(body)),
-        n_atomic=len(re.findall(r'\batomic_\w+|__atomic_\w+|_Atomic\b', body)),
-        n_volatile=len(re.findall(r'\bvolatile\b', body)),
-        n_restrict=len(re.findall(r'\brestrict\b|__restrict', body)),
-        n_likely=len(re.findall(r'\b(likely|unlikely|__builtin_expect)\b', body)),
-        n_builtin=len(re.findall(r'__builtin_\w+', body)),
-        n_static_assert=len(re.findall(r'_Static_assert|static_assert', body)),
+        n_float_lit=len(_EC_FLOAT.findall(body)),
+        n_null_check=len(_EC_NULLCHK.findall(body)),
+        n_intrinsic=0, n_atomic=0, n_volatile=0, n_restrict=0,
+        n_likely=0, n_static_assert=0,
+        n_builtin=len(_EC_BUILTIN.findall(body)),
         n_labels=len(LABEL_RE.findall(body)),
         n_cases=len(CASE_RE.findall(body)),
     )
+    # Rare keywords: one pass, tally by group index. __builtin_expect
+    # belongs to TWO metrics (likely AND builtin), so every non-None
+    # group tallies -- no break.
+    for m in _EC_RARE.finditer(body):
+        for gi in range(1, 7):
+            if m.group(gi) is not None:
+                out[_EC_RARE_IDX[gi]] += 1
+    return out
+
+_RETURN_SHAPE_NEG = re.compile(r'^-\s*\d+$')
 
 def return_shapes(body: str) -> dict[str, int]:
     """How a function reports failure.
@@ -2961,7 +3114,7 @@ def return_shapes(body: str) -> dict[str, int]:
             r["ret_void"] += 1
         elif v == "NULL":
             r["ret_null"] += 1
-        elif re.match(r'^-\s*\d+$', v):
+        elif _RETURN_SHAPE_NEG.match(v):
             r["ret_neg"] += 1
         elif v == "0":
             r["ret_zero"] += 1
@@ -3064,8 +3217,16 @@ def loop_analysis(body: str) -> dict[str, int]:
         i += 1
     return r
 
+#: One pass feeds both max_nesting and cognitive in metrics().
+_METRICS_BRACE = re.compile(r'[{}]|\b(?:if|for|while|switch|catch)\b')
+
 def metrics(body: str) -> dict[str, int]:
-    """Size and control-flow shape."""
+    """Size and control-flow shape.
+
+    The nesting and cognitive passes were two separate walks over every
+    body byte (a pure-Python char loop, then a finditer over braces); one
+    combined finditer pass produces both numbers.
+    """
     nl = nb = ns = ng = nr = nc = nlog = 0
     for m in METRIC_KW.finditer(body):
         t = m.group(0)
@@ -3085,22 +3246,24 @@ def metrics(body: str) -> dict[str, int]:
         if t == 'return':
             nr += 1
     cyclo = 1 + nc + nlog
-    depth = mx = cog = 0
-    for ch in body:
-        if ch == "{":
-            depth += 1
-            mx = max(mx, depth)
-        elif ch == "}":
-            depth = max(0, depth - 1)
+    mx = cog = 0
     d = 0
-    for m in re.finditer(r'[{}]|\b(if|for|while|switch|catch)\b', body):
+    # One pass: braces update depth/max-depth; decision keywords add their
+    # nesting depth to the cognitive total. Same numbers as the old two
+    # passes: max_nesting was a plain brace walk (blanked text has no
+    # string-literal braces), and cognitive's keyword set is identical.
+    for m in _METRICS_BRACE.finditer(body):
         t = m.group(0)
         if t == "{":
             d += 1
+            if d > mx:
+                mx = d
         elif t == "}":
-            d = max(0, d - 1)
+            d -= 1
+            if d < 0:
+                d = 0
         else:
-            cog += max(1, d)
+            cog += d if d > 1 else 1
     idents = IDENT.findall(body)
     ops = OPERATOR.findall(body)
     return dict(
@@ -3251,6 +3414,17 @@ class CAnalyzer(Analyzer):
         # -- P2 pack: const-cast, toctou ------------------------------------
         ("n_const_cast", "INT NOT NULL DEFAULT 0"),
         ("n_toctou", "INT NOT NULL DEFAULT 0"),
+        # -- deeper-insight pack ---------------------------------------------
+        ("n_lock_acquire", "INT NOT NULL DEFAULT 0"),
+        ("n_lock_release", "INT NOT NULL DEFAULT 0"),
+        ("n_narrow_cast", "INT NOT NULL DEFAULT 0"),
+        ("n_sign_cmp", "INT NOT NULL DEFAULT 0"),
+        ("n_variadic_fmt", "INT NOT NULL DEFAULT 0"),
+        ("n_memcpy", "INT NOT NULL DEFAULT 0"),
+        ("n_allocsite", "INT NOT NULL DEFAULT 0"),
+        ("n_allocsite_nosizeof", "INT NOT NULL DEFAULT 0"),
+        ("n_global_read", "INT NOT NULL DEFAULT 0"),
+        ("n_global_write", "INT NOT NULL DEFAULT 0"),
     )
 
     SCHEMA_EXT = r"""
@@ -3291,15 +3465,20 @@ CREATE TABLE layout(
      line INT NOT NULL DEFAULT 0
  ) STRICT;
 
- -- `&fn` expressions: addresses taken of in-tree functions. A function whose
- -- only uses are address-taken is invisible to the call graph (the call goes
- -- through a pointer) -- fnptr-blindspot-callers ranks exactly those.
+ -- `&fn` expressions and bare function-name references in argument
+ -- position at file scope (dispatch-table entries). A function whose only
+ -- uses are address-taken or table-listed is invisible to the call graph
+ -- (the call goes through a pointer) -- fnptr-blindspot-callers ranks
+ -- exactly those. `kind` splits body-level address-takes ('addr',
+ -- symbol_id set) from file-scope initializer references ('addr'/'ref',
+ -- symbol_id NULL); non-function names are pruned in post_build.
  CREATE TABLE addr_taken(
      id INTEGER PRIMARY KEY,
      symbol_id INT REFERENCES symbols(id),
      file_id INT NOT NULL REFERENCES files(id),
      name TEXT NOT NULL,
-     line INT NOT NULL DEFAULT 0
+     line INT NOT NULL DEFAULT 0,
+     kind TEXT NOT NULL DEFAULT 'addr'
  ) STRICT;
 
  CREATE TABLE secret_candidates(
@@ -3307,6 +3486,35 @@ CREATE TABLE layout(
      symbol_id INT REFERENCES symbols(id),
      file_id INT NOT NULL REFERENCES files(id),
      value TEXT NOT NULL,
+     line INT NOT NULL
+ ) STRICT;
+
+ -- Every malloc/calloc/realloc/alloca call with its size-expression text.
+ -- The sizeof question ("was the element count multiplied by the element
+ -- size?") is answerable from the expression, not from a count.
+ CREATE TABLE allocsites(
+     id INTEGER PRIMARY KEY,
+     symbol_id INT NOT NULL REFERENCES symbols(id),
+     file_id INT NOT NULL REFERENCES files(id),
+     fn TEXT NOT NULL,
+     size_expr TEXT NOT NULL,
+     line INT NOT NULL
+ ) STRICT;
+
+ -- memcpy-family calls with their first three argument texts. `size_buf`
+ -- is the identifier the SIZE expression dereferences (inside its
+ -- sizeof()), extracted at capture time so the mismatch query is a
+ -- plain comparison instead of string surgery in SQL.
+ CREATE TABLE memops(
+     id INTEGER PRIMARY KEY,
+     symbol_id INT NOT NULL REFERENCES symbols(id),
+     file_id INT NOT NULL REFERENCES files(id),
+     fn TEXT NOT NULL,
+     dst TEXT NOT NULL,
+     src TEXT NOT NULL,
+     size_arg TEXT NOT NULL DEFAULT '',
+     size_buf TEXT NOT NULL DEFAULT '',
+     dst_tail TEXT NOT NULL DEFAULT '',
      line INT NOT NULL
  ) STRICT;
 
@@ -3351,23 +3559,38 @@ CREATE TABLE config_blocks(
     is_config INT NOT NULL DEFAULT 0
 ) STRICT;
 
--- Transitive caller counts computed in Python after resolve_calls (the call
--- graph is a DAG-plus-cycles, so SQL recursion would re-expand per path).
--- `n_transitive` is the number of DISTINCT functions that can reach the
--- symbol through resolved edges at any depth.
+-- Transitive caller/callee counts computed in Python after resolve_calls
+-- (the call graph is a DAG-plus-cycles, so SQL recursion would re-expand
+-- per path). `n_transitive` is the number of DISTINCT functions that can
+-- REACH the symbol through resolved edges at any depth; `n_transitive_out`
+-- is the number of DISTINCT functions the symbol can reach -- upward blast
+-- radius and downward exposure respectively.
 CREATE TABLE reach(
     symbol_id INT NOT NULL PRIMARY KEY REFERENCES symbols(id),
-    n_transitive INT NOT NULL DEFAULT 0
+    n_transitive INT NOT NULL DEFAULT 0,
+    n_transitive_out INT NOT NULL DEFAULT 0
 ) WITHOUT ROWID, STRICT;
 
-CREATE TABLE makefile_rules(
+ CREATE TABLE makefile_rules(
+     id INTEGER PRIMARY KEY,
+     path TEXT NOT NULL,
+     rule TEXT NOT NULL,
+     line INT NOT NULL,
+     n_objs INT NOT NULL DEFAULT 0,
+     n_srcs INT NOT NULL DEFAULT 0,
+     uses_ar INT NOT NULL DEFAULT 0
+ ) STRICT;
+
+-- Include cycles, computed once in post_build. The first version walked
+-- paths in a recursive CTE; on PostgreSQL's 13.8k-edge include graph that
+-- enumerates PATHS (exponentially many) rather than cycles, and never
+-- finished. The Python pass is bounded DFS per root with a visited-set.
+CREATE TABLE include_cycles(
     id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL,
-    rule TEXT NOT NULL,
-    line INT NOT NULL,
-    n_objs INT NOT NULL DEFAULT 0,
-    n_srcs INT NOT NULL DEFAULT 0,
-    uses_ar INT NOT NULL DEFAULT 0
+    a_path TEXT NOT NULL,
+    b_path TEXT NOT NULL,
+    length INT NOT NULL,
+    members TEXT NOT NULL
 ) STRICT;
 """
 
@@ -3383,8 +3606,11 @@ CREATE INDEX idx_glob_name ON globals(name);
 CREATE INDEX idx_symbols_concurrency ON symbols(module_id) WHERE n_concurrency>0;
 CREATE INDEX idx_cfg_expr ON config_blocks(expr) WHERE is_config=1;
 CREATE INDEX idx_reach_fan ON reach(n_transitive DESC) WHERE n_transitive>0;
+CREATE INDEX idx_reach_out ON reach(n_transitive_out DESC) WHERE n_transitive_out>0;
 CREATE INDEX idx_decl_name ON declarations(name);
 CREATE INDEX idx_addrtaken ON addr_taken(name);
+CREATE INDEX idx_addrtaken_sym ON addr_taken(symbol_id) WHERE symbol_id IS NOT NULL;
+CREATE INDEX idx_fn_fanin0 ON symbols(kind, fan_in) WHERE kind='function' AND fan_in=0 AND is_test=0;
 CREATE INDEX idx_secret_sym ON secret_candidates(symbol_id);
 CREATE INDEX idx_mk_rule ON makefile_rules(n_objs DESC, n_srcs DESC);
 CREATE INDEX idx_fn_fnptr ON symbols(n_fnptr_calls DESC, name, file_id) WHERE n_fnptr_calls>0;
@@ -3398,6 +3624,14 @@ CREATE INDEX idx_fn_strlen ON symbols(strlen_in_loop DESC, name, file_id) WHERE 
 CREATE INDEX idx_fn_intrin ON symbols(n_intrinsic DESC, name, file_id) WHERE n_intrinsic>0;
 CREATE INDEX idx_fn_cast ON symbols(n_cast DESC, name, file_id) WHERE n_cast>0;
 CREATE INDEX idx_fn_inline ON symbols(fan_in DESC, name, file_id) WHERE is_inline=1 AND is_static=1;
+CREATE INDEX idx_fn_lockacq ON symbols(n_lock_acquire DESC, name, file_id) WHERE n_lock_acquire>0;
+CREATE INDEX idx_fn_narrow ON symbols(n_narrow_cast DESC, name, file_id) WHERE n_narrow_cast>0;
+CREATE INDEX idx_fn_signcmp ON symbols(n_sign_cmp DESC, name, file_id) WHERE n_sign_cmp>0;
+CREATE INDEX idx_fn_gwrite ON symbols(n_global_write DESC, name, file_id) WHERE n_global_write>0;
+CREATE INDEX idx_allocsite_fn ON allocsites(fn, symbol_id);
+CREATE INDEX idx_allocsite_sym ON allocsites(symbol_id);
+CREATE INDEX idx_memops_fn ON memops(fn, symbol_id);
+CREATE INDEX idx_memops_sym ON memops(symbol_id);
 """
 
     VIEW_EXT = r"""
@@ -3530,8 +3764,8 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
             return idx >= 0 and ln <= ends[idx]
 
         self._prototypes(rec, blank, in_function, bufs)
-        self._globals(rec, blank, db, in_function)
-        self._functions(rec, raw, blank, funcs, db, bufs)
+        globals_ = self._globals(rec, blank, db, in_function)
+        self._functions(rec, raw, blank, funcs, db, bufs, globals_)
 
         db.execute("UPDATE files SET n_parse_errors=?, n_missing_nodes=?, "
                    "parse_ms=? WHERE id=?",
@@ -3670,10 +3904,44 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                 self.declared.add(nm)
                 bufs.rows("declarations").append(
                     (rec.fid, nm, line_of(blank, m.start())))
+        # File-scope uses: the dispatch-table initializer (`static struct
+        # cmd cmds[] = {&get, &set}`) and the generated-table argument
+        # (`MAKE_CMD(...,clusterCommand,-3)`) that body scans never see.
+        # Recorded with symbol_id NULL and kind 'addr'/'ref' so they are
+        # distinguishable from a body-level `&fn` -- these are exactly the
+        # shapes that keep a function alive while fan_in reads zero.
+        # Macro bodies are skipped: `&var` inside `#define atomicIncr(var,
+        # ...)` is a PARAMETER reference, and counting it would fabricate
+        # uses of whatever the parameter happens to be named after.
+        # A directive owns its CONTINUATION lines too -- a `#define X ... \
+        # ... &var` spans several physical lines, and only the first was
+        # excluded before, so the continuation lines' `&var` leaked in.
+        directive_lines: set[int] = set()
+        in_cont = False
+        for ln_no, ln_text in enumerate(blank.splitlines(), 1):
+            is_dir = in_cont or ln_text.lstrip().startswith("#")
+            if is_dir:
+                directive_lines.add(ln_no)
+            in_cont = is_dir and ln_text.rstrip().endswith("\\")
+
+        for am in FILE_SCOPE_REF_RE.finditer(blank):
+            if in_function(line_of(blank, am.start())):
+                continue
+            if line_of(blank, am.start()) in directive_lines:
+                continue
+            nm = am.group(2)
+            if nm in KEYWORDS or nm in TYPE_WORDS:
+                continue
+            kind = "addr" if am.group(1) else "ref"
+            bufs.rows("addr_taken").append(
+                (None, rec.fid, nm, line_of(blank, am.start()), kind))
 
     def _globals(self, rec: FileRec, blank: str, db: sqlite3.Connection,
-                 in_function) -> None:
+                 in_function) -> list[tuple[str, int]]:
+        """File-scope objects, and the (name, line) list the per-function
+        global read/write pass consumes."""
         rows = []
+        names: list[tuple[str, int]] = []
         for m in GLOBAL_RE.finditer(blank):
             ln = line_of(blank, m.start())
             if in_function(ln):
@@ -3682,6 +3950,7 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
             if gname in KEYWORDS or ctype.strip() in (
                     "return", "typedef", "case", "goto", "else", "do"):
                 continue
+            names.append((gname, ln))
             rows.append((
                 rec.fid, rec.mid, gname, re.sub(r'\s+', ' ', ctype).strip()[:120],
                 ln,
@@ -3695,11 +3964,13 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                 "INSERT INTO globals(file_id,module_id,name,type,line,is_static,"
                 "is_const,is_volatile,is_atomic,is_array,ptr_depth,has_init) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        return names
 
     # -- functions ---------------------------------------------------------
     def _functions(self, rec: FileRec, raw: str, blank: str,
                    funcs: list[tuple[Any, ...]], db: sqlite3.Connection,
-                   bufs: Buffers) -> None:
+                   bufs: Buffers,
+                   globals_: list[tuple[str, int]] = ()) -> None:
         raw_lines = raw.splitlines()
         for name, sig, ls, le, st, inl, body, boff in funcs:
             mt = metrics(body)
@@ -3708,6 +3979,8 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
             rs = return_shapes(body)
             ps = split_params(sig)
             raw_body = raw[boff:boff + len(body)]
+            blines = _BodyLines(body, ls)
+            rlines = _BodyLines(raw_body, ls)
             n_cmt = sum(1 for l in raw_body.splitlines()
                         if l.strip().startswith(("/*", "//", "*")))
             doc, ndoc = has_leading_comment(raw_lines, ls)
@@ -3721,7 +3994,7 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                 ptr = len(lstars or "")
                 ltype = (stor + lty + (" " + lstars if lstars else "")).strip()
                 locs.append((len(locs), lname[:80], ltype[:120],
-                             line_of(body, lm.start()) + ls - 1,
+                             blines.of(lm.start()),
                              1 if "const" in stor else 0,
                              0 if "const" in stor else 1, 0,
                              1 if lm.group(6) else 0, 0, 0, ptr))
@@ -3729,7 +4002,7 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
 
             mags = [m for m in NUM_RE.finditer(body)
                     if not _is_ok_magic(m.group(1))]
-            calls, n_calls, fnptr = self._scan_calls(body, boff, raw)
+            calls, n_calls, fnptr = self._scan_calls(body, rlines)
 
             # -- P2 pack ----------------------------------------------------
             # const-cast-away (CERT EXP05-C): a `(T*)` cast applied to a
@@ -3748,12 +4021,140 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
             # addr_taken: `&fn` in this body -- a use the call graph cannot
             # see; fnptr-blindspot-callers joins these against fan_in=0.
             # sid is assigned below; buffer the pairs until it exists.
-            addr_rows = [(am.group(1), line_of(body, am.start()) + ls - 1)
+            addr_rows = [(am.group(1), blines.of(am.start()))
                          for am in ADDR_TAKEN_RE.finditer(body)]
+
+            # -- deeper-insight pack -----------------------------------------
+            # Lock pairing: every acquire should have a release on the same
+            # path. The counts land in columns; the pairing verdict is a
+            # query (lock-imbalance), because "acquires 2, releases 1" is
+            # only suspicious, not wrong.
+            n_lock_acquire = len(LOCK_ACQUIRE_RE.findall(body))
+            n_lock_release = len(LOCK_RELEASE_RE.findall(body))
+            # Narrow casts: (uint32_t)x and friends -- silent truncation.
+            n_narrow_cast = len(NARROW_CAST_RE.findall(body))
+            # Signed-vs-size comparisons: `if (i < sizeof(b))` where i may
+            # be a signed local. CERT INT31-C's wrap shape. Loop-initial
+            # declarations (`for (int i = 0; ...)`) never match LOCAL_RE
+            # (it anchors at line start), so the candidate set adds
+            # builtin-typed declarations from the body. unsigned/size_t
+            # declarations are EXCLUDED: they cannot go negative, so they
+            # are not the wrap shape.
+            local_names = {l[1] for l in locs}
+            param_names = {p[2] for p in ps if p[2]}
+            for_decl = set()
+            for m4 in re.finditer(
+                    r'\b((?:long\s+|short\s+)*int)\s+([A-Za-z_]\w*)\s*=', body):
+                prefix = body[max(0, m4.start() - 9):m4.start()]
+                if "unsigned" not in prefix and "size_t" not in prefix \
+                        and "uint" not in prefix:
+                    for_decl.add(m4.group(2))
+            known = local_names | param_names | for_decl
+            n_sign_cmp = sum(
+                1 for m3 in SIGN_CMP_SIZEOF_RE.finditer(body)
+                if (m3.group(1) or m3.group(3)) in known)
+            # Variadic format wrappers: this fn is variadic AND forwards to
+            # a vprintf-family call -- the format string it passes decides
+            # whether caller-controlled %n is reachable.
+            n_variadic_fmt = (
+                len(VARIADIC_FMT_WRAP_RE.findall(body))
+                if any(p[6] for p in ps) else 0)
+            # memcpy-family sites with argument text (dst, src, size).
+            # size_buf: the identifier inside the size expression's
+            # sizeof(...) -- `sizeof(dst->buf)` -> 'buf', `sizeof(*p)` ->
+            # 'p', `len * 4` -> ''. A TYPE operand (sizeof(struct x),
+            # sizeof(int), sizeof(uint32_t)) yields '' -- a type has no
+            # buffer identity, and counting it would invent mismatches.
+            # dst_tail: last path element of dst (`s->cmds` -> 'cmds') so
+            # the SQL is two plain equality tests.
+            memop_rows = []
+            for m3 in MEMOP_ARG_RE.finditer(body):
+                dst = m3.group(2).strip()
+                sarg = (m3.group(4) or "").strip()
+                buf = ""
+                sm = re.search(r'sizeof\s*\(\s*(.*?)\s*\)', sarg)
+                if sm:
+                    operand = sm.group(1)
+                    tm = re.match(
+                        r'(?:struct|union|enum)\s+[A-Za-z_]\w*'
+                        r'|u?int(?:8|16|32|64)_t|char|int|long|short|float'
+                        r'|double|unsigned\s+\w+|size_t', operand)
+                    if not tm:
+                        nm = re.search(r'([A-Za-z_]\w*)\s*$', operand)
+                        if nm:
+                            buf = nm.group(1)
+                else:
+                    idm = IDENT.search(sarg)
+                    if idm and not re.match(r'^\d', sarg):
+                        buf = idm.group(0)
+                dtail = re.split(r'[.>\[\]]', dst)[-1].strip() or dst
+                memop_rows.append(
+                    (m3.group(1), dst[:120],
+                     m3.group(3).strip()[:120], sarg[:120], buf, dtail[:80],
+                     blines.of(m3.start())))
+            # Allocation sites with their size expression. The closing
+            # paren is found by COUNTING depth -- body.find(")") stops at
+            # the first one, truncating `malloc(sizeof(struct x) * n)` to
+            # `sizeof(struct x`.
+            alloc_rows: list[tuple[str, str, int]] = []
+            for am2 in ALLOCSITE_RE.finditer(body):
+                d2 = 1
+                j = am2.end()
+                while j < len(body) and d2:
+                    if body[j] == "(":
+                        d2 += 1
+                    elif body[j] == ")":
+                        d2 -= 1
+                    j += 1
+                if d2 or (j - am2.end()) > 160:
+                    continue
+                szexpr = re.sub(r'\s+', ' ',
+                                body[am2.end():j - 1]).strip()[:150]
+                alloc_rows.append((am2.group(1), szexpr,
+                                   blines.of(am2.start())))
+            n_allocsite = len(alloc_rows)
+            n_allocsite_nosizeof = sum(
+                1 for _, sz, _ in alloc_rows if "sizeof" not in sz)
+            # Global reads/writes: which of THIS FILE's file-scope objects
+            # appear in the body. A write is `g =` (not ==), a compound
+            # assignment, or ++/-- on either side; everything else --
+            # including every comparison -- is a read. Same-file only: a
+            # cross-TU extern reference is invisible to this scan, and
+            # pretending otherwise would invent coupling.
+            # A DEREF write through a global pointer (`*gptr = 5`) is NOT
+            # a write to the pointer itself -- the star sits BEFORE the
+            # name, so a `*` immediately before the identifier means the
+            # identifier is only the address being written through.
+            gnames = {gn for gn, _ in globals_}
+            n_global_read = n_global_write = 0
+            if gnames:
+                compound = ("+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+                            "<<=", ">>=")
+                for im in IDENT.finditer(body):
+                    tok = im.group(0)
+                    if tok not in gnames:
+                        continue
+                    before = body[max(0, im.start() - 2):im.start()]
+                    if before.endswith("*"):
+                        n_global_read += 1          # *gptr = ... : gptr is
+                        continue                    # read for its address
+                    e2 = im.end()
+                    while e2 < len(body) and body[e2] in " \t\r\n":
+                        e2 += 1
+                    nxt = body[e2:e2 + 3]
+                    if nxt.startswith("=") and not nxt.startswith("=="):
+                        n_global_write += 1          # g = ...
+                    elif nxt[:2] in compound:
+                        n_global_write += 1          # g += ...
+                    elif nxt[:2] in ("++", "--") or before.endswith(
+                            ("++", "--")):
+                        n_global_write += 1          # ++g / g++
+                    else:
+                        n_global_read += 1
 
             m: dict[str, Any] = {}
             m.update(mt)
-            m.update({k: v for k, v in la.items()})
+            m.update(la)
             m.update(ec)
             m.update(rs)
             m["n_string_lit"] = len(STRING_LIT.findall(raw_body))
@@ -3778,6 +4179,16 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
             m["n_dynamic_calls"] = fnptr
             m["n_const_cast"] = n_const_cast
             m["n_toctou"] = n_toctou
+            m["n_lock_acquire"] = n_lock_acquire
+            m["n_lock_release"] = n_lock_release
+            m["n_narrow_cast"] = n_narrow_cast
+            m["n_sign_cmp"] = n_sign_cmp
+            m["n_variadic_fmt"] = n_variadic_fmt
+            m["n_memcpy"] = len(memop_rows)
+            m["n_allocsite"] = n_allocsite
+            m["n_allocsite_nosizeof"] = n_allocsite_nosizeof
+            m["n_global_read"] = n_global_read
+            m["n_global_write"] = n_global_write
 
             qual = ("%s:%s" % (rec.rel, name)) if st else name
             sid = self._insert_symbol(
@@ -3786,7 +4197,14 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
 
             for tname, tline in addr_rows:
                 bufs.rows("addr_taken").append(
-                    (sid, rec.fid, tname, tline))
+                    (sid, rec.fid, tname, tline, "addr"))
+
+            for afn, szexpr, aline in alloc_rows:
+                bufs.rows("allocsites").append(
+                    (sid, rec.fid, afn, szexpr, aline))
+            for mfn, dst, src, sarg, sbuf, dtail, mline in memop_rows:
+                bufs.rows("memops").append(
+                    (sid, rec.fid, mfn, dst, src, sarg, sbuf, dtail, mline))
 
             for l in locs:
                 bufs.locals.append((sid,) + l[:10])
@@ -3794,7 +4212,7 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                 v = m2.group(1)
                 bufs.literals.append(
                     (sid, rec.fid, "hex" if v[:2].lower() == "0x" else "int",
-                     v[:40], line_of(body, m2.start()) + ls - 1, 1))
+                     v[:40], blines.of(m2.start()), 1))
             for sm in STRING_LIT.finditer(raw_body):
                 sl = sm.group(0)
                 if len(sl) >= SECRET_MIN_LEN and " " not in sl \
@@ -3802,7 +4220,7 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                     # G07: credential-shaped literal -- candidate, not verdict
                     bufs.rows("secret_candidates").append(
                         (sid, rec.fid, sl[:200],
-                         line_of(body, sm.start()) + ls - 1))
+                         blines.of(sm.start())))
             for am in ATTR_RE.finditer(sig):
                 bufs.attributes.append((sid, rec.fid, am.group(1)[:80], None, ls))
             for pos, ptype, pname, stars, is_arr, is_const, is_var in ps:
@@ -3821,8 +4239,8 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                 self.pend_lines.append(call_lines)
             self.fn_by_name.setdefault(name, []).append((sid, rec.fid, rec.mid))
 
-    def _scan_calls(self, body: str, boff: int,
-                    raw: str) -> tuple[dict[str, list[int]], int, int]:
+    def _scan_calls(self, body: str,
+                    rlines: _BodyLines) -> tuple[dict[str, list[int]], int, int]:
         """Every `ident(` in a body, with the line of EVERY occurrence.
 
         This used to keep only the first line per callee, which cost 35% of a
@@ -3855,7 +4273,7 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
                                               and body[j - 1] == "-")):
                 continue                      # member call: counted as indirect
             n_calls += 1
-            calls.setdefault(tok, []).append(line_of(raw, boff + s))
+            calls.setdefault(tok, []).append(rlines.of(s))
         fnptr = (len(FNPTR_CALL_RE.findall(body))
                  + len(MEMBER_CALL_RE.findall(body)))
         return calls, n_calls + fnptr, fnptr
@@ -3908,6 +4326,12 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
         db.executemany(sql, rows)
         self._sym_buckets[key] = []
 
+    #: Cached (cols, values-template-builder) for _insert_symbol. The
+    #: column list is invariant for the life of the process; sorting ~150
+    #: names PER FUNCTION dominated the profile (15k sorts, 2.1M generator
+    #: steps on the profiling corpus).
+    _sym_layout: Optional[tuple[list[str], Any]] = None
+
     def _insert_symbol(self, db: sqlite3.Connection, rec: FileRec, name: str,
                        kind: str, line_start: int, line_end: int, qual: str,
                        signature: str, return_type: str, visibility: str,
@@ -3919,16 +4343,20 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
         old variable-width per-row INSERT because every metric column is
         `INT NOT NULL DEFAULT 0`.
         """
-        cols = ["file_id", "module_id", "name", "qual_name", "kind",
-                "line_start", "line_end", "n_lines", "signature",
-                "return_type", "visibility"]
-        metric_cols = sorted(c for c in _SYMBOL_COLS
-                             if c not in cols and c != "id")
-        full_cols = cols + metric_cols
+        layout = CAnalyzer._sym_layout
+        if layout is None:
+            cols = ["file_id", "module_id", "name", "qual_name", "kind",
+                    "line_start", "line_end", "n_lines", "signature",
+                    "return_type", "visibility"]
+            metric_cols = sorted(c for c in _SYMBOL_COLS
+                                 if c not in cols and c != "id")
+            layout = CAnalyzer._sym_layout = (cols + metric_cols, metric_cols)
+        full_cols, metric_cols = layout
+        g = m.get
         vals: list[Any] = [rec.fid, rec.mid, name, qual[:400], kind,
                            line_start, line_end, line_end - line_start + 1,
                            signature[:400], return_type[:200], visibility]
-        vals += [int(m.get(c, 0)) for c in metric_cols]
+        vals += [int(g(c, 0)) for c in metric_cols]
         return self._new_symbol(db, full_cols, vals)
 
     def flush_symbols(self, db: sqlite3.Connection) -> None:
@@ -4068,11 +4496,17 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
             ("declarations",
              "INSERT INTO declarations(file_id,name,line) VALUES(?,?,?)"),
             ("addr_taken",
-             "INSERT INTO addr_taken(symbol_id,file_id,name,line) "
-             "VALUES(?,?,?,?)"),
+             "INSERT INTO addr_taken(symbol_id,file_id,name,line,kind) "
+             "VALUES(?,?,?,?,?)"),
             ("secret_candidates",
              "INSERT INTO secret_candidates(symbol_id,file_id,value,line) "
              "VALUES(?,?,?,?)"),
+            ("allocsites",
+             "INSERT INTO allocsites(symbol_id,file_id,fn,size_expr,line) "
+             "VALUES(?,?,?,?,?)"),
+            ("memops",
+             "INSERT INTO memops(symbol_id,file_id,fn,dst,src,size_arg,"
+             "size_buf,dst_tail,line) VALUES(?,?,?,?,?,?,?,?,?)"),
         ):
             rows = bufs.extra.get(tbl)
             if rows:
@@ -4143,42 +4577,210 @@ UPDATE symbols AS s SET n_alloc = x.n FROM
         db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
                    ("layout_model", "LP64: pointer 8/8, long 8, int 4; "
                                     "sizes reported only where exact=1"))
+        self._prune_addr_taken(db)
         self._transitive_fan(db)
+        self._include_cycles(db)
 
-    def _transitive_fan(self, db: sqlite3.Connection) -> None:
-        """Count distinct callers that can reach each symbol through resolved
-        edges, at any depth.
+    def _include_cycles(self, db: sqlite3.Connection) -> None:
+        """User-header include cycles, via bounded DFS from each root.
 
-        The call graph is a DAG with cycles, so a SQL walk over edges would
-        re-expand every path; a traversal of the REVERSE adjacency in Python
-        is O(V+E) per node and exact on the resolved edges: each symbol gets
-        the set of distinct callers (fan-in) that can reach it. Results feed
-        `blast-radius`, whose answer is the transitive CALLER set.
+        The recursive-CTE version enumerated PATHS -- exponentially many on
+        a dense include graph (PostgreSQL's 13.8k edges never finished) --
+        where the ANSWER is only cycles. Each root runs a depth-capped DFS
+        with a per-path visited set; returning to the root records one
+        cycle, deduplicated by member set so `a->b->a` and its rotation
+        are one row. Depth cap 8: longer include chains are beyond review.
         """
         edges = db.execute(
-            "SELECT caller_id, callee_id FROM edges").fetchall()
-        if not edges:
-            return
-        callers: dict[int, list[int]] = {}
-        symbols = {c for c, _ in edges} | {k for _, k in edges}
-        for caller, callee in edges:
-            callers.setdefault(callee, []).append(caller)
-        rows: list[tuple[int, int]] = []
-        for sym in symbols:
-            seen: set[int] = set()
-            stack = [sym]
+            "SELECT i.file_id, i.target_id FROM imports i "
+            "JOIN files sf ON sf.id=i.file_id "
+            "WHERE i.target_id IS NOT NULL AND i.is_relative=1 "
+            "AND i.kind='include' AND sf.is_test=0").fetchall()
+        adj: dict[int, set[int]] = {}
+        for a, b in edges:
+            adj.setdefault(a, set()).add(b)
+        paths = dict(db.execute("SELECT id, path FROM files"))
+        seen: set[frozenset[int]] = set()
+        rows: list[tuple[str, str, int, str]] = []
+        for root in sorted(adj):
+            stack = [(root, [root])]
             while stack:
-                cur = stack.pop()
-                for nxt in callers.get(cur, ()):
-                    if nxt not in seen and nxt != sym:
-                        seen.add(nxt)
-                        stack.append(nxt)
-            if seen:
-                rows.append((sym, len(seen)))
+                node, path = stack.pop()
+                for nxt in adj.get(node, ()):
+                    if nxt == root and len(path) >= 2:
+                        key = frozenset(path)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        members = [paths.get(f_, "?") for f_ in path]
+                        rows.append((members[0], members[-1], len(path),
+                                     " -> ".join(members)))
+                    elif nxt not in path and len(path) < 8:
+                        stack.append((nxt, path + [nxt]))
+                if len(rows) > 5000:      # absurd-cycle safety valve
+                    break
         if rows:
             db.executemany(
-                "INSERT OR REPLACE INTO reach(symbol_id, n_transitive) "
-                "VALUES(?,?)", rows)
+                "INSERT INTO include_cycles(a_path,b_path,length,members) "
+                "VALUES(?,?,?,?)", rows)
+
+    def _prune_addr_taken(self, db: sqlite3.Connection) -> None:
+        """Drop file-scope rows whose name is not a function defined here.
+
+        The file-scope capture is textual and deliberately wide (argument
+        position at file scope), so it also catches data identifiers --
+        `dictCreate(&commandTableDictType)` names a TYPE object. The
+        fnptr queries join on defined function names, but the dead weight
+        is real: pruning here keeps the table honest for ad-hoc SQL too.
+        Body-level rows are never pruned; their capture is `&name` inside
+        a function body and is already narrow.
+        """
+        n = db.execute(
+            "DELETE FROM addr_taken WHERE symbol_id IS NULL AND name NOT IN "
+            "(SELECT name FROM symbols WHERE kind='function')").rowcount
+        db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                   ("addr_taken_pruned",
+                    "%d non-function file-scope references dropped" % n))
+
+    def _transitive_fan(self, db: sqlite3.Connection) -> None:
+        """Distinct callers that can reach each symbol, and distinct callees
+        each symbol can reach, through resolved edges at any depth.
+
+        The naive version DFS'd the adjacency once per symbol --
+        O(V*(V+E)), which on a 35k-function tree is billions of set
+        operations and the better part of an hour before the first query
+        answers. This computes both directions in three passes:
+
+          1. Tarjan SCC (iterative -- a deep call chain must not blow the
+             Python stack), which folds every cycle into one node.
+          2. A predecessor and a successor closure over the condensation,
+             one big-int OR per edge: `preds[C] = OR over predecessors P of
+             preds[P]|bit(P)`, and symmetrically for succs. Components are
+             processed callers-first for preds and callees-first for succs
+             (Tarjan emits components in reverse topological order, so one
+             direction reads the list forwards and the other backwards),
+             which makes each step a plain fold.
+          3. popcount per member. A member of a cycle can reach, and be
+             reached by, every other member, so a component of size k
+             contributes k-1 to each of its members in both directions.
+
+        Results feed `blast-radius` (callers) and `call-chain-depth`
+        (callees). Same tables, same numbers, no per-symbol traversal.
+        """
+        edges = db.execute(
+            "SELECT caller_id, callee_id FROM edges "
+            "WHERE caller_id <> callee_id").fetchall()
+        if not edges:
+            return
+        adj: dict[int, list[int]] = {}
+        nodes: set[int] = set()
+        for caller, callee in edges:
+            nodes.add(caller)
+            nodes.add(callee)
+            adj.setdefault(caller, []).append(callee)
+
+        # -- Tarjan, iterative --------------------------------------------
+        index: dict[int, int] = {}
+        low: dict[int, int] = {}
+        onstk: set[int] = set()
+        stk: list[int] = []
+        comps: list[list[int]] = []
+        counter = 0
+        for root in nodes:
+            if root in index:
+                continue
+            index[root] = low[root] = counter
+            counter += 1
+            stk.append(root)
+            onstk.add(root)
+            work: list[tuple[int, Any]] = [(root, iter(adj.get(root, ())))]
+            while work:
+                v, it = work[-1]
+                descended = False
+                for w in it:
+                    if w not in index:
+                        index[w] = low[w] = counter
+                        counter += 1
+                        stk.append(w)
+                        onstk.add(w)
+                        work.append((w, iter(adj.get(w, ()))))
+                        descended = True
+                        break
+                    if w in onstk and index[w] < low[v]:
+                        low[v] = index[w]
+                if descended:
+                    continue
+                work.pop()
+                if work:
+                    u = work[-1][0]
+                    if low[v] < low[u]:
+                        low[u] = low[v]
+                if low[v] == index[v]:
+                    comp = []
+                    while True:
+                        w = stk.pop()
+                        onstk.discard(w)
+                        comp.append(w)
+                        if w == v:
+                            break
+                    comps.append(comp)
+
+        # -- closures over the condensation --------------------------------
+        # One bit PER NODE, not per component: a merged cycle of k nodes
+        # stands for k distinct callers/callees, and a single bit per
+        # component undercounts by exactly k-1 (caught by differential
+        # test against a naive DFS). Each component owns the bit range
+        # [off[c], off[c]+size); folding a predecessor ORs in its whole
+        # range, so popcounts stay plain.
+        comp_of: dict[int, int] = {}
+        for ci, comp in enumerate(comps):
+            for v in comp:
+                comp_of[v] = ci
+        off: list[int] = []
+        nxt = 0
+        for comp in comps:
+            off.append(nxt)
+            nxt += len(comp)
+
+        def mask(ci: int) -> int:
+            return ((1 << len(comps[ci])) - 1) << off[ci]
+
+        pred_edges: dict[int, list[int]] = {}
+        succ_edges: dict[int, list[int]] = {}
+        for caller, callee in edges:
+            pc, cc = comp_of[caller], comp_of[callee]
+            if pc != cc:
+                pred_edges.setdefault(cc, []).append(pc)
+                succ_edges.setdefault(pc, []).append(cc)
+        preds: dict[int, int] = {}
+        succs: dict[int, int] = {}
+        # Tarjan emits components callees-first: reversed() is the
+        # callers-first order the predecessor fold needs, and forward order
+        # is the callees-first order the successor fold needs.
+        for ci in reversed(range(len(comps))):
+            acc = 0
+            for p in pred_edges.get(ci, ()):
+                acc |= preds.get(p, 0) | mask(p)
+            preds[ci] = acc
+        for ci in range(len(comps)):
+            acc = 0
+            for c2 in succ_edges.get(ci, ()):
+                acc |= succs.get(c2, 0) | mask(c2)
+            succs[ci] = acc
+
+        rows: list[tuple[int, int, int]] = []
+        for ci, comp in enumerate(comps):
+            base_in = preds[ci].bit_count()
+            base_out = succs[ci].bit_count()
+            extra = len(comp) - 1      # fellow cycle members reach both ways
+            if base_in + base_out + extra == 0:
+                continue
+            for v in comp:
+                rows.append((v, base_in + extra, base_out + extra))
+        if rows:
+            db.executemany(
+                "INSERT OR REPLACE INTO reach(symbol_id, n_transitive, "
+                "n_transitive_out) VALUES(?,?,?)", rows)
 
 def _is_ok_magic(tok: str) -> bool:
     """Integers nobody should be asked to name."""
@@ -4693,22 +5295,30 @@ QUERIES: list[tuple[str, str, str, str]] = [
     ORDER BY s.fan_in DESC LIMIT :lim"""),
 (
     "macro-side-effect",
-    "Function-like macro that may evaluate arguments twice (CERT PRE31-C)",
-    "ANSWERS where a function-like macro is defined, which may evaluate its\n"
-    "     arguments more than once. If an argument has side effects (i++, f()),\n"
-    "     the result is undefined.\n"
-    "ACT use a static inline function instead of a macro.\n"
-    "MISLEADS a macro that does not reference its arguments more than once is\n"
-    "     safe. The graph sees the macro but not its body.",
-    """SELECT s.name, s.kind,
-        s.n_macro_calls AS macro_calls,
-        s.n_calls, s.fan_in,
+    "Heavily-used function-like macro that may evaluate arguments twice (CERT PRE31-C)",
+    "ANSWERS the function-like macros with the most use sites -- each use\n"
+    "     passes its arguments through the macro body once PER REFERENCE in\n"
+    "     that body, so an argument with side effects (i++, f()) is\n"
+    "     evaluated however many times the body names it. `uses` is the\n"
+    "     call-shaped reference count from call resolution.\n"
+    "ACT convert the top rows to static inline functions: identical\n"
+    "     runtime cost, but types checked, breakpoints possible, and the\n"
+    "     double-evaluation hazard gone.\n"
+    "MISLEADS a macro that references each argument exactly once is safe\n"
+    "     and lands here anyway (the body text is captured in macros.body\n"
+    "     -- read it before acting); a macro used only as a non-call token\n"
+    "     shows zero uses.",
+    """SELECT s.name, mc.n_uses AS uses,
+        mc.n_params AS params, mc.body_len AS body_len,
+        mc.is_multiline AS multiline,
         f.path || ':' || s.line_start AS at
-    FROM symbols s JOIN files f ON f.id=s.file_id
+    FROM macros mc
+    JOIN symbols s ON s.id=mc.symbol_id
+    JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
-    WHERE s.kind='macro' AND s.fan_in > 3 AND f.is_test=0
+    WHERE mc.is_functionlike=1 AND mc.n_uses > 3
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.fan_in DESC LIMIT :lim"""),
+    ORDER BY mc.n_uses DESC LIMIT :lim"""),
 (
     "vtable-risk",
     "Functions reached through function pointers or dynamic member calls",
@@ -4823,16 +5433,26 @@ QUERIES: list[tuple[str, str, str, str]] = [
     "     here by construction (the scanner sees function calls only); a header\n"
     "     whose functions are CALLED THROUGH POINTERS is also invisible. This is\n"
     "     a candidate list, not a delete list.",
-    """SELECT f.path AS header, f.sloc,
-        (SELECT COUNT(*) FROM symbols s WHERE s.file_id=f.id) AS n_syms,
-        (SELECT COUNT(*) FROM symbols s
-          WHERE s.file_id=f.id AND s.kind='function') AS n_fns,
-        (SELECT COUNT(*) FROM edges e JOIN symbols s ON s.id=e.callee_id
-          WHERE s.file_id=f.id) AS inbound_calls,
+    """WITH sym AS (
+        -- Per-file symbol counts and inbound calls aggregated ONCE; the
+        -- first version ran three correlated COUNT subqueries per header.
+        SELECT s.file_id AS fid, COUNT(*) AS n_syms,
+            SUM(s.kind='function') AS n_fns
+        FROM symbols s GROUP BY s.file_id),
+    inbound AS (
+        SELECT s.file_id AS fid, COUNT(*) AS calls
+        FROM edges e JOIN symbols s ON s.id=e.callee_id
+        GROUP BY s.file_id)
+    SELECT f.path AS header, f.sloc,
+        COALESCE(sym.n_syms, 0) AS n_syms,
+        COALESCE(sym.n_fns, 0) AS n_fns,
+        COALESCE(inb.calls, 0) AS inbound_calls,
         COUNT(DISTINCT i.file_id) AS included_by
     FROM files f
     JOIN imports i ON i.target_id=f.id AND i.kind='include'
     LEFT JOIN modules m ON m.id=f.module_id
+    LEFT JOIN sym ON sym.fid = f.id
+    LEFT JOIN inbound inb ON inb.fid = f.id
     WHERE f.n_symbols > 0 AND COALESCE(m.name,'') LIKE :mod
     GROUP BY f.id
     HAVING inbound_calls = 0 AND n_fns > 0
@@ -4849,10 +5469,9 @@ QUERIES: list[tuple[str, str, str, str]] = [
     "MISLEADS `n_transitive` counts callers THROUGH RESOLVED EDGES ONLY; a\n"
     "     symbol called dynamically (function pointer) or across a name\n"
     "     collision undercounts, and a widely-included header's inline helpers\n"
-    "     are undercounted for the same reason. The pass is a per-symbol\n"
-    "     traversal over the reverse adjacency: O(V*(V+E)) in total, which is\n"
-    "     fine at redis scale and slow on very large C corpora -- it is exact\n"
-    "     on the edges that exist, not memoised.",
+    "     are undercounted for the same reason. The pass is an SCC fold over\n"
+    "     the whole graph (exact on the edges that exist); `call-chain-depth`\n"
+    "     in METRICS is the same table read DOWNWARD.",
     """SELECT s.name, r.n_transitive AS transitive_callers,
         s.fan_in, s.n_calls, s.sloc,
         f.path || ':' || s.line_start AS at
@@ -5040,35 +5659,16 @@ QUERIES: list[tuple[str, str, str, str]] = [
     "ACT break the cycle with a forward declaration or by shrinking one\n"
     "     header; rows name both endpoints and the cycle length.\n"
     "MISLEADS include guards make cycles harmless at compile time, so this\n"
-    "     is a maintainability smell, not a defect; depth is capped at 8;\n"
-    "     is_relative=1 means user \"...\" includes, and a `<...>` include\n"
-    "     that happens to resolve in-tree is treated as system-style and\n"
-    "     excluded from the walk.",
-    """WITH RECURSIVE walk(root, dep, depth, path) AS (
-        SELECT i.file_id, i.target_id, 1,
-               '>' || i.file_id || '>' || i.target_id || '>'
-        FROM imports i
-        WHERE i.target_id IS NOT NULL AND i.is_relative = 1
-          AND i.kind='include'
-        UNION
-        SELECT w.root, i.target_id, w.depth + 1, w.path || i.target_id || '>'
-        FROM walk w
-        JOIN imports i ON i.file_id = w.dep
-        WHERE i.target_id IS NOT NULL AND i.is_relative = 1
-          AND i.kind='include'
-          AND w.depth < 8
-          AND (i.target_id = w.root
-               OR instr(w.path, '>' || i.target_id || '>') = 0)
-    )
-    SELECT DISTINCT f1.path AS header, f3.path AS partner, w.depth
-    FROM walk w
-    JOIN files f1 ON f1.id = w.root
-    JOIN imports i0 ON i0.file_id = w.root AND i0.target_id IS NOT NULL
-         AND i0.is_relative = 1 AND i0.kind = 'include'
-    JOIN files f3 ON f3.id = i0.target_id
-    WHERE w.dep = w.root
-    ORDER BY w.depth, header
-    LIMIT :lim"""),
+    "     is a maintainability smell, not a defect; the cycle set is\n"
+    "     computed at BUILD time (bounded DFS, depth cap 8) into the\n"
+    "     include_cycles table -- a recursive-CTE version of this query\n"
+    "     enumerated paths rather than cycles and never finished on large\n"
+    "     trees; is_relative=1 means user \"...\" includes, and a <...>\n"
+    "     include that resolves in-tree is excluded from the walk.",
+    """SELECT a_path AS header, b_path AS partner, length,
+        members
+    FROM include_cycles
+    ORDER BY length, header LIMIT :lim"""),
 (
     "const-cast-away",
     "Casts that drop const from const-declared names (CERT EXP05-C)",
@@ -5099,15 +5699,24 @@ QUERIES: list[tuple[str, str, str, str]] = [
     "     plugin point or a table-driven dispatch entry.\n"
     "MISLEADS &fn text capture catches address-takes in function bodies; an\n"
     "     address taken in a struct initializer at file scope (the dominant\n"
-    "     dispatch-table pattern) is NOT captured -- the table rows are a\n"
-    "     floor, and `linkage-scope-mismatch` and dead-code must be read\n"
-    "     with this page open.",
-    """SELECT s.name, f.path, s.line_start, s.sloc,
-        (SELECT COUNT(*) FROM addr_taken a WHERE a.name=s.name) AS addr_taken
-    FROM symbols s JOIN files f ON f.id=s.file_id
+    "     dispatch-table pattern) is NOT here -- dispatch-table-orphan owns\n"
+    "     those rows, and dead-code must be read with both pages open.",
+    """-- Body-level address-takes aggregated per name ONCE: the first
+    -- version ran a correlated COUNT over addr_taken for every
+    -- zero-fan-in function, which is the only query in either catalogue
+    -- that took seconds (6.4s on the profiling corpus; everything else
+    -- is under 32ms).
+    WITH body_refs AS (
+        SELECT name, COUNT(*) AS addr_taken
+        FROM addr_taken WHERE symbol_id IS NOT NULL
+        GROUP BY name)
+    SELECT s.name, f.path, s.line_start, s.sloc,
+        COALESCE(br.addr_taken, 0) AS addr_taken
+    FROM symbols s
+    JOIN files f ON f.id=s.file_id
+    JOIN body_refs br ON br.name = s.name
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.kind='function' AND s.fan_in=0 AND s.is_test=0
-      AND EXISTS (SELECT 1 FROM addr_taken a WHERE a.name=s.name)
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY addr_taken DESC, s.sloc DESC LIMIT :lim"""),
 (
@@ -5124,13 +5733,19 @@ QUERIES: list[tuple[str, str, str, str]] = [
     "     only when their name matches -- a same-named static in one file\n"
     "     does NOT satisfy an extern promise in another; libc prototypes in\n"
     "     system headers are not scanned (only this tree's files are).",
-    """SELECT d.name, f.path, d.line,
-        (SELECT COUNT(*) FROM symbols s
-          WHERE s.name = d.name AND s.kind='function') AS defined_count
-    FROM declarations d JOIN files f ON f.id=d.file_id
+    """WITH defs AS (
+        -- Definition counts per name ONCE: the first version ran two
+        -- correlated COUNT subqueries over symbols per declaration row,
+        -- O(decls x symbols) before the index on name helped the filter
+        -- but not the repetition.
+        SELECT name, COUNT(*) AS defined_count
+        FROM symbols WHERE kind='function' GROUP BY name)
+    SELECT d.name, f.path, d.line, COALESCE(df.defined_count, 0) AS defined_count
+    FROM declarations d
+    JOIN files f ON f.id=d.file_id
     LEFT JOIN modules m ON m.id=f.module_id
-    WHERE (SELECT COUNT(*) FROM symbols s
-            WHERE s.name = d.name AND s.kind='function') = 0
+    LEFT JOIN defs df ON df.name = d.name
+    WHERE COALESCE(df.defined_count, 0) = 0
       AND f.is_generated = 0 AND COALESCE(m.name,'') LIKE :mod
     ORDER BY d.name, f.path
     LIMIT :lim"""),
@@ -5154,7 +5769,288 @@ QUERIES: list[tuple[str, str, str, str]] = [
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.n_toctou > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.n_toctou DESC, s.fan_in DESC LIMIT :lim""")
+    ORDER BY s.n_toctou DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "lock-imbalance",
+    "Acquires a lock more often than it releases it",
+    "ANSWERS the functions where an early return or a goto-out ladder can\n"
+    "     leave a mutex held: acquire sites outnumber release sites in one\n"
+    "     body. The next caller to take that lock blocks forever -- and if\n"
+    "     the lock is taken under load first, the hang looks like a load\n"
+    "     problem, not a code problem.\n"
+    "ACT pair every acquire with a release on EVERY path, or move to\n"
+    "     pthread_mutex_trylock with explicit unlock on the failure path.\n"
+    "MISLEADS counts SITES, not paths: two acquires and two releases can\n"
+    "     still leak (both releases behind the same `if`), and a function\n"
+    "     whose contract is 'returns with the lock held' (an allocator's\n"
+    "     arena lock, a lazy initializer) is correct and lands here anyway.\n"
+    "     A release inside a called cleanup function is invisible.",
+    """SELECT s.name, s.n_lock_acquire AS acquires,
+        s.n_lock_release AS releases,
+        s.n_lock_acquire - s.n_lock_release AS imbalance,
+        s.n_returns AS return_paths, s.n_gotos AS gotos,
+        s.fan_in, s.cyclomatic AS cyclo,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND s.n_lock_acquire > s.n_lock_release
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY imbalance DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "lock-under-io",
+    "A lock is held across a call that can sleep or block I/O",
+    "ANSWERS where a function both takes a lock and performs raw descriptor\n"
+    "     I/O in the same body: read/write/recv/send/mmap while holding a\n"
+    "     pthread mutex. Every other thread wanting that lock stalls for the\n"
+    "     duration of the I/O -- the classic latency cliff under load, and\n"
+    "     with a non-recursive mutex plus a nested acquisition, a deadlock.\n"
+    "ACT shrink the critical section: copy what is needed under the lock,\n"
+    "     release, then do the I/O. If the I/O must be covered, document why\n"
+    "     and bound it (timeout, O_NONBLOCK).\n"
+    "MISLEADS co-occurrence in one body is not ordering: the I/O may run\n"
+    "     strictly before the first acquire or after the last release, and\n"
+    "     this cannot see which. Buffered stdio (fprintf) is excluded here\n"
+    "     on purpose -- it lives in its own query family; a blocking call\n"
+    "     reached THROUGH a callee while the lock is held is invisible.",
+    """SELECT s.name, s.n_lock_acquire AS acquires,
+        s.n_io AS io_calls, s.n_memory AS mem_calls,
+        s.cyclomatic AS cyclo, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND s.n_lock_acquire > 0 AND s.n_io > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_io DESC, s.n_lock_acquire DESC LIMIT :lim"""),
+(
+    "memcpy-sizeof-mismatch",
+    "Copy whose size argument names neither dst nor src",
+    "ANSWERS the copy sites where the SIZE expression dereferences a\n"
+    "     buffer that is neither argument: memcpy(a, b, sizeof(c)) copies\n"
+    "     by c's width -- CERT ARR38-C's shape when a, b and c have\n"
+    "     different element sizes. `size_buf` is the identifier the size\n"
+    "     expression references (from its sizeof), '' when it names none.\n"
+    "ACT read every row: the fix is a size naming THE DESTINATION, or an\n"
+    "     explicit MIN of both. Prefer strlcpy / memcpy_s where available.\n"
+    "MISLEADS textual, not semantic: sizeof(*dst) vs sizeof(struct x) can\n"
+    "     be equal; copying into a larger dst is legal; a length VARIABLE\n"
+    "     as size reads clean here but is exactly where an unchecked value\n"
+    "     bites -- this query finds the WRONG-BUFFER sites, not every bad\n"
+    "     copy. Argument capture stops at one paren level.",
+    """SELECT mo.fn AS op, mo.dst, mo.src, mo.size_arg, mo.size_buf,
+        s.name AS caller, s.fan_in,
+        f.path || ':' || mo.line AS at
+    FROM memops mo
+    JOIN symbols s ON s.id = mo.symbol_id
+    JOIN files f ON f.id = mo.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE mo.fn IN ('memcpy','memmove','strncpy','strncat','snprintf')
+      AND mo.size_buf <> ''
+      AND mo.size_buf <> mo.dst_tail
+      AND instr(mo.src, mo.size_buf) = 0
+      -- a size expression with arithmetic (`sizeof(x) * n`, `n + 1`) is
+      -- computed, not copied from the wrong buffer wholesale
+      AND mo.size_arg NOT LIKE '%*%' AND mo.size_arg NOT LIKE '%+%'
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, mo.line LIMIT :lim"""),
+(
+    "alloc-without-sizeof",
+    "malloc(n * k) with no sizeof in the size expression",
+    "ANSWERS allocation sites whose size expression names no sizeof at all:\n"
+    "     malloc(count * 4) hard-codes the element width, malloc(len) may be\n"
+    "     confusing bytes with elements, and neither survives the element\n"
+    "     type changing under it. Each row is the exact line to re-derive.\n"
+    "ACT write sizeof(*p) (or sizeof(T)) explicitly, and prefer calloc for\n"
+    "     arrays so the overflow check is someone else's already-written bug\n"
+    "     fix.\n"
+    "MISLEADS a byte-oriented API (a raw network buffer, a string + 1) is\n"
+    "     CORRECT without sizeof and will dominate this list in most trees;\n"
+    "     a size expression built through a project macro (`s_malloc`,\n"
+    "     `ALLOC_ARRAY`) hides its sizeof from this scan entirely.",
+    """SELECT a.fn, a.size_expr, s.name AS caller, s.fan_in,
+        s.n_allocsite AS alloc_sites,
+        f.path || ':' || a.line AS at
+    FROM allocsites a
+    JOIN symbols s ON s.id = a.symbol_id
+    JOIN files f ON f.id = a.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE a.size_expr NOT LIKE '%sizeof%'
+      AND a.size_expr <> ''
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, a.line LIMIT :lim"""),
+(
+    "global-writer-concentration",
+    "Functions that WRITE file-scope state, ranked by how much they touch",
+    "ANSWERS which functions mutate shared file-scope objects, and which\n"
+    "     globals are written from the most places. `race-surface` says a\n"
+    "     global EXISTS and is mutable; this says WHO actually writes it --\n"
+    "     the half that turns 'could race' into 'here is the commit that\n"
+    "     must take the lock'.\n"
+    "ACT every writer of a hot global is a serialization point: batch the\n"
+    "     writes, shard the state, or make the field atomic.\n"
+    "MISLEADS same-file globals only -- writes through an extern declared\n"
+    "     in a header are invisible, so cross-TU writers undercount; a\n"
+    "     local variable shadowing a global name is counted as the global;\n"
+    "     and `g->field = x` through a pointer parameter reads as a write\n"
+    "     only when the base name matches a captured global.",
+    """WITH writers AS MATERIALIZED (
+        SELECT s.id, s.name, s.n_global_write AS writes,
+            s.file_id, s.module_id, s.fan_in, s.cyclomatic AS cyclo,
+            s.line_start
+        FROM symbols s WHERE s.kind='function' AND s.n_global_write > 0),
+    gcount AS NOT MATERIALIZED (
+        SELECT file_id, COUNT(*) AS mutable_globals
+        FROM globals WHERE is_const=0 GROUP BY file_id)
+    SELECT w.name, w.writes, m.name AS module,
+        COALESCE(gc.mutable_globals, 0) AS mutable_globals_here,
+        w.fan_in, w.cyclo,
+        DENSE_RANK() OVER (PARTITION BY w.module_id
+            ORDER BY w.writes DESC, w.fan_in DESC) AS rank_in_module,
+        f.path || ':' || w.line_start AS at
+    FROM writers w
+    JOIN files f ON f.id=w.file_id
+    LEFT JOIN modules m ON m.id=w.module_id
+    LEFT JOIN gcount gc ON gc.file_id=w.file_id
+    WHERE f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY w.writes DESC, w.fan_in DESC LIMIT :lim"""),
+(
+    "truncating-cast-flow",
+    "Fixed-width narrowing casts on data that came from wide sources",
+    "ANSWERS `(uint32_t)x`-style casts to a STRICTLY narrower fixed-width\n"
+    "     type in functions that also do heavy arithmetic or I/O -- the\n"
+    "     places where a 64-bit length, hash or offset silently becomes 32\n"
+    "     bits. The wrap is not UB, which is exactly why nothing complains:\n"
+    "     the value just comes back wrong on input above 4 GiB.\n"
+    "ACT before casting, range-check and reject; after casting, never use\n"
+    "     the wide original again. Prefer size_t end-to-end.\n"
+    "MISLEADS a cast to uint8_t for serialization into a wire format is\n"
+    "     correct and common; the scan cannot know the value fits. Only\n"
+    "     fixed-width targets are counted -- casts to int/long are\n"
+    "     platform-dependent and deliberately absent.",
+    """SELECT s.name, s.n_narrow_cast AS narrow_casts,
+        s.n_arith AS arith_ops, s.n_shift AS shifts,
+        s.n_io AS io_calls, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND s.n_narrow_cast > 0
+      AND (s.n_arith > 0 OR s.n_shift > 0 OR s.n_io > 0)
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_narrow_cast DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "signed-size-compare",
+    "Signed value compared against a size or sizeof result",
+    "ANSWERS comparisons of the form `if (i < sizeof(b))` / `while (n <=\n"
+    "     len)` where the left side is a signed local or parameter: the\n"
+    "     comparison promotes the signed value to size_t, so -1 becomes\n"
+    "     SIZE_MAX and the bounds check PASSES for the one input that must\n"
+    "     fail it (CERT INT31-C).\n"
+    "ACT make the index size_t, or compare in the signed domain against a\n"
+    "     checked cast of the size.\n"
+    "MISLEADS the left operand being declared signed is necessary but not\n"
+    "     sufficient: a value proven non-negative before the compare makes\n"
+    "     the row harmless, and the scan sees declarations, not proofs.",
+    """SELECT s.name, s.n_sign_cmp AS sign_cmps,
+        s.n_cmp AS total_cmps, s.n_params, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND s.n_sign_cmp > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_sign_cmp DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "variadic-format-forwarder",
+    "Variadic function forwarding to a vprintf-family call",
+    "ANSWERS the wrappers that turn caller-supplied arguments into formatted\n"
+    "     output: variadic definitions containing v?snprintf/v?printf/syslog.\n"
+    "     Whether %n is reachable from outside depends ENTIRELY on whether\n"
+    "     these forwarders pass through a caller-controlled format string --\n"
+    "     they are the chokepoints worth auditing, because every other\n"
+    "     printf-shaped call in the tree funnels through a handful of them.\n"
+    "ACT audit each: the format argument should be a literal or a fixed\n"
+    "     table entry, never a parameter forwarded verbatim.\n"
+    "MISLEADS a wrapper that hardcodes its own literal format ('%s') is safe\n"
+    "     and indistinguishable here from one forwarding the caller's format\n"
+    "     through; the format STRING itself is blanked during scanning (it is\n"
+    "     a literal), so its content is not inspected.",
+    """SELECT s.name, s.n_variadic_fmt AS fmt_calls,
+        s.n_stdio AS stdio_calls, s.fan_in,
+        GROUP_CONCAT(DISTINCT h.pattern) AS via,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    LEFT JOIN hazards h ON h.symbol_id=s.id
+        AND h.pattern IN ('vsnprintf','vsprintf','vfprintf','vprintf','syslog')
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND s.is_variadic=1 AND s.n_variadic_fmt > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.fan_in DESC, fmt_calls DESC LIMIT :lim"""),
+(
+    "dispatch-table-orphan",
+    "Referenced ONLY in file-scope initializers: live but zero fan-in",
+    "ANSWERS functions kept alive exclusively by a dispatch-table entry at\n"
+    "     file scope -- an initializer reference (`static cmd_t cmds[] =\n"
+    "     {&get, &set}`) or a generated-table argument\n"
+    "     (`MAKE_CMD(...,getCommand,...)`). No body contains the use, so\n"
+    "     dead-code and every fan-in-based number read zero while the\n"
+    "     function is very much alive: these are the plugin points of a\n"
+    "     table-driven C program.\n"
+    "ACT treat as public API: renaming one breaks a TABLE, silently, at\n"
+    "     runtime. Any signature change needs the table's owning module in\n"
+    "     the review. `refs` says how many tables list it.\n"
+    "MISLEADS the capture is textual (argument position, file scope, macro\n"
+    "     bodies skipped), so a same-named DATA object referenced in an\n"
+    "     initializer can attach to a function of that name after pruning;\n"
+    "     a table entry spelled through a project macro's PARAMETER is not\n"
+    "     seen (macro bodies are excluded on purpose); and a function whose\n"
+    "     address is taken BOTH in a table and in a body appears here only\n"
+    "     for its body-level rows.",
+    """SELECT s.name, COUNT(a.id) AS table_refs,
+        SUM(a.kind='ref') AS plain_refs,
+        GROUP_CONCAT(DISTINCT f2.basename) AS tables_in,
+        s.sloc, s.cyclomatic AS cyclo,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN addr_taken a ON a.name = s.name AND a.symbol_id IS NULL
+    JOIN files f2 ON f2.id = a.file_id
+    JOIN files f ON f.id = s.file_id
+    LEFT JOIN modules m ON m.id = s.module_id
+    WHERE s.kind='function' AND s.fan_in=0
+      AND NOT EXISTS (SELECT 1 FROM addr_taken b
+                      WHERE b.name=s.name AND b.symbol_id IS NOT NULL)
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY table_refs DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "error-path-frees",
+    "Allocations whose frees sit only behind error branches",
+    "ANSWERS functions that allocate, free, and branch heavily: the shape\n"
+    "    where the free list covers the error ladder but a NEW success-path\n"
+    "    early return skips it. Unlike ownership-review (which flags 'no\n"
+    "    free at all'), this finds the functions where a future edit is most\n"
+    "    likely to introduce a leak, because the discipline exists but is\n"
+    "    one return away from breaking. `allocs` counts direct\n"
+    "    malloc/calloc/realloc/alloca sites; project wrappers are invisible\n"
+    "    to it.\n"
+    "ACT when editing one of these, trace every new return against the free\n"
+    "    ladder -- or convert to goto-cleanup, which makes skipping it\n"
+    "    impossible.\n"
+    "MISLEADS a heuristic by construction: alloc==free==1 with two branches\n"
+    "    is usually fine; the ranking surfaces DENSITY of exits vs frees,\n"
+    "    not an actual missing free. Transfers of ownership (returning the\n"
+    "    buffer) look identical, and frees reached through a wrapper\n"
+    "    function do not count, so a disciplined function using one can\n"
+    "    read as frees=0 -- those land in ownership-review instead.",
+    """SELECT s.name, s.n_allocsite AS allocs, s.n_free AS frees,
+        s.n_returns AS return_paths, s.n_branches AS branches,
+        s.n_gotos AS gotos, s.cyclomatic AS cyclo, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND s.n_allocsite > 0 AND s.n_free > 0
+      AND s.n_returns >= 3 AND s.n_returns > s.n_allocsite
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_returns DESC, s.n_allocsite DESC LIMIT :lim""")
 ]
 
 METRICS = [
@@ -5221,9 +6117,15 @@ METRICS = [
     "ACT `direct` counts allocation written in the body; `xalloc` walks the\n"
     "     call graph and multiplies by static call sites.\n"
     "MISLEADS the multiplier is STATIC call sites, not trip count, and the\n"
-    "     walk stops at depth 3 -- deeper allocation is not counted at all.",
-    """-- depth bound: 3 call levels; the multiplier is capped at 4096 so a
-    -- densely-called leaf cannot explode the intermediate table.
+    "     walk stops at depth 3 -- deeper allocation is not counted at all.\n"
+    "     Cycles are double-counted (a self-recursive wrapper's own mass is\n"
+    "     pushed back into it), so treat xalloc as an upper bound.",
+    """-- Allocations reachable within 3 call levels. The first version walked
+    -- one row PER PATH (a recursive CTE over callsites), which on a
+    -- 35k-function tree is tens of millions of rows before the first answer.
+    -- Aggregating per LEVEL instead is three O(E) joins with identical
+    -- semantics: level k's allocation mass is the previous level's mass
+    -- pushed through one more edge.
     WITH RECURSIVE
     edge(caller, callee, mult) AS (
         SELECT caller_id, callee_id, COUNT(*) FROM callsites
@@ -5233,21 +6135,30 @@ METRICS = [
         WHERE category='alloc' AND pattern<>'free'
           AND lower(substr(pattern, -4))<>'free'
         GROUP BY symbol_id),
-    walk(root, sym, depth, mult) AS (
-        SELECT s.id, s.id, 0, 1 FROM symbols s WHERE s.kind='function'
-        UNION ALL
-        SELECT w.root, e.callee, w.depth+1, w.mult*e.mult
-        FROM walk w JOIN edge e ON e.caller=w.sym
-        WHERE w.depth < 3 AND e.callee <> w.root AND w.mult < 4096)
-    SELECT s.name, SUM(w.mult*d.n) AS xalloc,
-        COALESCE((SELECT n FROM direct WHERE sym=s.id),0) AS direct,
+    acc1(sym, n) AS (
+        SELECT e.caller, SUM(e.mult*d.n) FROM edge e
+        JOIN direct d ON d.sym=e.callee GROUP BY e.caller),
+    acc2(sym, n) AS (
+        SELECT e.caller, SUM(e.mult*a.n) FROM edge e
+        JOIN acc1 a ON a.sym=e.callee GROUP BY e.caller),
+    acc3(sym, n) AS (
+        SELECT e.caller, SUM(e.mult*a.n) FROM edge e
+        JOIN acc2 a ON a.sym=e.callee GROUP BY e.caller)
+    SELECT s.name,
+        COALESCE(d.n,0) + COALESCE(a1.n,0) + COALESCE(a2.n,0)
+            + COALESCE(a3.n,0) AS xalloc,
+        COALESCE(d.n,0) AS direct,
         s.n_loops AS loops, m.name AS module,
         f.path || ':' || s.line_start AS at
-    FROM walk w JOIN direct d ON d.sym=w.sym
-    JOIN symbols s ON s.id=w.root JOIN files f ON f.id=s.file_id
+    FROM symbols s
+    LEFT JOIN direct d ON d.sym=s.id
+    LEFT JOIN acc1 a1 ON a1.sym=s.id
+    LEFT JOIN acc2 a2 ON a2.sym=s.id
+    LEFT JOIN acc3 a3 ON a3.sym=s.id
+    JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.kind='function' AND COALESCE(m.name,'') LIKE :mod
-    GROUP BY w.root HAVING xalloc >= 8
+      AND COALESCE(d.n,0)+COALESCE(a1.n,0)+COALESCE(a2.n,0)+COALESCE(a3.n,0) >= 8
     ORDER BY xalloc DESC LIMIT :lim"""),
 (
     "module-coupling",
@@ -5626,7 +6537,223 @@ METRICS = [
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.n_magic > 10 AND s.kind='function' AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.n_magic DESC, s.fan_in DESC LIMIT :lim""")
+    ORDER BY s.n_magic DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "call-chain-depth",
+    "Deepest resolved call chains: how far a change propagates downward",
+    "ANSWERS the functions with the widest downward exposure -- the count\n"
+    "     of DISTINCT functions each one can reach through resolved edges\n"
+    "     at any depth (precomputed in `reach.n_transitive_out`). Where\n"
+    "     blast-radius counts who can reach YOU (upward risk), this counts\n"
+    "     what you can REACH: the failure modes, allocation behaviour and\n"
+    "     locking you inherit every time you call down the stack.\n"
+    "ACT a wide fan under a request handler is where latency and error\n"
+    "     handling get lost; flatten, or make each level's contract\n"
+    "     explicit.\n"
+    "MISLEADS breadth, not depth: a function calling 30 helpers outranks a\n"
+    "     strict 12-level chain of 1-callee hops; calls through function\n"
+    "     pointers end the walk and undercount; a cycle member inherits its\n"
+    "     component's full reach.",
+    """SELECT s.name, r.n_transitive_out AS reachable_fns,
+        r.n_transitive AS transitive_callers,
+        s.fan_out, s.cyclomatic AS cyclo,
+        m.name AS module,
+        f.path || ':' || s.line_start AS at
+    FROM reach r
+    JOIN symbols s ON s.id=r.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY r.n_transitive_out DESC LIMIT :lim"""),
+(
+    "global-state-map",
+    "Which modules own mutable file-scope state, and who writes it",
+    "ANSWERS the mutation map `race-surface` cannot draw: per module, the\n"
+    "    count of mutable file-scope objects against the number of\n"
+    "    functions that WRITE one of them in place. A module high on both\n"
+    "    columns is stateful by design and is where 'just add a feature'\n"
+    "    turns into 'understand six globals first'.\n"
+    "ACT the fix is architectural: group the globals into one context\n"
+    "    struct passed explicitly, so ownership shows up in signatures.\n"
+    "MISLEADS same-file references only (extern-through-header use is\n"
+    "    invisible), and a write counted here can be an initializer run\n"
+    "    once at startup -- volume of writes is not volume of races.",
+    """-- Per-file aggregates computed SEPARATELY and joined once: joining
+    -- files->globals->writers in one pass multiplies every SUM by the
+    -- other side's row count (the classic fan-out bug this tool's own
+    -- README documents).
+    WITH gstat AS NOT MATERIALIZED (
+        SELECT f.module_id AS mid, COUNT(*) AS mutable_globals,
+            SUM(g.is_static) AS static_ones
+        FROM globals g JOIN files f ON f.id=g.file_id
+        WHERE g.is_const=0 AND f.is_test=0
+        GROUP BY f.module_id),
+    wstat AS NOT MATERIALIZED (
+        SELECT f.module_id AS mid,
+            COUNT(DISTINCT s.id) AS writer_fns,
+            SUM(s.n_global_write) AS write_sites
+        FROM symbols s JOIN files f ON f.id=s.file_id
+        WHERE s.kind='function' AND s.n_global_write>0 AND f.is_test=0
+        GROUP BY f.module_id)
+    SELECT m.name AS module,
+        COALESCE(gs.mutable_globals,0) AS mutable_globals,
+        COALESCE(gs.static_ones,0) AS static_ones,
+        COALESCE(ws.writer_fns,0) AS writer_fns,
+        COALESCE(ws.write_sites,0) AS write_sites
+    FROM modules m
+    LEFT JOIN gstat gs ON gs.mid=m.id
+    LEFT JOIN wstat ws ON ws.mid=m.id
+    WHERE m.name LIKE :mod
+      AND COALESCE(gs.mutable_globals,0)+COALESCE(ws.writer_fns,0) > 0
+    ORDER BY mutable_globals DESC, writer_fns DESC LIMIT :lim"""),
+(
+    "error-handling-density",
+    "Where failure handling dominates the code",
+    "ANSWERS the functions whose shape IS error handling: return paths vs\n"
+    "    distinct failure shapes (NULL / negative / zero), null checks, and\n"
+    "    gotos-to-cleanup. C has no stack unwinding, so this work is real\n"
+    "    code with real branch cost -- and its absence is a defect while\n"
+    "    its excess is unreadability. This metric measures the balance.\n"
+    "ACT a high ratio with FEW null checks is the dangerous corner:\n"
+    "    failure-shaped but not checking allocations. Start there.\n"
+    "MISLEADS ret_* counts are textual (`return NULL;` exactly); a returned\n"
+    "    error ENUM or errno expression counts as ret_val, so a\n"
+    "    consistently-error-coded module looks value-returning; goto here\n"
+    "    includes non-cleanup uses.",
+    """SELECT s.name,
+        s.n_returns AS returns_,
+        s.ret_null + s.ret_neg + s.ret_zero AS fail_shapes,
+        s.n_null_check AS null_checks,
+        s.n_gotos AS gotos,
+        CAST(100.0*(s.ret_null+s.ret_neg+s.ret_zero+s.n_null_check)
+             / NULLIF(s.n_returns + s.n_branches, 0) AS INT) AS err_pct,
+        s.cyclomatic AS cyclo, s.fan_in,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND s.n_returns >= 4
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY err_pct DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "alloc-site-inventory",
+    "Every allocation site, grouped by size-expression shape",
+    "ANSWERS the tree's actual allocation habits: raw byte counts vs\n"
+    "    sizeof-multiplied element counts vs bare constants, per allocator.\n"
+    "    The sizeof share is the single best proxy for allocation-safety\n"
+    "    discipline, and it is comparable across projects.\n"
+    "ACT read the shape mix before trusting any single leak query: a tree\n"
+    "    that allocates mostly through wrappers needs wrapper-level review,\n"
+    "    not site-level.\n"
+    "MISLEADS project allocator wrappers are invisible unless they call\n"
+    "    malloc/calloc/realloc directly IN THE BODY (they usually do, which\n"
+    "    is why the fn column matters); alloca rows are stack allocations\n"
+    "    and do not leak -- they exhaust the stack instead.",
+    """SELECT a.fn,
+        COUNT(*) AS sites,
+        COUNT(*) FILTER (WHERE a.size_expr LIKE '%sizeof%') AS with_sizeof,
+        COUNT(*) FILTER (WHERE a.size_expr NOT LIKE '%sizeof%') AS raw_bytes,
+        COUNT(DISTINCT s.name) AS callers,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE a.size_expr LIKE '%sizeof%')
+              / COUNT(*), 1) AS pct_sizeof
+    FROM allocsites a
+    JOIN symbols s ON s.id=a.symbol_id
+    JOIN files f ON f.id=a.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE COALESCE(m.name,'') LIKE :mod
+    GROUP BY a.fn
+    ORDER BY sites DESC LIMIT :lim"""),
+(
+    "copy-hotspots",
+    "The heaviest memcpy-family users, with their copy-site inventory",
+    "ANSWERS which functions move the most bytes-by-call-count: the\n"
+    "    memcpy/memmove/strcpy/strcat/sprintf load ranked per function.\n"
+    "    Copy count is the cheapest available proxy for memory-bandwidth\n"
+    "    pressure, and these functions are also where a wrong length\n"
+    "    argument does the most damage.\n"
+    "ACT for the top rows ask the only two questions that matter: could\n"
+    "    this copy be a pointer swap, and is the length derived from input?\n"
+    "MISLEADS call COUNT, not bytes moved -- one memcpy of 4 KB outranks\n"
+    "    nothing here if the rest are 8-byte struct copies; copies inside\n"
+    "    loops multiply beyond what the count shows (join nested-loops for\n"
+    "    that).",
+    """SELECT s.name, s.n_memcpy AS copy_sites,
+        s.n_memory AS mem_ops_total, s.max_loop_depth AS loop_depth,
+        s.alloc_in_loop AS allocs_in_loop, s.fan_in,
+        m.name AS module,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='function' AND s.n_memcpy >= 3
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_memcpy DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "macro-reach",
+    "Macro definitions ranked by transitive use weight",
+    "ANSWERS the preprocessor's real API surface: function-like macros\n"
+    "    weighted by use sites AND by body size -- n_uses * body_len is the\n"
+    "    amount of source the reader must simulate to understand one macro\n"
+    "    call. macro-machinery ranks by uses alone; this adds the cost side.\n"
+    "ACT the top rows are conversion candidates: a static inline function\n"
+    "    gives type checking and debuggability at identical runtime cost.\n"
+    "MISLEADS n_uses counts CALL-SHAPED uses only (name followed by '(');\n"
+    "    object-like macros used as constants show zero uses here, and a\n"
+    "    macro shadowed by a same-named function anywhere in the tree\n"
+    "    loses all its uses to that function.",
+    """SELECT s.name, mc.n_uses AS uses, mc.body_len AS body_len,
+        mc.n_uses * mc.body_len AS expanded_bytes,
+        mc.is_multiline AS multiline, mc.n_params AS params,
+        f.path || ':' || s.line_start AS at
+    FROM macros mc JOIN symbols s ON s.id=mc.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE mc.is_functionlike=1 AND mc.n_uses > 0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY expanded_bytes DESC LIMIT :lim"""),
+(
+    "struct-abi-surface",
+    "Structs most exposed to layout change, weighted by field volatility",
+    "ANSWERS the structs whose byte layout carries the most cross-file\n"
+    "    weight: exact-sized, pointer-bearing, and defined in headers other\n"
+    "    files include. Reordering ONE field of these changes offsets in\n"
+    "    every consumer -- the ABI-compat question struct-padding answers\n"
+    "    for waste, answered here for RISK.\n"
+    "ACT pin the hot ones with _Static_assert(sizeof(struct x) == N) so a\n"
+    "    layout change fails the build instead of the customer.\n"
+    "MISLEADS header-defined structs only (a .c-local struct cannot leak\n"
+    "    its layout); usage is inferred from include edges, so a widely\n"
+    "    included header whose struct nobody instantiates still tops the\n"
+    "    list; exact=1 rows only.",
+    """-- Field counts and includer counts aggregated per struct FIRST, then
+    -- joined once: correlated subqueries here would re-scan layout/imports
+    -- per row, and a direct join would multiply the layout SUMs by the
+    -- includer count.
+    WITH fld AS NOT MATERIALIZED (
+        SELECT symbol_id,
+            SUM(ptr_depth>0 AND in_union=0 AND depth=0) AS ptr_fields,
+            SUM(is_fnptr) AS fnptr_fields
+        FROM layout GROUP BY symbol_id),
+    inc AS NOT MATERIALIZED (
+        SELECT target_id AS fid, COUNT(DISTINCT file_id) AS includers
+        FROM imports WHERE target_id IS NOT NULL
+        GROUP BY target_id)
+    SELECT s.name AS struct_, ss.total_size AS sz,
+        ss.total_pad AS pad,
+        COALESCE(fl.ptr_fields,0) AS ptr_fields,
+        COALESCE(fl.fnptr_fields,0) AS fnptr_fields,
+        COALESCE(i.includers,0) AS includers,
+        ss.n_lines_64 AS lines64,
+        f.path || ':' || s.line_start AS at
+    FROM struct_size ss
+    JOIN symbols s ON s.id=ss.symbol_id
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN fld fl ON fl.symbol_id=s.id
+    LEFT JOIN inc i ON i.fid=f.id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE ss.exact=1 AND f.ext='.h'
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY includers DESC, ptr_fields DESC, ss.total_size DESC
+    LIMIT :lim""")
 ]
 
 _SYMBOL_COLS: set[str] = set()
