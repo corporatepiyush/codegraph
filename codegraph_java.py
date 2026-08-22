@@ -596,7 +596,7 @@ class Query:
 # every shared query to branch.
 # ==========================================================================
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 COMMON_SKIP_DIRS = {
     ".git", ".hg", ".svn", ".jj", ".idea", ".vscode", ".vs", ".claude",
@@ -3500,6 +3500,34 @@ Path GET POST PUT DELETE WebServlet MessageMapping KafkaListener
 RabbitListener JmsListener EventListener Scheduled Bean
 """.split())
 
+#: Spring Framework 7 resilience annotations (framework-native @Retryable and
+#: @ConcurrencyLimit; the jakarta/SmallRye variants of @Retryable share the
+#: simple name). Activated by @EnableResilientMethods -- activation is a
+#: config fact this scan does not chase; counting SITES is the job.
+RESILIENCE_ANNOTATIONS = frozenset("""
+Retryable ConcurrencyLimit RateLimiter CircuitBreaker Bulkhead Timeout
+""".split())
+
+#: Declarative HTTP client annotations (Spring 7 HTTP Interfaces / the
+#: newer @HttpExchange family). An interface annotated @HttpExchange has no
+#: implementation in this tree by design -- the proxy is generated -- so
+#: its methods read as dead unless these are recognised.
+HTTP_EXCHANGE_ANNOTATIONS = frozenset("""
+HttpExchange GetExchange PostExchange PutExchange DeleteExchange
+PatchExchange
+""".split())
+
+#: Jakarta EE 12 additions to the framework set. EE 12 promotes Jakarta
+#: Query 1.0, Data 1.1, Persistence 4.0, CDI 5.0, Validation 4.0,
+#: Security 5.0 (all GA'd or in flight for the July-2026 platform); their
+#: annotations parse as plain names, so recognition is a set membership.
+JAKARTA_EE12_ANNOTATIONS = frozenset("""
+Query Find FindAll Save Delete Insert Update AttributeOverride
+TenantId TenantIdResolver MultiTenant IdGeneratorType UsingReflection
+Persists SubqueryProvider CTEProvider RunInTransaction
+ClaimAttributes RunAs DeclareRoles RolesAllowed PermitAll DenyAll
+""".split())
+
 HANDLER_METHODS = frozenset("doGet doPost doPut doDelete service onMessage".split())
 
 FRAMEWORK_ANNOTATIONS = frozenset("""
@@ -3826,6 +3854,34 @@ class JavaAnalyzer(TreeSitterAnalyzer):
         ("n_super_calls", "INT NOT NULL DEFAULT 0"),
         ("n_static_write_ctor", "INT NOT NULL DEFAULT 0"),
         ("n_modern_idioms", "INT NOT NULL DEFAULT 0"),
+        # -- Java 25 / Spring 7 / Jakarta EE 12 pack -------------------------
+        #: JEP 513 flexible constructor bodies: this constructor runs
+        #: statements BEFORE super()/this(). The grammar recovers (prologue
+        #: statements survive; only the bare super() lands in an ERROR), but
+        #: the error count is noise and the shape is worth knowing: prologue
+        #: code cannot read instance state, so refactors that move it after
+        #: the super call change what it can touch.
+        ("is_flex_constructor", "INT NOT NULL DEFAULT 0"),
+        #: Spring Framework 7 resilience annotations on this method
+        #: (@Retryable, @ConcurrencyLimit, ...): retry multiplies every
+        #: side effect by maxAttempts, and a concurrency limit on a method
+        #: whose callers are virtual threads is a throughput decision.
+        ("n_resilience_annos", "INT NOT NULL DEFAULT 0"),
+        #: Spring Framework 7 API versioning: the mapping annotation carries
+        #: an explicit `version = "..."` attribute.
+        ("n_api_version_attr", "INT NOT NULL DEFAULT 0"),
+        #: Spring HTTP Interfaces (@HttpExchange family): these interfaces
+        #: have no in-tree implementation -- the proxy is generated -- so
+        #: their methods are live with zero fan_in by design.
+        ("is_http_exchange_client", "INT NOT NULL DEFAULT 0"),
+        #: Jakarta EE 12 spec-annotation surface (Data/Query/Persistence/
+        #: Security families). Recognition, not verdicts: it says which
+        #: EE 12 specs this code leans on.
+        ("n_ee12_annos", "INT NOT NULL DEFAULT 0"),
+        #: JSpecify nullability annotations (@NonNull/@Nullable). Spring 7
+        #: adopts JSpecify as its null-safety standard; a method that takes
+        #: @NonNull params AND can return null is a contract violation.
+        ("n_jspecify_annos", "INT NOT NULL DEFAULT 0"),
     )
 
     SCHEMA_EXT = r"""
@@ -3974,6 +4030,11 @@ CREATE INDEX idx_fn_vtroot ON symbols(name, file_id) WHERE is_virtual_thread_roo
 CREATE INDEX idx_fn_pool ON symbols(name, file_id) WHERE is_pooled_executor_root=1;
 CREATE INDEX idx_fn_owner ON symbols(owner_type, name);
 CREATE INDEX idx_fn_refl ON symbols(n_reflection DESC, name) WHERE n_reflection>0;
+CREATE INDEX idx_fn_resil ON symbols(n_resilience_annos DESC, name, file_id) WHERE n_resilience_annos>0;
+CREATE INDEX idx_fn_flexctor ON symbols(is_flex_constructor, file_id) WHERE is_flex_constructor=1;
+CREATE INDEX idx_fn_httpx ON symbols(owner_type) WHERE is_http_exchange_client=1;
+CREATE INDEX idx_fn_ee12 ON symbols(n_ee12_annos DESC, name, file_id) WHERE n_ee12_annos>0;
+CREATE INDEX idx_fn_verattr ON symbols(n_api_version_attr DESC, name, file_id) WHERE n_api_version_attr>0;
 """
 
     VIEW_EXT = r"""
@@ -4066,6 +4127,14 @@ UPDATE symbols AS s SET n_overloads = x.c - 1 FROM
      GROUP BY owner_type, name HAVING COUNT(*) > 1) AS x
     WHERE x.ot = s.owner_type AND x.nm = s.name;
 
+-- Spring 7 HTTP Interfaces: an @HttpExchange interface's methods are
+-- implemented by a generated proxy, never by this tree. Propagate the
+-- flag to the methods so dead-code can exempt them.
+UPDATE symbols AS s SET is_http_exchange_client = 1
+WHERE s.kind IN ('method') AND s.owner_type <> '' AND s.is_abstract = 1
+  AND s.owner_type IN (
+      SELECT name FROM symbols WHERE is_http_exchange_client = 1);
+
 UPDATE symbols SET arity_rank = CASE
     WHEN n_params <= 1 THEN 0 WHEN n_params <= 3 THEN 1
     WHEN n_params <= 6 THEN 2 ELSE 3 END
@@ -4157,6 +4226,12 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
 
         pooled = bool(POOLED_EXECUTOR_RE.search(btxt))
         virtual = bool(VIRTUAL_THREAD_RE.search(btxt))
+        # -- Java 25 / Spring 7 / Jakarta EE 12 pack ------------------------
+        is_ctor = node.type == "constructor_declaration"
+        flex = 1 if (is_ctor and _is_flex_constructor(node)) else 0
+        resilience = len(annos & RESILIENCE_ANNOTATIONS)
+        version_attr = len(_annotation_arg_values(node, src, "version"))
+        jspecify = len(annos & {"NonNull", "Nullable", "CheckForNull"})
         return dict(
             is_public=1 if "public" in mods or (
                 not mods and scope.type_name == "") else 0,
@@ -4184,6 +4259,10 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
             n_raw_types=len(RAW_TYPE_RE.findall(sig + " " + btxt[:20000])),
             n_wildcard_types=ptxt.count("?"),
             n_params=_count_params(params),
+            is_flex_constructor=flex,
+            n_resilience_annos=resilience,
+            n_api_version_attr=min(version_attr, 9),
+            n_jspecify_annos=jspecify,
         )
 
     def type_flags(self, node: Any, rec: FileRec,
@@ -4194,6 +4273,12 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
         parents = _supertype_names(node, src)
         body = node.child_by_field_name("body")
         btxt = _txt(body, src) if body is not None else ""
+        # Spring 7 HTTP Interfaces: an interface annotated @HttpExchange.
+        # Its methods get proxies generated at runtime -- no in-tree
+        # implementation will ever exist, so dead-code must exempt them
+        # (is_http_exchange_client is that exemption flag).
+        http_client = int(node.type == "interface_declaration"
+                          and bool(annos & HTTP_EXCHANGE_ANNOTATIONS))
         return dict(
             is_public=1 if "public" in mods else 0,
             is_static=1 if re.search(r'\bstatic\b', mods) else 0,
@@ -4207,6 +4292,8 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
             owner_type=scope.type_name[:120],
             n_annotations=len(annos),
             n_generic_params=_count_type_params(node),
+            is_http_exchange_client=http_client,
+            n_ee12_annos=len(annos & JAKARTA_EE12_ANNOTATIONS),
         )
 
     # -- the measuring pass ------------------------------------------------
@@ -5170,8 +5257,28 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
              "synchronized no longer pins (release >= 24); only JNI and FFM "
              "downcalls do" if reln >= 24 else
              "synchronized STILL pins at the declared release (< 24)"
-             if reln else
+              if reln else
              "unknown: no release declared, assuming 24+ per TARGET"),
+            ("jep513_flexible_ctors",
+             "%d constructor(s) run statements before super()/this(); the "
+             "grammar recovers them but files.n_parse_errors counts one per "
+             "site until tree-sitter-java ships JEP 513 support"
+             % db.execute("SELECT COUNT(*) FROM symbols "
+                          "WHERE is_flex_constructor=1").fetchone()[0]),
+            ("spring7_surface",
+             "resilience=%d api-versioned=%d http-exchange-clients=%d"
+             % (db.execute("SELECT COUNT(*) FROM symbols WHERE "
+                           "n_resilience_annos>0").fetchone()[0],
+                db.execute("SELECT COUNT(*) FROM symbols WHERE "
+                           "n_api_version_attr>0").fetchone()[0],
+                db.execute("SELECT COUNT(*) FROM symbols WHERE "
+                           "is_http_exchange_client=1").fetchone()[0])),
+            ("jakarta_ee12",
+             "EE12 spec annotations on %d symbol(s) (Data/Query/Persistence/"
+             "Security families; platform GA July 2026)"
+             % db.execute("SELECT COUNT(*) FROM symbols WHERE "
+                          "n_ee12_annos>0 OR n_jspecify_annos>0"
+                          ).fetchone()[0]),
             ("packages", ", ".join(sorted(self.pkg_roots)[:12]) or "(none seen)"),
         )
         db.executemany("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
@@ -5244,6 +5351,54 @@ def _annotation_names(node: Any, src: bytes) -> set[str]:
                     out.add(_txt(nm, src).rsplit(".", 1)[-1])
         break
     return out
+
+def _annotation_arg_values(node: Any, src: bytes, arg: str) -> list[str]:
+    """Values of `arg = ...` inside the node's annotations.
+
+    Reads only the modifiers block. Element-value pairs and single-element
+    initialiser arrays both count; a bare positional value does not, because
+    matching it to a name without the spec's declaration is a guess.
+    """
+    vals: list[str] = []
+    for c in node.named_children:
+        if c.type != "modifiers":
+            continue
+        for a in c.named_children:
+            if a.type not in ("annotation", "marker_annotation"):
+                continue
+            args = a.child_by_field_name("arguments")
+            if args is None:
+                continue
+            for e in args.named_children:
+                if e.type != "element_value_pair":
+                    continue
+                key = e.child_by_field_name("key")
+                val = e.child_by_field_name("value")
+                if key is None or val is None:
+                    continue
+                if _txt(key, src).rsplit(".", 1)[-1] == arg:
+                    vals.append(_txt(val, src)[:120])
+        break
+    return vals
+
+def _is_flex_constructor(node: Any) -> bool:
+    """True when a constructor_declaration carries an ERROR child whose
+    entire text is a bare super()/this() invocation -- the exact shape
+    tree-sitter-java 0.23.x produces on JEP 513 flexible constructor
+    bodies (prologue statements survive; only the mid-body super() lands
+    in the ERROR)."""
+    body = node.child_by_field_name("body")
+    if body is None or not body.has_error:
+        return False
+    stack = [body]
+    while stack:
+        n = stack.pop()
+        if n.type == "ERROR":
+            t = n.text.decode("utf-8", "replace").strip()
+            if t.startswith(("super(", "this(")):
+                return True
+        stack.extend(n.named_children)
+    return False
 
 def _simple_type(text: str) -> str:
     """`java.util.List<String>` -> `List`. Resolution is by simple name, so a
@@ -5893,7 +6048,9 @@ WITH fld AS (
     "MISLEADS this is the query most likely to be wrong, and `graph-blindspots`\n"
     "     measures by how much. Public symbols are excluded because a caller\n"
     "     outside this tree cannot be seen at all, so what is left is private\n"
-    "     and unreferenced -- a much weaker claim than dead.",
+    "     and unreferenced -- a much weaker claim than dead. Methods of an\n"
+    "     @HttpExchange interface are excluded explicitly: their\n"
+    "     implementation is a generated proxy, so fan_in=0 is their NORMAL.",
     """SELECT s.name, s.kind, s.sloc, s.cyclomatic AS cyclo,
         s.n_external_calls AS ext_calls,
         f.path || ':' || s.line_start AS at
@@ -5901,6 +6058,7 @@ WITH fld AS (
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.fan_in=0 AND s.is_public=0 AND s.is_test=0
       AND s.is_entrypoint=0 AND s.is_override=0 AND s.is_abstract=0
+      AND s.is_http_exchange_client=0
       AND s.kind IN ('function','method','closure')
       AND s.name NOT IN ('(anonymous)','<module>')
       AND f.is_test=0 AND f.is_generated=0
@@ -6737,7 +6895,150 @@ WITH fld AS (
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.n_modern_idioms > 0
       AND f.is_generated = 0 AND f.is_test = 0 AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.n_modern_idioms DESC, s.sloc DESC LIMIT :lim""")
+    ORDER BY s.n_modern_idioms DESC, s.sloc DESC LIMIT :lim"""),
+(
+    "flex-constructor-prologues",
+    "JEP 513: constructors running statements before super()/this()",
+    "ANSWERS which constructors use flexible constructor bodies (Java 25,\n"
+    "     final in JEP 513): validation or field computation BEFORE the\n"
+    "     super call. The prologue cannot read instance state -- not even\n"
+    "     fields of the class being built -- so any code there that looks\n"
+    "     at `this` is a compile error waiting for the next edit.\n"
+    "ACT keep prologues to argument validation and static helpers; move\n"
+    "     anything that touches instance state after the super call.\n"
+    "MISLEADS tree-sitter-java 0.23.x does not know JEP 513: it recovers\n"
+    "     the constructor (prologue statements survive and ARE counted)\n"
+    "     but emits one ERROR node per site, so files.n_parse_errors\n"
+    "     overcounts by exactly this many. The super()/this() invocation\n"
+    "     itself is dropped from the tree, so n_super_calls undercounts\n"
+    "     here by one.",
+    """SELECT s.name, s.owner_type AS owner, s.fan_in,
+        s.n_params, m.name AS module,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.is_flex_constructor=1 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.owner_type, s.name LIMIT :lim"""),
+(
+    "resilience-annotation-surface",
+    "Spring Framework 7 @Retryable / @ConcurrencyLimit sites",
+    "ANSWERS where framework-native resilience is declared: retry with\n"
+    "     backoff, concurrency limits, circuit breakers. A @Retryable\n"
+    "     multiplies every side effect inside the method by maxAttempts --\n"
+    "     an insert retried 3 times is three inserts unless it is\n"
+    "     idempotent, and a retry around non-atomic state writes is a\n"
+    "     corruption generator.\n"
+    "ACT check idempotency FIRST on every row that also writes state; a\n"
+    "     @ConcurrencyLimit number that exceeds the downstream pool size\n"
+    "     is decoration.\n"
+    "MISLEADS counts SITES, not activation: these annotations are inert\n"
+    "    unless @EnableResilientMethods (or the equivalent config) is\n"
+    "    present somewhere, which this scan does not chase; jakarta or\n"
+    "    SmallRye annotations sharing the simple name are counted too.",
+    """SELECT s.name, s.owner_type AS owner,
+        GROUP_CONCAT(DISTINCT a.name) AS resilience_annos,
+        s.n_resilience_annos AS n_annos,
+        s.n_query_calls AS db_calls, s.n_runtime_exec AS exec_calls,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s
+    LEFT JOIN attributes a ON a.symbol_id = s.id
+        AND a.name IN ('Retryable','ConcurrencyLimit','RateLimiter',
+                       'CircuitBreaker','Bulkhead','Timeout')
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('function','method') AND s.n_resilience_annos > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY s.n_resilience_annos DESC, s.n_query_calls DESC,
+             s.fan_in DESC LIMIT :lim"""),
+(
+    "http-exchange-clients",
+    "Spring 7 declarative HTTP clients (@HttpExchange interfaces)",
+    "ANSWERS which interfaces are declarative HTTP clients: their methods\n"
+    "     have NO implementation in this tree -- Spring generates the proxy\n"
+    "     from the annotations. Every one reads as dead code and every one\n"
+    "     is a network boundary whose timeouts, retries and error mapping\n"
+    "     live entirely in configuration.\n"
+    "ACT audit each client's @GetExchange/@PostExchange set against the\n"
+    "     remote service's actual contract; a renamed remote endpoint\n"
+    "     surfaces here as nothing at all until runtime.\n"
+    "MISLEADS recognition is by the annotation simple name only -- a\n"
+    "     custom meta-annotation wrapping @HttpExchange is invisible;\n"
+    "     interface default methods are real code, not proxy stubs, so a\n"
+    "     default method on such an interface is ordinary Java.",
+    """SELECT s.name AS client_interface, m2.name AS module,
+        COUNT(c.id) AS exchange_methods,
+        GROUP_CONCAT(DISTINCT c.name) AS methods,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s
+    JOIN attributes a ON a.symbol_id=s.id
+         AND a.name IN ('HttpExchange','GetExchange','PostExchange',
+                        'PutExchange','DeleteExchange','PatchExchange')
+    LEFT JOIN symbols c ON c.owner_type = s.name AND c.kind='method'
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m2 ON m2.id=s.module_id
+    WHERE s.is_http_exchange_client=1 AND f.is_test=0
+      AND COALESCE(m2.name,'') LIKE :mod
+    GROUP BY s.id
+    ORDER BY exchange_methods DESC LIMIT :lim"""),
+(
+    "api-version-drift",
+    "Spring Framework 7 API versioning: same path, different versions",
+    "ANSWERS version-skew inside one controller: methods mapped to the same\n"
+    "     path (or same name) carrying different `version` attributes. The\n"
+    "     whole point of first-class API versioning is that v1 and v2 of an\n"
+    "     operation stay reviewable side by side; when they drift apart in\n"
+    "     behaviour without a version bump, clients silently get the old\n"
+    "     semantics.\n"
+    "ACT pair each row's versions and diff them; if they differ beyond the\n"
+    "     intended change, bump the version attribute instead of editing in\n"
+    "     place.\n"
+    "MISLEADS pairs by METHOD NAME, which catches the common\n"
+    "     sayHello-v1/sayHello-v2 spelling but misses renamed pairs; the\n"
+    "     version attribute lives on the annotation, so a controller-level\n"
+    "     version inherited by all methods shows as zero per-method\n"
+    "     attributes here.",
+    """SELECT s.owner_type AS controller, s.name AS method,
+        (SELECT GROUP_CONCAT(a.args) FROM attributes a
+          WHERE a.symbol_id=s.id AND a.args LIKE '%version%') AS version_args,
+        s.n_api_version_attr AS version_attrs,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind='method' AND s.n_api_version_attr>0
+      AND s.owner_type <> '' AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+      AND EXISTS (
+          SELECT 1 FROM symbols t
+          WHERE t.owner_type = s.owner_type AND t.name = s.name
+            AND t.id <> s.id)
+    ORDER BY s.owner_type, s.name LIMIT :lim"""),
+(
+    "jspecify-null-contract-violations",
+    "@NonNull parameters on methods that can return null (Spring 7 JSpecify)",
+    "ANSWERS where JSpecify nullability (Spring 7's adopted standard) makes\n"
+    "    a contract the implementation breaks: the method takes @NonNull\n"
+    "    parameters and also contains `return null`. Callers compiled\n"
+    "    against the annotations will trust them; the null arrives anyway.\n"
+    "ACT either drop the null return (Optional, a sentinel, or throw) or\n"
+    "    annotate the return @Nullable and force every caller to handle it.\n"
+    "MISLEADS the null-return count is textual (`return null`); a null\n"
+    "    returned only behind a guard that proves impossibility still\n"
+    "    counts, and a @Nullable RETURN annotation (rather than parameter)\n"
+    "    is correct here and indistinguishable from none at this scan's\n"
+    "    granularity.",
+    """SELECT s.name, s.owner_type AS owner,
+        s.n_jspecify_annos AS null_annos,
+        s.n_null_returns AS null_returns,
+        s.fan_in, s.n_params,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('function','method') AND s.n_jspecify_annos > 0
+      AND s.n_null_returns > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, s.n_null_returns DESC LIMIT :lim"""),
 ]
 
 JavaAnalyzer.METRICS = [
@@ -7178,7 +7479,154 @@ JavaAnalyzer.METRICS = [
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.n_suppressions > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
-    ORDER BY s.n_suppressions DESC, s.fan_in DESC LIMIT :lim""")
+    ORDER BY s.n_suppressions DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "ee12-spec-surface",
+    "Jakarta EE 12 specification annotations in use (Data/Query/Persistence/Security)",
+    "ANSWERS which parts of the EE 12 platform this tree actually leans on:\n"
+    "    Jakarta Data repositories, Query 1.0 providers, Persistence 4.0,\n"
+    "    Security 5.0 role model. Platform GA is July 2026, so this is the\n"
+    "    forward-compatibility map -- code using EE 11-only APIs will need\n"
+    "    migration attention when the platform lands.\n"
+    "ACT group rows by module to see whether EE 12 usage is contained or\n"
+    "    smeared; smearing is what turns the next platform upgrade into a\n"
+    "    cross-cutting project.\n"
+    "MISLEADS matches ANNOTATION SIMPLE NAMES only: several (Query, Find,\n"
+    "    Save, Delete) collide with names from other libraries, so a\n"
+    "    non-Jakarta import of the same simple name counts too; absence of\n"
+    "    rows never means EE-incompatible -- XML descriptors and\n"
+    "    convention-over-configuration wiring are invisible here.",
+    """SELECT m.name AS module,
+        COUNT(DISTINCT s.id) AS annotated_symbols,
+        SUM(s.n_ee12_annos) AS ee12_anno_sites,
+        GROUP_CONCAT(DISTINCT a.name) AS specs_seen,
+        COUNT(DISTINCT f.id) AS files
+    FROM symbols s
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    LEFT JOIN attributes a ON a.symbol_id=s.id
+         AND a.name IN ('Query','Find','FindAll','Save','Delete','Insert',
+                        'Update','TenantId','RunInTransaction','RolesAllowed',
+                        'PermitAll','DeclareRoles','RunAs','Persists',
+                        'CTEProvider','SubqueryProvider')
+    WHERE s.n_ee12_annos > 0 AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY m.id
+    ORDER BY annotated_symbols DESC LIMIT :lim"""),
+(
+    "java25-adoption",
+    "Java 25 language-feature adoption per module (JEP 511/512/513)",
+    "ANSWERS how far each module has moved onto the Java 25 surface:\n"
+    "    flexible constructor bodies, module imports, compact source\n"
+    "    files, pattern switches. A module at zero on a Java-25 baseline\n"
+    "    is either new code worth reviewing or old code the team has not\n"
+    "    touched -- both facts worth knowing before a modernisation push.\n"
+    "ACT pick ONE feature per modernisation pass and sweep it module-wide;\n"
+    "    mixed-style modules are where review attention goes to die.\n"
+    "MISLEADS flex-ctor counts come from ERROR recovery (see\n"
+    "    flex-constructor-prologues), so they are exact only while\n"
+    "    tree-sitter-java predates JEP 513; module imports are recovered by\n"
+    "    text scan and count per FILE; preview features need\n"
+    "    --enable-preview and may vanish.",
+    """SELECT COALESCE(m.name,'(none)') AS module,
+        SUM(CASE WHEN s.is_flex_constructor=1 THEN 1 ELSE 0 END)
+            AS flex_ctors,
+        COUNT(DISTINCT CASE WHEN s.n_modern_idioms>0 THEN s.id END)
+            AS modern_idiom_methods,
+        COUNT(*) AS methods_total
+    FROM symbols s
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('function','method','constructor')
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY m.id
+    ORDER BY flex_ctors DESC, modern_idiom_methods DESC LIMIT :lim"""),
+(
+    "spring7-readiness",
+    "Spring Framework 7 surface per module: resilience, versioning, HTTP clients",
+    "ANSWERS which modules already speak Spring 7 (resilience annotations,\n"
+    "     API versioning, declarative clients) and which are still on the\n"
+    "     pre-7 idioms. Useful as an upgrade checklist: the modules with\n"
+    "     zero across the board are the ones whose controllers will need\n"
+    "     the most migration eyes.\n"
+    "ACT sort the upgrade order by this table, not by module size -- a\n"
+    "     small module deep on Spring 6 idioms costs more than a big one\n"
+    "     already half-migrated.\n"
+    "MISLEADS annotation SIMPLE NAMES again; a module can be perfectly\n"
+    "    Spring-7-ready with zero rows here if it uses none of these three\n"
+    "    features.",
+    """SELECT COALESCE(m.name,'(none)') AS module,
+        COUNT(DISTINCT CASE WHEN s.n_resilience_annos>0 THEN s.id END)
+            AS resilience_methods,
+        COUNT(DISTINCT CASE WHEN s.n_api_version_attr>0 THEN s.id END)
+            AS versioned_endpoints,
+        (SELECT COUNT(*) FROM symbols t WHERE t.is_http_exchange_client=1
+          AND t.module_id=m.id) AS http_clients,
+        COUNT(DISTINCT s.id) AS methods_total
+    FROM symbols s
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('function','method') AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY m.id
+    ORDER BY resilience_methods DESC, http_clients DESC LIMIT :lim"""),
+(
+    "null-contract-density",
+    "JSpecify nullability coverage: annotated vs public methods per module",
+    "ANSWERS how much of each module's public surface carries explicit\n"
+    "     nullability (@NonNull/@Nullable). Nullability is only useful when\n"
+    "     it is NEARLY UNIVERSAL -- one unannotated method in a fully\n"
+    "     annotated package poisons the inference for every caller that\n"
+    "     trusts the tooling.\n"
+    "ACT for the top module, finish the sweep rather than starting a new\n"
+    "    one: partial null-safety has most of the cost and none of the\n"
+    "    benefit.\n"
+    "MISLEADS counts ANNOTATION SITES, not completeness -- a method with no\n"
+    "    nullable parameters correctly carries no @NonNull, so low density\n"
+    "    can be genuine cleanliness; only intra-JSpecify projects benefit.",
+    """SELECT COALESCE(m.name,'(none)') AS module,
+        COUNT(DISTINCT CASE WHEN s.n_jspecify_annos>0 THEN s.id END)
+            AS annotated_methods,
+        COUNT(DISTINCT CASE WHEN s.is_public=1 THEN s.id END)
+            AS public_methods,
+        ROUND(100.0 * COUNT(DISTINCT CASE WHEN s.n_jspecify_annos>0
+              THEN s.id END)
+            / NULLIF(COUNT(DISTINCT CASE WHEN s.is_public=1 THEN s.id END),0),
+            1) AS pct_public_annotated
+    FROM symbols s
+    JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('function','method') AND f.is_test=0
+      AND COALESCE(m.name,'') LIKE :mod
+    GROUP BY m.id
+    HAVING public_methods > 0
+    ORDER BY pct_public_annotated ASC LIMIT :lim"""),
+(
+    "framework-lock-in-map",
+    "Framework coupling per class: handler + DI + EE12 annotation load",
+    "ANSWERS which classes carry the heaviest framework annotation load --\n"
+    "    the map of what stops this codebase from being plain Java. High\n"
+    "    annotation density is not a defect; UNIFORM density is invisible\n"
+    "    architecture and this makes it visible per class so extraction\n"
+    "    candidates stand out.\n"
+    "ACT classes at the top with few callers (low fan_in) are extraction\n"
+    "    candidates: all framework, little use. Classes at the top WITH\n"
+    "    high fan_in are your actual architecture -- document them.\n"
+    "MISLEADS annotation COUNT is not coupling DEPTH: one @Transactional\n"
+    "    pulls in less than five lifecycle callbacks; generated code\n"
+    "    (excluded here) often carries heavy annotations legitimately.",
+    """SELECT s.name AS type_, s.kind,
+        s.n_annotations AS annos,
+        s.n_ee12_annos AS ee12_annos,
+        s.fan_in, s.sloc,
+        m.name AS module,
+        f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('class','interface','record','enum')
+      AND s.n_annotations >= 4 AND f.is_test=0 AND f.is_generated=0
+      AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_annotations DESC, s.n_ee12_annos DESC LIMIT :lim""")
 ]
 
 

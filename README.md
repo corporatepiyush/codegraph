@@ -302,13 +302,13 @@ service to warm; the cost is the parse itself, paid once per run.
 | `codegraph_python.py` | 57 | 23 | 80 |
 | `codegraph_go.py` | 59 | 17 | 76 |
 | `codegraph_c.py` | 53 | 33 | 86 |
-| `codegraph_java.py` | 50 | 17 | 67 |
+| `codegraph_java.py` | 55 | 22 | 77 |
 | `codegraph_typescript.py` | 51 | 19 | 70 |
 | `codegraph_ruby.py` | 55 | 9 | 64 |
 | `codegraph_rust.py` | 51 | 14 | 65 |
 | `codegraph_javascript.py` | 41 | 14 | 55 |
 | `codegraph_php.py` | 49 | 13 | 62 |
-| **All** | **466** | **159** | **625** |
+| **All** | **471** | **164** | **635** |
 
 (Single source of truth for these numbers: run `codegraph_<lang>.py --list` and
 `--metrics --list`. If the table disagrees with the scripts, the scripts win.)
@@ -375,9 +375,12 @@ Concurrency is the first citizen — goroutines, locks, contexts:
   `scattered-concerns` (M), `deep-call-chain` (M), `unused-exported`,
   `dead-code`, `risk-ranked` (M)
 
-### Java (50 act, 17 weigh)
+### Java (55 act, 22 weigh)
 
-Concurrency under the JVM, resource discipline, and framework/type design:
+Concurrency under the JVM, resource discipline, and framework/type design —
+with a Java 25 / Spring Framework 7 / Jakarta EE 12 pack (JEP 513 flexible
+constructor recovery, resilience annotations, API versioning, HTTP
+interfaces, JSpecify, EE 12 spec surface):
 
 - **Concurrency & executors** — `vt-pinning-frontier`,
   `threadlocal-leak-on-pooled`, `shared-mutable-statics`, `lock-order-inversion`,
@@ -388,6 +391,11 @@ Concurrency under the JVM, resource discipline, and framework/type design:
   `null-return-ignore`, `reference-equality`, `narrow-calculation`,
   `static-mutable-state`, `missing-super-call`, `overridden-not-annotated`,
   `modern-idiom-candidates`
+- **Java 25 / Spring 7 / Jakarta EE 12** — `flex-constructor-prologues`,
+  `resilience-annotation-surface`, `http-exchange-clients`, `api-version-drift`,
+  `jspecify-null-contract-violations` (Q), `ee12-spec-surface` (M),
+  `java25-adoption` (M), `spring7-readiness` (M), `null-contract-density` (M),
+  `framework-lock-in-map` (M)
 - **Resources & exceptions** — `resource-open-never-closed`, `files-stream-leak`,
   `exception-contract-drift`, `empty-catch-by-fanin`, `dead-exception`,
   `try-in-loop`, `static-write-in-ctor`, `n-plus-one`
@@ -398,13 +406,14 @@ Concurrency under the JVM, resource discipline, and framework/type design:
   `unauthenticated-input-surface`
 - **Design / architecture** — `hierarchy-depth`, `di-bottleneck`,
   `overload-density`, `iface-impl-ratio`, `package-cycle`,
-  `annotation-coupling`, `abstract-fanout`, `layer-violations`,
-  `megamorphic-callsites` (M), `raw-types-and-unchecked` (M),
+  `annotation-coupling`, `abstract-fanout`, `layer-violations`, `dead-code`,
+  `weak-random`, `megamorphic-callsites` (M), `raw-types-and-unchecked` (M),
   `per-element-cost` (M), `boxing-in-hot-loop` (M), `string-concat-in-loop`,
   `regex-and-format-per-call` (M), `platform-charset-across-module-boundary` (M),
   `serializable-no-uid` (M), `print-stacktrace-leak` (M), `god-class` (M),
   `setaccessible-and-finalizers` (M), `deep-nesting` (M), `too-many-params` (M),
-  `suppressed-warnings` (M)
+  `suppressed-warnings` (M), plus the shared core (`graph-blindspots`,
+  `hot-multipliers`, `risk-ranked`, `parse-coverage`)
 
 ### JavaScript (41 act, 14 weigh)
 
