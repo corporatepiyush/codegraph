@@ -4263,6 +4263,7 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
             n_resilience_annos=resilience,
             n_api_version_attr=min(version_attr, 9),
             n_jspecify_annos=jspecify,
+            n_ee12_annos=_qualified_ee12_annos(node, src),
         )
 
     def type_flags(self, node: Any, rec: FileRec,
@@ -4293,7 +4294,7 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
             n_annotations=len(annos),
             n_generic_params=_count_type_params(node),
             is_http_exchange_client=http_client,
-            n_ee12_annos=len(annos & JAKARTA_EE12_ANNOTATIONS),
+            n_ee12_annos=_qualified_ee12_annos(node, src),
         )
 
     # -- the measuring pass ------------------------------------------------
@@ -5357,6 +5358,39 @@ def _annotation_names(node: Any, src: bytes) -> set[str]:
                     out.add(_txt(nm, src).rsplit(".", 1)[-1])
         break
     return out
+
+def _qualified_ee12_annos(node: Any, src: bytes) -> int:
+    """Count EE 12 annotations with package verification where possible.
+
+    Simple names like Query/Save/Delete collide with every library; when a
+    use is QUALIFIED (jakarta.data.Query), the package decides. Qualified
+    uses of a GENERIC name count only under a jakarta./javax. root;
+    unqualified uses keep counting as before -- documented as the MISLEADS
+    of ee12-spec-surface.
+    """
+    JAKARTA_ROOTS = ("jakarta.", "javax.")
+    GENERIC = {"Query", "Find", "FindAll", "Save", "Delete", "Insert",
+               "Update"}
+    n = 0
+    for c in node.named_children:
+        if c.type != "modifiers":
+            continue
+        for a in c.named_children:
+            if a.type not in ("annotation", "marker_annotation"):
+                continue
+            nm = a.child_by_field_name("name")
+            if nm is None:
+                continue
+            full = _txt(nm, src)
+            simple = full.rsplit(".", 1)[-1]
+            if simple not in JAKARTA_EE12_ANNOTATIONS:
+                continue
+            if "." in full and simple in GENERIC:
+                pkg = full.rsplit(".", 1)[0]
+                if not pkg.startswith(JAKARTA_ROOTS):
+                    continue
+            n += 1
+    return n
 
 def _annotation_arg_values(node: Any, src: bytes, arg: str) -> list[str]:
     """Values of `arg = ...` inside the node's annotations.
@@ -7499,11 +7533,13 @@ JavaAnalyzer.METRICS = [
     "ACT group rows by module to see whether EE 12 usage is contained or\n"
     "    smeared; smearing is what turns the next platform upgrade into a\n"
     "    cross-cutting project.\n"
-    "MISLEADS matches ANNOTATION SIMPLE NAMES only: several (Query, Find,\n"
-    "    Save, Delete) collide with names from other libraries, so a\n"
-    "    non-Jakarta import of the same simple name counts too; absence of\n"
-    "    rows never means EE-incompatible -- XML descriptors and\n"
-    "    convention-over-configuration wiring are invisible here.",
+    "MISLEADS the row GATE (n_ee12_annos) verifies the package when an\n"
+    "    annotation is spelled qualified -- a qualified mypkg.Query does\n"
+    "    not count -- but UNQUALIFIED uses still count on the simple name,\n"
+    "    and the specs_seen column lists simple names for the same reason:\n"
+    "    treat it as a hint, not a census. Absence of rows never means\n"
+    "    EE-incompatible -- XML descriptors and convention-over-\n"
+    "    configuration wiring are invisible here.",
     """SELECT m.name AS module,
         COUNT(DISTINCT s.id) AS annotated_symbols,
         SUM(s.n_ee12_annos) AS ee12_anno_sites,
