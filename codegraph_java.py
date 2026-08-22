@@ -4867,10 +4867,16 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
             else:
                 continue
             annos = _annotation_names(p, src)
+            # JSpecify: @NonNull on a parameter is the PRIMARY nullability
+            # spelling; it must reach both params.is_nullable and the
+            # method's n_jspecify_annos count.
+            if annos & {"NonNull", "Nullable", "CheckForNull"}:
+                self._sym_updates.append(("n_jspecify_annos", 1, sid))
             bufs.params.append(
                 (sid, pos, (name or "?")[:120], ptype[:200], None,
-                 int(bool(annos & {"Nullable", "CheckForNull"})), variadic,
-                 0, 0, int(bool(annos & {"Nullable", "CheckForNull"})),
+                 int(bool(annos & {"NonNull", "Nullable", "CheckForNull"})),
+                 variadic, 0, 0,
+                 int(bool(annos & {"NonNull", "Nullable", "CheckForNull"})),
                  int("<" in ptype), int(not ptype),
                  ptype.count("<") + ptype.count("[")))
             pos += 1
@@ -5395,7 +5401,9 @@ def _is_flex_constructor(node: Any) -> bool:
         n = stack.pop()
         if n.type == "ERROR":
             t = n.text.decode("utf-8", "replace").strip()
-            if t.startswith(("super(", "this(")):
+            # `this()` mid-body recovers as bare "()" -- the grammar drops
+            # the `this` token itself; `super()` keeps its name.
+            if t.startswith(("super(", "this(")) or t == "()":
                 return True
         stack.extend(n.named_children)
     return False
@@ -7537,7 +7545,7 @@ JavaAnalyzer.METRICS = [
     FROM symbols s
     JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
-    WHERE s.kind IN ('function','method','constructor')
+    WHERE s.kind IN ('function','method','constructor') AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
     GROUP BY m.id
     ORDER BY flex_ctors DESC, modern_idiom_methods DESC LIMIT :lim"""),
