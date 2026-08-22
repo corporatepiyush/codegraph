@@ -478,7 +478,33 @@ def named_children(node: Any, *types: str) -> list[Any]:
 def child_by_field(node: Any, field: str) -> Optional[Any]:
     return node.child_by_field_name(field)
 
+_TEXT_CACHE: dict[int, tuple[bytes, Optional[str]]] = {}
+_TEXT_CACHE_MAX = 8
+
+_ASCII_SCAN = re.compile(rb'^[\x00-\x7f]*$')
+
 def text_of(node: Any, src: bytes) -> str:
+    """Node text; ASCII files get a cached decoded string to slice.
+
+    measure() calls this millions of times per build, each paying a fresh
+    UTF-8 decode (8.4M on elasticsearch). For an ALL-ASCII file, byte
+    offsets and character indices are identical, so the decoded string can
+    be cached and sliced directly -- no per-call decode at all. A file
+    containing any non-ASCII byte caches None and takes the plain path:
+    its node offsets are BYTE offsets, and slicing the decoded STR by them
+    is wrong (a 3-byte CJK char is ONE str index -- the fuzz test catches
+    this in seconds).
+    """
+    ent = _TEXT_CACHE.get(id(src))
+    if ent is None or ent[0] is not src:
+        ascii_ok = _ASCII_SCAN.match(src) is not None
+        cached = src.decode("ascii") if ascii_ok else None
+        if len(_TEXT_CACHE) >= _TEXT_CACHE_MAX:
+            _TEXT_CACHE.clear()
+        _TEXT_CACHE[id(src)] = (src, cached)
+        ent = _TEXT_CACHE[id(src)]
+    if ent[1] is not None:                  # ascii: offsets are 1:1
+        return ent[1][node.start_byte:node.end_byte]
     return src[node.start_byte:node.end_byte].decode("utf-8", "replace")
 
 def field_text(node: Any, field: str, src: bytes, default: str = "") -> str:
@@ -2657,9 +2683,6 @@ class TreeSitterAnalyzer(Analyzer):
         cols = ["file_id", "module_id", "parent_id", "name", "qual_name",
                 "kind", "line_start", "line_end", "n_lines", "byte_start",
                 "byte_end", "signature", "return_type", "visibility"]
-        vals: list[Any] = [rec.fid, rec.mid, parent_id, name, qual[:400], kind,
-                           ls, le, le - ls + 1, node.start_byte, node.end_byte,
-                           signature[:400], return_type[:200], visibility]
         # One fixed-width row per symbol, buffered. The old form built the
         # column list from whichever metrics were present, which meant 2,544
         # distinct INSERT shapes on javaparser alone -- impossible to batch,
@@ -2700,13 +2723,24 @@ class TreeSitterAnalyzer(Analyzer):
                 "INSERT INTO symbols(id,%s,%s) VALUES(%s)"
                 % (",".join(cols), ",".join(n for n, _ in spec),
                    ",".join("?" * (1 + len(cols) + len(spec)))))
+            # Patch-style row build: start from the defaults vector (a
+            # C-speed list copy), then overwrite only the keys this symbol
+            # actually measured -- typically a handful of ~150 columns.
+            # The old form called m.get once per column per symbol:
+            # 13.1M dict lookups on elasticsearch vs ~300k patches here.
+            self._sym_defaults = [d for _, d in spec]
+            self._sym_index = {k: i for i, (k, _) in enumerate(spec)}
         self._n_sym += 1
         sid = self._n_sym
-        row = [sid]
-        row.extend(vals)
-        for k, dflt in spec:
-            v = m.get(k, dflt)
-            row.append(int(v) if isinstance(v, bool) else v)
+        row = self._sym_defaults.copy()
+        for k, v in m.items():
+            i = self._sym_index.get(k)
+            if i is not None:
+                row[i] = int(v) if isinstance(v, bool) else v
+        row[:0] = [sid]
+        row[1:1] = [rec.fid, rec.mid, parent_id, name, qual[:400], kind,
+                    ls, le, le - ls + 1, node.start_byte, node.end_byte,
+                    signature[:400], return_type[:200], visibility]
         self._sym_rows.append(tuple(row))
         # Drained periodically, not held to the end. Buffering all of them
         # satisfied the no-single-row-DML rule but cost 89 MB on netty alone
@@ -6561,12 +6595,19 @@ WITH fld AS (
     "MISLEADS n_overloads counts (name, owner) collisions minus one; two\n"
     "     same-named methods in DIFFERENT owners each report n_overloads=0,\n"
     "     which is correct for dispatch but understates name noise.",
-    """SELECT pc.name AS owner, s.name, MAX(s.n_overloads) AS overloads,
-        (SELECT COUNT(*) FROM symbols s2
-          WHERE s2.name=s.name AND s2.parent_id=s.parent_id) AS total_defs,
+    """-- total_defs per (parent_id, name) aggregated ONCE: the first version
+    -- ran a correlated COUNT per output row, 3.3s on elasticsearch's
+    -- 87k-symbol graph vs 260ms for this join.
+    WITH defs AS (
+        SELECT parent_id, name, COUNT(*) AS total_defs
+        FROM symbols WHERE kind='method' GROUP BY parent_id, name)
+    SELECT pc.name AS owner, s.name, MAX(s.n_overloads) AS overloads,
+        MAX(d.total_defs) AS total_defs,
         MIN(s.sloc) AS sloc, MAX(s.fan_in) AS fan_in,
         f.path || ':' || MIN(s.line_start) AS at
-    FROM symbols s JOIN symbols pc ON pc.id=s.parent_id
+    FROM symbols s
+    JOIN defs d ON d.parent_id=s.parent_id AND d.name=s.name
+    JOIN symbols pc ON pc.id=s.parent_id
     JOIN files f ON f.id=s.file_id
     LEFT JOIN modules m ON m.id=s.module_id
     WHERE s.kind='method' AND s.n_overloads > 0
