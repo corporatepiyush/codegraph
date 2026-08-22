@@ -3916,6 +3916,29 @@ class JavaAnalyzer(TreeSitterAnalyzer):
         #: adopts JSpecify as its null-safety standard; a method that takes
         #: @NonNull params AND can return null is a contract violation.
         ("n_jspecify_annos", "INT NOT NULL DEFAULT 0"),
+        # -- linter-rule sweep pack (SpotBugs/PMD/Error Prone gaps that are
+        #    graph-shaped: they need call sites, owner types or name sets,
+        #    which is exactly what a per-file checker cannot see) ----------
+        #: Object.notify() called (not notifyAll): only one waiter wakes,
+        #: and which one is arbitrary. PMD UseNotifyAllInsteadOfNotify.
+        ("n_notify_single", "INT NOT NULL DEFAULT 0"),
+        #: x.run() called directly on a non-this receiver: runs in the
+        #: CALLER'S thread; the author almost always meant x.start().
+        #: PMD DontCallThreadRun.
+        ("n_run_called_directly", "INT NOT NULL DEFAULT 0"),
+        #: -x.compareTo(y) or x.compareTo(y) * -1: negating the result is
+        #: wrong whenever compareTo returns Integer.MIN_VALUE. SpotBugs
+        #: RV_NEGATING_RESULT_OF_COMPARETO. Needs the METHOD body plus
+        #: knowledge of what compareTo means -- a name-graph fact.
+        ("n_compareto_negate", "INT NOT NULL DEFAULT 0"),
+        #: new BigDecimal(<not a String>): the double ctor keeps binary
+        #: error (new BigDecimal(0.1) != 0.1). SpotBugs
+        #: DMI_BIGDECIMAL_CONSTRUCTED_FROM_DOUBLE.
+        ("n_bigDecimal_from_double", "INT NOT NULL DEFAULT 0"),
+        #: compareTo/compare result compared against a SPECIFIC value
+        #: (== 1, == -1): only the sign is contractual. SpotBugs
+        #: RV_CHECK_COMPARETO_FOR_SPECIFIC_RETURN_VALUE.
+        ("n_compareto_specific", "INT NOT NULL DEFAULT 0"),
     )
 
     SCHEMA_EXT = r"""
@@ -4365,6 +4388,17 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                     st.bump("n_boxing_in_loop")
                 if tname in ("StringBuilder", "StringBuffer"):
                     st.bump("concat_in_loop")
+            # SpotBugs DMI_BIGDECIMAL_CONSTRUCTED_FROM_DOUBLE: the double
+            # ctor keeps binary error (new BigDecimal(0.1) is NOT 0.1);
+            # only a String or BigDecimal.valueOf(double) is exact. The
+            # capture needs the ARGUMENT type, so it lives on this node.
+            if tname == "BigDecimal":
+                args = node.child_by_field_name("arguments")
+                if args is not None and args.named_children:
+                    first = args.named_children[0]
+                    if first.type in ("decimal_floating_point_literal",) or (
+                            first.type == "identifier"):
+                        st.bump("n_bigDecimal_from_double")
             if tname in RESOURCE_TYPES:
                 st.bump("io_in_loop" if loop_depth else "n_resource_open")
             self._loop_counters("new " + tname, st, loop_depth)
@@ -4443,6 +4477,16 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
             st.bump("n_read_object")             # OBJECT_DESERIALIZATION
         if _b in ("loadLibrary", "load") and "System" in full:
             st.bump("n_load_library")
+        # -- linter-rule sweep pack (SpotBugs/PMD gaps needing call sites) --
+        if _b == "notify":
+            st.bump("n_notify_single")     # PMD UseNotifyAllInsteadOfNotify
+        elif _b == "run" and obj is not None and obj.type != "this":
+            # x.run() called directly -- runs in the CALLER'S thread when x
+            # is a Thread; the author almost always meant start(). Counted
+            # on ANY named receiver; the query joins against Thread
+            # allocation in the same file to rank, and documents the
+            # false-positive surface (PMD DontCallThreadRun).
+            st.bump("n_run_called_directly")   # PMD DontCallThreadRun
         if recv in JAVA_REQ_RECEIVERS:
             kind = JAVA_INPUT_KINDS.get(base)
             if kind is not None:
@@ -4610,6 +4654,20 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                 if (right is not None and right.type == "null_literal") or (
                         left is not None and left.type == "null_literal"):
                     st.bump("n_null_check")
+                # SpotBugs RV_CHECK_COMPARETO_FOR_SPECIFIC_RETURN_VALUE:
+                # only the SIGN of compareTo/compare is contractual; `== 1`
+                # breaks for comparators returning arbitrary magnitudes.
+                if right is not None and left is not None:
+                    for call_side, lit_side in ((left, right), (right, left)):
+                        if call_side.type == "method_invocation":
+                            nm3 = call_side.child_by_field_name("name")
+                            if nm3 is not None and _txt(nm3, src) in (
+                                    "compareTo", "compare") and \
+                                    lit_side.type in (
+                                        "decimal_integer_literal",):
+                                if _txt(lit_side, src).strip() in (
+                                        "1", "-1"):
+                                    st.bump("n_compareto_specific")
                 if o in ("==", "!=") and right is not None and \
                         left is not None and right.type not in (
                             "decimal_integer_literal",
@@ -4633,7 +4691,9 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                         st.bump("concat_in_loop")
                 else:
                     st.bump("n_arith")
-            elif o in ("-", "*", "/", "%"):
+            elif o == "-":
+                st.bump("n_arith")
+            elif o in ("*", "/", "%"):
                 st.bump("n_arith")
                 # Error Prone NarrowCalculation: an arithmetic product
                 # assigned to a long without widening -- `long x = a * b`
@@ -4648,6 +4708,17 @@ SELECT root, sym, MIN(depth) FROM back GROUP BY root, sym;
                     if ty is not None and \
                             _txt(ty, src).lstrip().startswith("long"):
                         st.bump("n_narrow_calc")
+        elif t == "unary_expression":
+            # SpotBugs RV_NEGATING_RESULT_OF_COMPARETO: `-x.compareTo(y)`
+            # breaks when compareTo returns Integer.MIN_VALUE (negating
+            # MIN_VALUE is MIN_VALUE). The grammar makes unary minus its own
+            # node with an unnamed operator child and exactly one operand.
+            kids = [c for c in node.named_children if c.type != "comment"]
+            if len(kids) == 1 and kids[0].type == "method_invocation":
+                nm2 = kids[0].child_by_field_name("name")
+                if nm2 is not None and _txt(nm2, src) in (
+                        "compareTo", "compare"):
+                    st.bump("n_compareto_negate")
         elif t == "assignment_expression":
             op = _field_child(node, "operator")
             if op is not None and _txt(op, src) != "=":
@@ -7122,6 +7193,81 @@ WITH fld AS (
       AND s.n_null_returns > 0 AND f.is_test=0
       AND COALESCE(m.name,'') LIKE :mod
     ORDER BY s.fan_in DESC, s.n_null_returns DESC LIMIT :lim"""),
+(
+    "notify-without-notifyall",
+    "Object.notify() where notifyAll() is the safer contract (PMD UseNotifyAllInsteadOfNotify)",
+    "ANSWERS monitor wake-ups that pick ONE arbitrary waiter. If two threads\n"
+    "     wait for different conditions on the same monitor, notify() wakes\n"
+    "     the wrong one and both stall -- the lost-wakeup shape. The graph\n"
+    "     adds what PMD cannot: fan_in says how many code paths can be\n"
+    "     waiting, and the same-file wait() count says whether multiple\n"
+    "     conditions share the monitor.\n"
+    "ACT replace with notifyAll() unless every waiter waits on the SAME\n"
+    "     predicate in a loop -- then notify() is correct and cheaper.\n"
+    "MISLEADS single-waiter monitors are common and correct; check the\n"
+    "     wait loop's predicate before acting. Counted by simple name, so\n"
+    "     custom notify() methods on other classes count too.",
+    """SELECT s.name, s.owner_type AS owner,
+        s.n_notify_single AS notify_calls,
+        s.n_monitor_call AS monitor_ops,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('function','method') AND s.n_notify_single > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.fan_in DESC, s.n_notify_single DESC LIMIT :lim"""),
+(
+    "thread-run-not-start",
+    ".run() called directly: executes in the CALLER'S thread (PMD DontCallThreadRun)",
+    "ANSWERS task launches that never launched: `x.run()` executes the body\n"
+    "     inline, synchronously -- no new thread, no concurrency, and any\n"
+    "     blocking inside it now blocks the caller. The author almost always\n"
+    "     meant `x.start()`. The query ranks by whether the same file also\n"
+    "     allocates Threads/executors, which separates real launch sites\n"
+    "     from same-named run() helpers.\n"
+    "ACT replace .run() with .start(), or extract a Runnable and pass it to\n"
+    "     the executor you already have.\n"
+    "MISLEADS counted by simple NAME on any receiver -- a genuine call to a\n"
+    "    domain method named run() (a benchmark harness, Runnable.run passed\n"
+    "    deliberately inline) counts too; the file-level Thread-allocation\n"
+    "    column is the tiebreaker, not proof.",
+    """SELECT s.name, s.owner_type AS owner,
+        s.n_run_called_directly AS run_calls,
+        CASE WHEN EXISTS (SELECT 1 FROM symbols t
+             WHERE t.file_id=s.file_id
+             AND (t.n_executor_create>0 OR t.is_virtual_thread_root=1))
+             THEN 1 ELSE 0 END AS thread_file,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('function','method') AND s.n_run_called_directly > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY thread_file DESC, s.fan_in DESC LIMIT :lim"""),
+(
+    "bigdecimal-from-double",
+    "new BigDecimal(double): binary error baked into money math (SpotBugs DMI_BIGDECIMAL)",
+    "ANSWERS BigDecimal constructions from floating-point literals or\n"
+    "     variables: new BigDecimal(0.1) is exactly\n"
+    "     0.1000000000000000055511151231257827... -- the double's binary\n"
+    "     error, preserved forever in your 'exact' decimal. Money math that\n"
+    "     chose BigDecimal for correctness keeps the bug it chose it to\n"
+    "     avoid.\n"
+    "ACT use the String constructor or BigDecimal.valueOf(double), which\n"
+    "     routes through Double.toString.\n"
+    "MISLEADS identifier-typed arguments count too (a double variable may\n"
+    "    hold an exact value like 0.5); only literals and bare identifiers\n"
+    "    are captured -- a method call returning double is not seen and may\n"
+    "    still construct imprecise values.",
+    """SELECT s.name, s.owner_type AS owner,
+        s.n_bigDecimal_from_double AS bad_ctors,
+        s.n_alloc_sites AS total_allocs,
+        s.fan_in, f.path || ':' || s.line_start AS at
+    FROM symbols s JOIN files f ON f.id=s.file_id
+    LEFT JOIN modules m ON m.id=s.module_id
+    WHERE s.kind IN ('function','method')
+      AND s.n_bigDecimal_from_double > 0
+      AND f.is_test=0 AND COALESCE(m.name,'') LIKE :mod
+    ORDER BY s.n_bigDecimal_from_double DESC, s.fan_in DESC LIMIT :lim"""),
 ]
 
 JavaAnalyzer.METRICS = [

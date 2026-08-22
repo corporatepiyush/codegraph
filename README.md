@@ -302,13 +302,13 @@ service to warm; the cost is the parse itself, paid once per run.
 | `codegraph_python.py` | 57 | 23 | 80 |
 | `codegraph_go.py` | 59 | 17 | 76 |
 | `codegraph_c.py` | 53 | 33 | 86 |
-| `codegraph_java.py` | 55 | 22 | 77 |
+| `codegraph_java.py` | 58 | 22 | 80 |
 | `codegraph_typescript.py` | 51 | 19 | 70 |
 | `codegraph_ruby.py` | 55 | 9 | 64 |
 | `codegraph_rust.py` | 51 | 14 | 65 |
 | `codegraph_javascript.py` | 41 | 14 | 55 |
 | `codegraph_php.py` | 49 | 13 | 62 |
-| **All** | **471** | **164** | **635** |
+| **All** | **474** | **164** | **638** |
 
 (Single source of truth for these numbers: run `codegraph_<lang>.py --list` and
 `--metrics --list`. If the table disagrees with the scripts, the scripts win.)
@@ -375,22 +375,24 @@ Concurrency is the first citizen — goroutines, locks, contexts:
   `scattered-concerns` (M), `deep-call-chain` (M), `unused-exported`,
   `dead-code`, `risk-ranked` (M)
 
-### Java (55 act, 22 weigh)
+### Java (58 act, 22 weigh)
 
 Concurrency under the JVM, resource discipline, and framework/type design —
 with a Java 25 / Spring Framework 7 / Jakarta EE 12 pack (JEP 513 flexible
 constructor recovery, resilience annotations, API versioning, HTTP
-interfaces, JSpecify, EE 12 spec surface):
+interfaces, JSpecify, EE 12 spec surface) and a linter-rule sweep pack
+(PMD/SpotBugs rules that need call sites or owner context):
 
 - **Concurrency & executors** — `vt-pinning-frontier`,
   `threadlocal-leak-on-pooled`, `shared-mutable-statics`, `lock-order-inversion`,
   `lock-held-across-io`, `thread-sleep-in-lock`, `parallel-stream-hazard`,
   `executor-without-shutdown`, `submit-in-loop`, `lock-on-boxed`,
-  `false-sharing-and-escape`
+  `false-sharing-and-escape`, `notify-without-notifyall`,
+  `thread-run-not-start`
 - **Correctness smells** — `equals-hashcode-mismatch`, `double-checked-locking`,
   `null-return-ignore`, `reference-equality`, `narrow-calculation`,
   `static-mutable-state`, `missing-super-call`, `overridden-not-annotated`,
-  `modern-idiom-candidates`
+  `modern-idiom-candidates`, `bigdecimal-from-double`
 - **Java 25 / Spring 7 / Jakarta EE 12** — `flex-constructor-prologues`,
   `resilience-annotation-surface`, `http-exchange-clients`, `api-version-drift`,
   `jspecify-null-contract-violations` (Q), `ee12-spec-surface` (M),
