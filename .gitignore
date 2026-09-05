@@ -1,0 +1,48 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+*.db
+*.db-journal
+*.sqlite
+.DS_Store
+corpus/
+.tsvenv/
+reports/*.txt
+.venv/
+CLAUDE.md
+qharness.py
+_triggers/
+truthcheck.py
+perfgate.py
+.opencode/
+
+# per-session handoff / plan notes -- working documents, not part of the product
+*_plan.md
+
+# local dev tooling, kept out of the repo (one self-contained file per PL only)
+audit_split.py
+profiler.py
+sweep.py
+review_manifest.md
+rm_two.py
+rm_two_helper.py
+sql.*.txt
+py.*.profstats
+test_repos/
+*.py_split
+*.py.bak
+
+# one-shot local helpers
+_*.py
+PLAN.md
+.audit-probes/
+
+# local measurement tooling (like qharness.py / truthcheck.py above)
+sqltime.py
+issuescan.py
+allocs.py
+.fixscratch/
