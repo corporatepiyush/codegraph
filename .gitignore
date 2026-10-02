@@ -63,6 +63,7 @@ go/*
 # repo is the Go ports only -- verification chain, spec copy, and corpora stay local
 /MECHANICAL_SYMPATHY.md
 /gate.sh
+/verify_c.sh
 /cgschema.py
 /cmpdump.py
 /dump_oracle.py
