@@ -11883,6 +11883,15 @@ func (g *Graph) hazardsByPattern(pats []string) []*Hazard {
 var scanOrder = "file"
 
 func (g *Graph) syms() []*Symbol {
+	if g.symsCache != nil && g.symsCacheOrder == scanOrder {
+		return g.symsCache
+	}
+	out := g.symsUncached()
+	g.symsCache, g.symsCacheOrder = out, scanOrder
+	return out
+}
+
+func (g *Graph) symsUncached() []*Symbol {
 	if scanOrder == "name" {
 		return g.symsByName()
 	}
@@ -17290,6 +17299,7 @@ type lexer struct {
 	fileID   uint32
 	pos      int32
 	curLine  int32
+	posLine  int32
 	errs     *[]lexErr
 
 	afterHash  bool
@@ -17304,9 +17314,22 @@ func tokFileID(id uint32) uint16 {
 }
 
 func newLexer(src []byte, fileID uint32, errs *[]lexErr) *lexer {
-	b, origOf, origLine, lineStar := spliceSource(stripBOM(src))
-	return &lexer{src: b, origOf: origOf, origLine: origLine, lineStar: lineStar,
-		fileID: fileID, errs: errs}
+	src = stripBOM(src)
+	lineStar := make([]int32, 0, len(src)/24+8)
+	lineStar = append(lineStar, 0)
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		if c == '\r' || (c == '\\' && i+1 < len(src) &&
+			(src[i+1] == '\n' || src[i+1] == '\r')) {
+			b, origOf, origLine, ls := spliceSource(src)
+			return &lexer{src: b, origOf: origOf, origLine: origLine,
+				lineStar: ls, fileID: fileID, errs: errs}
+		}
+		if c == '\n' {
+			lineStar = append(lineStar, int32(i+1))
+		}
+	}
+	return &lexer{src: src, lineStar: lineStar, fileID: fileID, errs: errs}
 }
 
 func (lx *lexer) errf(off int32, msg string) {
@@ -17316,6 +17339,27 @@ func (lx *lexer) errf(off int32, msg string) {
 }
 
 func (lx *lexer) lineAt(off int32) int32 {
+	if lx.origLine == nil {
+		if int(off) >= len(lx.src) {
+			off = int32(len(lx.src)) - 1
+			if off < 0 {
+				return 1
+			}
+		}
+		lo, hi := 0, len(lx.lineStar)
+		for lo < hi {
+			mid := (lo + hi) / 2
+			if lx.lineStar[mid] <= off {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		if lo < 1 {
+			return 1
+		}
+		return int32(lo)
+	}
 	if int(off) < len(lx.origLine) {
 		return lx.origLine[off]
 	}
@@ -17326,25 +17370,43 @@ func (lx *lexer) lineAt(off int32) int32 {
 }
 
 func (lx *lexer) posOf(off int32) (origOff, line, col int32) {
-	if int(off) >= len(lx.origOf) {
+	if lx.origLine == nil {
+		if int(off) >= len(lx.src) {
+			off = int32(len(lx.src)) - 1
+			if off < 0 {
+				return 0, 1, 1
+			}
+		}
+	} else if int(off) >= len(lx.origOf) {
 		off = int32(len(lx.origOf)) - 1
 		if off < 0 {
 			return 0, 1, 1
 		}
 	}
 
-	lo, hi := 0, len(lx.lineStar)
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if lx.lineStar[mid] <= off {
-			lo = mid + 1
-		} else {
-			hi = mid
+	lineIdx := int(lx.posLine)
+	if lineIdx >= len(lx.lineStar) || lx.lineStar[lineIdx] > off {
+		lo, hi := 0, len(lx.lineStar)
+		for lo < hi {
+			mid := (lo + hi) / 2
+			if lx.lineStar[mid] <= off {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		lineIdx = lo - 1
+		if lineIdx < 0 {
+			lineIdx = 0
+		}
+	} else {
+		for lineIdx+1 < len(lx.lineStar) && lx.lineStar[lineIdx+1] <= off {
+			lineIdx++
 		}
 	}
-	lineIdx := lo - 1
-	if lineIdx < 0 {
-		lineIdx = 0
+	lx.posLine = int32(lineIdx)
+	if lx.origLine == nil {
+		return off, int32(lineIdx + 1), off - lx.lineStar[lineIdx] + 1
 	}
 	return lx.origOf[off], lx.origLine[off], off - lx.lineStar[lineIdx] + 1
 }
@@ -17792,6 +17854,23 @@ func (pp *preprocessor) errf(line int32, msg string) {
 var ppSrcMu sync.RWMutex
 var ppSrcCache = map[string][]byte{}
 
+const tokBufMax = 131072
+
+var tokBufPool = sync.Pool{}
+
+func getTokBuf() []Tok {
+	if v := tokBufPool.Get(); v != nil {
+		return v.([]Tok)[:0]
+	}
+	return nil
+}
+
+func putTokBuf(b []Tok) {
+	if c := cap(b); c >= 1024 && c <= tokBufMax {
+		tokBufPool.Put(b[:0])
+	}
+}
+
 func ppCachedRead(abs string) ([]byte, bool) {
 	ppSrcMu.RLock()
 	data, ok := ppSrcCache[abs]
@@ -17820,6 +17899,7 @@ func (pp *preprocessor) loadFile(abs string) (*fileTokSrc, bool) {
 	pp.genFileID++
 	id := pp.genFileID
 	src := &fileTokSrc{path: abs, id: id, raw: data}
+	src.toks = make([]Tok, 0, len(data)/7+16)
 	for {
 		t := lex.next()
 		src.toks = append(src.toks, t)
@@ -17848,6 +17928,7 @@ func (pp *preprocessor) relFileName(abs string) string {
 }
 
 func (pp *preprocessor) run(abs string) []Tok {
+	pp.out = getTokBuf()
 	pp.fileName = pp.relFileName(abs)
 	if src, ok := pp.loadFile(abs); ok {
 		pp.process(src, 1)
@@ -17907,7 +17988,11 @@ func (pp *preprocessor) process(src *fileTokSrc, depth int) {
 		if !pp.condActive() {
 			continue
 		}
-		pp.out = append(pp.out, pp.expand(line)...)
+		if pp.lineMayExpand(line) {
+			pp.out = append(pp.out, pp.expand(line)...)
+		} else {
+			pp.out = append(pp.out, line...)
+		}
 	}
 }
 
@@ -18191,10 +18276,47 @@ func dequote(s string) string {
 	return strings.Trim(s, `"`)
 }
 
+type incCacheKey struct {
+	root string
+	dir  string
+	tgt  string
+	sys  bool
+}
+
+var (
+	incCacheMu sync.RWMutex
+	incCache   = map[incCacheKey]string{}
+
+	statSeen sync.Map
+)
+
+func statIsFile(p string) bool {
+	if v, ok := statSeen.Load(p); ok {
+		return v.(bool)
+	}
+	fi, err := os.Stat(p)
+	r := err == nil && !fi.IsDir()
+	statSeen.Store(p, r)
+	return r
+}
+
 func (pp *preprocessor) resolveInclude(src *fileTokSrc, tgt string, sys bool) string {
+	key := incCacheKey{root: pp.root, tgt: tgt, sys: sys}
+	if !sys {
+		key.dir = filepath.Dir(src.path)
+	}
+	cacheable := len(pp.incDirs) == 0
+	if cacheable {
+		incCacheMu.RLock()
+		hit, ok := incCache[key]
+		incCacheMu.RUnlock()
+		if ok {
+			return hit
+		}
+	}
 	cands := make([]string, 0, 4+len(pp.incDirs))
 	if !sys {
-		cands = append(cands, filepath.Join(filepath.Dir(src.path), tgt))
+		cands = append(cands, filepath.Join(key.dir, tgt))
 	}
 	for _, d := range pp.incDirs {
 		cands = append(cands, filepath.Join(d, tgt))
@@ -18202,15 +18324,23 @@ func (pp *preprocessor) resolveInclude(src *fileTokSrc, tgt string, sys bool) st
 	if pp.root != "" {
 		cands = append(cands, filepath.Join(pp.root, tgt))
 	}
+	res := ""
 	for _, c := range cands {
-		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
+		if statIsFile(c) {
 			if rp, err2 := filepath.Abs(c); err2 == nil {
-				return rp
+				res = rp
+			} else {
+				res = c
 			}
-			return c
+			break
 		}
 	}
-	return ""
+	if cacheable {
+		incCacheMu.Lock()
+		incCache[key] = res
+		incCacheMu.Unlock()
+	}
+	return res
 }
 
 func (pp *preprocessor) doLine(src *fileTokSrc, rest []Tok, dirLine int32) {
@@ -18271,12 +18401,28 @@ func addHide(h *hideSet, name string) *hideSet {
 	return nh
 }
 
-func (pp *preprocessor) expand(in []Tok) []Tok {
-	ets := make([]expTok, len(in))
-	for i, t := range in {
-		ets[i] = expTok{t, nil}
+func (pp *preprocessor) lineMayExpand(in []Tok) bool {
+	for i := range in {
+		if in[i].Kind != TIdent {
+			continue
+		}
+		tx := in[i].Text
+		if tx == "__LINE__" || tx == "__FILE__" {
+			return true
+		}
+		if _, ok := pp.macros[tx]; ok {
+			return true
+		}
 	}
-	return pp.expandETS(ets)
+	return false
+}
+
+func (pp *preprocessor) expand(in []Tok) []Tok {
+	work := make([]expTok, len(in))
+	for i := range in {
+		work[len(in)-1-i] = expTok{in[i], nil}
+	}
+	return pp.expandWork(work)
 }
 
 func (pp *preprocessor) expandETS(ets []expTok) []Tok {
@@ -18284,7 +18430,11 @@ func (pp *preprocessor) expandETS(ets []expTok) []Tok {
 	for i := len(ets) - 1; i >= 0; i-- {
 		work = append(work, ets[i])
 	}
-	out := make([]Tok, 0, len(ets)+32)
+	return pp.expandWork(work)
+}
+
+func (pp *preprocessor) expandWork(work []expTok) []Tok {
+	out := make([]Tok, 0, cap(work))
 	for len(work) > 0 {
 		et := work[len(work)-1]
 		work = work[:len(work)-1]
@@ -23889,6 +24039,7 @@ func (cr *c23run) parseTU(pos int32, fid int32) (tu *c23tu) {
 	}
 	p := newParser(tu.fa, toks, srcs, 0, &tu.perrs)
 	p.parseTU()
+	putTokBuf(toks)
 	tu.pp.out = nil
 	for _, fsrc := range tu.pp.fileByID {
 		fsrc.toks = nil

@@ -592,8 +592,10 @@ func (x *extractor) walkScope(t *Tree, root int32, sc scope) {
 	}
 
 	stack := make([]item, 0, 64)
+
+	rev := make([]int32, 0, 64)
 	pushAll := func(n int32, sc scope) {
-		var rev []int32
+		rev = rev[:0]
 		for c := t.nodes[n].first; c != noNode; c = t.nodes[c].next {
 			rev = append(rev, c)
 		}
@@ -607,8 +609,7 @@ func (x *extractor) walkScope(t *Tree, root int32, sc scope) {
 		stack = stack[:len(stack)-1]
 		cur, s := it.n, it.sc
 		if kind, ok := funcKinds[t.nodes[cur].kind]; ok {
-			sid := x.emitFunction(t, cur, s, kind)
-			nm := x.nodeName(t, cur)
+			sid, nm := x.emitFunction(t, cur, s, kind)
 			if nm == "" {
 				nm = "?"
 			}
@@ -621,8 +622,7 @@ func (x *extractor) walkScope(t *Tree, root int32, sc scope) {
 			continue
 		}
 		if kind, ok := typeKinds[t.nodes[cur].kind]; ok {
-			sid := x.emitType(t, cur, s, kind)
-			nm := x.nodeName(t, cur)
+			sid, nm := x.emitType(t, cur, s, kind)
 			if nm == "" {
 				nm = "?"
 			}
@@ -642,8 +642,9 @@ func isFuncOrType(k NodeKind) bool {
 	return ok
 }
 
-func (x *extractor) emitFunction(t *Tree, n int32, sc scope, kind string) int32 {
-	nm := x.nodeName(t, n)
+func (x *extractor) emitFunction(t *Tree, n int32, sc scope, kind string) (int32, string) {
+	rawName := x.nodeName(t, n)
+	nm := rawName
 	if nm == "" {
 		nm = "(anonymous)"
 	}
@@ -670,11 +671,11 @@ func (x *extractor) emitFunction(t *Tree, n int32, sc scope, kind string) int32 
 	m.BodyBytes = t.nodes[body].end - t.nodes[body].start
 	m.IsGenerated = boolInt(x.file.IsGen)
 	x.countParams(t, n, m)
-	x.functionFlags(t, n, m)
 	doc := x.docstringLines(t, n)
 	m.NDocLines = doc
 	m.HasDoc = boolInt(doc > 0)
 	sig := x.signatureOf(t, n)
+	x.functionFlags(t, n, m, nm, sig)
 
 	vis := "private"
 	if nm != "" && unicode.IsUpper(firstRune(nm)) {
@@ -697,11 +698,12 @@ func (x *extractor) emitFunction(t *Tree, n int32, sc scope, kind string) int32 
 	}
 	x.emitHazards(t, st, sid)
 	x.emitSatellites(t, st, sid)
-	return sid
+	return sid, rawName
 }
 
-func (x *extractor) emitType(t *Tree, n int32, sc scope, kind string) int32 {
-	nm := x.nodeName(t, n)
+func (x *extractor) emitType(t *Tree, n int32, sc scope, kind string) (int32, string) {
+	rawName := x.nodeName(t, n)
+	nm := rawName
 	if nm == "" {
 		nm = "(anonymous)"
 	}
@@ -742,7 +744,7 @@ func (x *extractor) emitType(t *Tree, n int32, sc scope, kind string) int32 {
 	}
 	x.emitHazards(t, st, sid)
 	x.typeSatellites(t, n, sid)
-	return sid
+	return sid, rawName
 }
 
 func boolInt(b bool) int32 {
@@ -880,9 +882,19 @@ func (x *extractor) emitParams(t *Tree, n int32, sid int32) {
 	}
 }
 
-func (x *extractor) functionFlags(t *Tree, n int32, m *metric) {
-	nm := x.nodeName(t, n)
-	sig := x.signatureOf(t, n)
+// isHandlerSig is the exact predicate of the former reHandlerSig regexp:
+// alternation of seven plain literals with no anchors, i.e. "contains any".
+func isHandlerSig(sig string) bool {
+	return strings.Contains(sig, "http.ResponseWriter") ||
+		strings.Contains(sig, "*http.Request") ||
+		strings.Contains(sig, "gin.Context") ||
+		strings.Contains(sig, "echo.Context") ||
+		strings.Contains(sig, "fiber.Ctx") ||
+		strings.Contains(sig, "events.APIGatewayProxyRequest") ||
+		strings.Contains(sig, "grpc.ServerStream")
+}
+
+func (x *extractor) functionFlags(t *Tree, n int32, m *metric, nm, sig string) {
 	recv := t.child(n, fReceiver)
 	recvType, recvPtr := "", int32(0)
 	if recv != noNode {
@@ -907,7 +919,7 @@ func (x *extractor) functionFlags(t *Tree, n int32, m *metric) {
 		strings.HasPrefix(nm, "Fuzz") || strings.HasPrefix(nm, "Example"))
 	m.IsEntrypoint = boolInt(nm == "main" || nm == "init")
 	m.IsInit = boolInt(nm == "init")
-	m.IsHandler = boolInt(reHandlerSig.MatchString(sig))
+	m.IsHandler = boolInt(isHandlerSig(sig))
 	m.ReceiverIsPointer = recvPtr
 	m.NCtxParams = int32(strings.Count(ptxt, "context.Context"))
 	if strings.Contains(ptxt, "any") || strings.Contains(ptxt, "interface") {
@@ -927,16 +939,13 @@ func (x *extractor) functionFlags(t *Tree, n int32, m *metric) {
 func (x *extractor) slocOf(t *Tree, n int32) int32 {
 	nd := t.nodes[n]
 	var c int32
-	for i, ln := range t.lines {
-		if i < int(nd.line) {
-			continue
-		}
-		if i > int(nd.endLn) {
-			break
-		}
-		lo := ln
-
-		if i == int(nd.line) && nd.start > lo {
+	first, last := int(nd.line), int(nd.endLn)
+	if last >= len(t.lines) {
+		last = len(t.lines) - 1
+	}
+	for i := first; i <= last; i++ {
+		lo := t.lines[i]
+		if i == first && nd.start > lo {
 			lo = nd.start
 		}
 		var hi int32
@@ -945,11 +954,11 @@ func (x *extractor) slocOf(t *Tree, n int32) int32 {
 		} else {
 			hi = int32(len(t.src))
 		}
-		if i == int(nd.endLn) && nd.end < hi && nd.end > lo {
+		if i == last && nd.end < hi && nd.end > lo {
 			hi = nd.end
 		}
-		s := strings.TrimSpace(string(t.src[lo:hi]))
-		if s == "" || isCommentPrefix(s) {
+		s := bytes.TrimSpace(t.src[lo:hi])
+		if len(s) == 0 || isCommentPrefix(s) {
 			continue
 		}
 		c++
@@ -959,9 +968,19 @@ func (x *extractor) slocOf(t *Tree, n int32) int32 {
 
 var commentPrefixes = []string{"//", "#", "/*", "*", "*/", `"""`, "'''", "--", "%"}
 
-func isCommentPrefix(s string) bool {
+func isCommentPrefix(s []byte) bool {
 	for _, p := range commentPrefixes {
-		if strings.HasPrefix(s, p) {
+		if len(s) < len(p) {
+			continue
+		}
+		ok := true
+		for i := 0; i < len(p); i++ {
+			if s[i] != p[i] {
+				ok = false
+				break
+			}
+		}
+		if ok {
 			return true
 		}
 	}
@@ -1492,6 +1511,8 @@ type pendingCall struct {
 	name    uint32
 	line    int32
 	dynamic bool
+
+	raw string
 }
 
 type pendingLit struct {
@@ -1743,7 +1764,6 @@ var (
 	reReturnNilErr   = regexp.MustCompile(`\breturn\s+nil,\s*err\b`)
 	reCommaErrAssign = regexp.MustCompile(`\b\w+\s*,\s*err\s*:=`)
 	reBlankAssign    = regexp.MustCompile(`^\s*_\s*(?:,\s*_\s*)*[:=]`)
-	reVarDecl        = regexp.MustCompile(`^\s*(\w+)\s*:=\s*`)
 	reRangeCopy      = regexp.MustCompile(`^\s*\w+\s*,\s*\w+\s*:?=\s*range\b`)
 	reSQL            = regexp.MustCompile(`(?i)\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TABLE|DROP\s+TABLE|ALTER\s+TABLE)\b`)
 
@@ -1751,7 +1771,6 @@ var (
 	reAnyParam     = regexp.MustCompile(`\b(?:any|interface\s*\{\s*\})\b`)
 	reIfaceReturn  = regexp.MustCompile(`\b(?:any|interface\s*\{\s*\}|error)\b`)
 	reNamedResults = regexp.MustCompile(`\(\s*\w+\s+\w`)
-	reHandlerSig   = regexp.MustCompile(`http\.ResponseWriter|\*http\.Request|gin\.Context|echo\.Context|fiber\.Ctx|events\.APIGatewayProxyRequest|grpc\.ServerStream`)
 	reGoBuild      = regexp.MustCompile(`(?m)^//go:build\s+(.+)$`)
 	reGenerated    = regexp.MustCompile(`(?m)^// Code generated .* DO NOT EDIT\.$`)
 	reWgOp         = regexp.MustCompile(`([A-Za-z_]\w*)\.(Add|Done|Wait)\(`)
@@ -2211,8 +2230,9 @@ func (x *extractor) onCall(t *Tree, n int32, st *bodyStats, loopDepth, nest int3
 		st.bumpName("n_pathjoin_in_loop")
 	}
 	dynamic := name == "" || !(isAlpha(name[0]) || name[0] == '_' || name[0] == '$')
+	raw := trunc(name, 200)
 	st.calls = append(st.calls, pendingCall{
-		name: x.g.intern(trunc(name, 200)), line: line1, dynamic: dynamic})
+		name: x.g.intern(raw), line: line1, dynamic: dynamic, raw: raw})
 	if dynamic {
 		st.bumpName("n_dynamic_calls")
 	}
@@ -2228,18 +2248,52 @@ func (x *extractor) onCall(t *Tree, n int32, st *bodyStats, loopDepth, nest int3
 	}
 }
 
+// matchVarDeclPrefix is the hand-rolled equivalent of the former
+// reVarDecl regexp `^\s*(\w+)\s*:=\s*`: it returns the captured name and
+// the offset one past the (greedy) trailing whitespace of the match.
+// Go regexp \s is exactly [\t\n\f\r ], and \w is [0-9A-Za-z_].
+func matchVarDeclPrefix(txt string) (string, int, bool) {
+	i := 0
+	for i < len(txt) && isRegexSpaceByte(txt[i]) {
+		i++
+	}
+	j := i
+	for j < len(txt) && isWordByte(txt[j]) {
+		j++
+	}
+	if j == i {
+		return "", 0, false
+	}
+	k := j
+	for k < len(txt) && isRegexSpaceByte(txt[k]) {
+		k++
+	}
+	if k+2 > len(txt) || txt[k] != ':' || txt[k+1] != '=' {
+		return "", 0, false
+	}
+	k += 2
+	for k < len(txt) && isRegexSpaceByte(txt[k]) {
+		k++
+	}
+	return txt[i:j], k, true
+}
+
+func isRegexSpaceByte(c byte) bool {
+	return c == '\t' || c == '\n' || c == '\f' || c == '\r' || c == ' '
+}
+
 func isLoopvarRebind(txt string) bool {
-	m := reVarDecl.FindStringSubmatch(txt)
-	if m == nil {
+	name, end, ok := matchVarDeclPrefix(txt)
+	if !ok {
 		return false
 	}
-	rest := strings.TrimLeft(txt[len(m[0]):], " \t")
-	if !strings.HasPrefix(rest, m[1]) {
+	rest := strings.TrimLeft(txt[end:], " \t")
+	if !strings.HasPrefix(rest, name) {
 		return false
 	}
 
-	if len(rest) > len(m[1]) {
-		switch c := rest[len(m[1])]; {
+	if len(rest) > len(name) {
+		switch c := rest[len(name)]; {
 		case c == '_', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
 			return false
 		}
@@ -2576,33 +2630,19 @@ func (x *extractor) emitHazards(t *Tree, st *bodyStats, sid int32) {
 		if c.name == nullStr {
 			continue
 		}
-		nm := x.g.Str.get(c.name)
-		pattern, cat, ok := x.hazardOf(nm)
+		pattern, cat, ok := x.hazardOf(c.raw)
 		if !ok {
 			continue
 		}
-		if _, dup := seen[pattern]; dup {
-			x.bumpLastHazard(pattern, sid)
+		if row, dup := seen[pattern]; dup {
+			x.g.Hazards[row].N++
 			continue
 		}
-		seen[pattern] = 1
+		seen[pattern] = int32(len(x.g.Hazards))
 		x.g.Hazards = append(x.g.Hazards, Hazard{
 			SymbolID: sid, Pattern: x.g.intern(trunc(pattern, 120)),
 			Category: x.g.intern(cat), N: 1, Line: c.line,
 		})
-	}
-}
-
-func (x *extractor) bumpLastHazard(pattern string, sid int32) {
-	for i := len(x.g.Hazards) - 1; i >= 0; i-- {
-		h := x.g.Hazards[i]
-		if h.SymbolID != sid {
-			return
-		}
-		if x.g.Str.get(h.Pattern) == pattern {
-			x.g.Hazards[i].N++
-			return
-		}
 	}
 }
 
@@ -4929,18 +4969,24 @@ func resolveImportTargets(g *Graph) {
 		".js", ".jsx", ".mjs", ".cjs", ".rb", ".php", ".go", ".rs", ".java"}
 	indexes := []string{"__init__.py", "index.ts", "index.tsx", "index.js",
 		"index.mjs", "mod.rs", "lib.rs"}
+	keyBuf := make([]byte, 0, 256)
 	look := func(cand string) int32 {
 		cand = strings.Trim(cand, "/")
 		if cand == "" {
 			return -1
 		}
+		keyBuf = append(keyBuf[:0], cand...)
+		n := len(keyBuf)
 		for _, sfx := range suffixes {
-			if h, ok := byPath[cand+sfx]; ok {
+			k := append(keyBuf[:n], sfx...)
+			if h, ok := byPath[string(k)]; ok {
 				return h
 			}
 		}
 		for _, idx := range indexes {
-			if h, ok := byPath[cand+"/"+idx]; ok {
+			k := append(keyBuf[:n], '/')
+			k = append(k, idx...)
+			if h, ok := byPath[string(k)]; ok {
 				return h
 			}
 		}
@@ -4994,15 +5040,16 @@ var _ = ast.Print
 func nowStamp() string { return time.Now().Format("2006-01-02T15:04:05") }
 
 type builder struct {
-	t    *Tree
-	file *token.File
-	ti   int
+	t       *Tree
+	file    *token.File
+	ti      int
+	lineCur int32
 }
 
 func buildTree(file *token.File, src []byte, f *ast.File) *Tree {
 	t := &Tree{src: src}
 	t.lines = lineStarts(src)
-	t.toks = scanTokens(src)
+	t.toks = scanTokens(src, t.lines)
 	capN := len(t.toks)*2 + 64
 	t.nodes = make([]Node, 0, capN)
 	t.tail = make([]int32, 0, capN)
@@ -5033,8 +5080,7 @@ func buildTree(file *token.File, src []byte, f *ast.File) *Tree {
 	return t
 }
 
-func scanTokens(src []byte) []Token {
-	lines := lineStarts(src)
+func scanTokens(src []byte, lines []int32) []Token {
 	curLine := int32(0)
 	lineOf := func(off int32) int32 {
 		for curLine > 0 && lines[curLine] > off {
@@ -5115,9 +5161,35 @@ func (b *builder) node(k NodeKind, start, end int32, f Slot) int32 {
 	t.nodes = append(t.nodes, Node{kind: k, field: f, parent: noNode,
 		first: noNode, next: noNode, start: start, end: end})
 	t.tail = append(t.tail, noNode)
-	t.nodes[id].line = t.lineOf(start)
+	t.nodes[id].line = b.lineOfStart(start)
 	t.nodes[id].endLn = t.lineOf(end)
 	return id
+}
+
+// lineOfStart is Tree.lineOf with a monotone high-water cursor: node starts
+// are created in near-source order, so most lookups advance the cursor by one
+// instead of binary-searching. A backwards start falls back to the search and
+// leaves the cursor where it was.
+func (b *builder) lineOfStart(off int32) int32 {
+	lines := b.t.lines
+	c := int(b.lineCur)
+	if c < len(lines) && lines[c] <= off {
+		for c+1 < len(lines) && lines[c+1] <= off {
+			c++
+		}
+		b.lineCur = int32(c)
+		return int32(c)
+	}
+	lo, hi := 0, len(lines)-1
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if lines[mid] <= off {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return int32(lo)
 }
 
 func (b *builder) add(parent, child int32) {

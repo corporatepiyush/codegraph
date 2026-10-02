@@ -432,12 +432,15 @@ func (p *tsParser) readCST(src, buf []byte) ([]byte, bool) {
 		v = v[n:]
 	}
 	inW.Close()
-	est := len(src) * 24
-	if est < 1<<20 {
-		est = 1 << 20
+	// The CST listing runs 20-40x the source bytes (one line per node, with
+	// indentation), so size the scratch buffer from the input. The doubling
+	// below still covers an underestimate, and the pool bounds retention.
+	est := len(src) * 40
+	if est < 1<<16 {
+		est = 1 << 16
 	}
-	if est > 1<<20 {
-		est = 1 << 20
+	if est > 4<<20 {
+		est = 4 << 20
 	}
 	if cap(buf) < est {
 		buf = make([]byte, 0, est)
@@ -1272,6 +1275,7 @@ type cstItem struct {
 	rec srcFile
 	buf []byte
 	ok  bool
+	res *fileResult
 }
 
 func build(root string, g *Graph) (int, error) {
@@ -1304,60 +1308,123 @@ func build(root string, g *Graph) (int, error) {
 	step := max(n/20, 1)
 	tParse := time.Now()
 	if n > 0 {
-		reader := newFileParser()
-		decoder := newFileParser()
-		defer func() {
-			reader.close()
-			decoder.close()
-		}()
-		freeBufs := make(chan []byte, pipeDepth+2)
-		cstCh := make(chan cstItem, pipeDepth)
+		// Parse and decode files with a pool of workers: each owns its own
+		// tree-sitter parser and decode slabs, so everything up to and
+		// including fileResult is private state. The consumer merges results
+		// strictly in file order, so symbol ids and every dump row are
+		// unchanged by the worker count.
+		workers := opts.workers
+		if workers < 1 {
+			workers = 1
+		}
+		if workers > n {
+			workers = n
+		}
+		if workers > 64 {
+			workers = 64
+		}
+		freeBufs := make(chan []byte, workers+2)
+		freeRes := make(chan *fileResult, workers+2)
+		cstCh := make(chan cstItem, workers+2)
+		jobs := make(chan int, workers)
 		go func() {
-			defer close(cstCh)
 			for i := range n {
-				sf := dis.files[i]
-				var buf []byte
-				select {
-				case buf = <-freeBufs:
-				default:
-				}
-				buf, ok := reader.p.readCST(sf.data, buf)
-				cstCh <- cstItem{idx: i, rec: sf, buf: buf, ok: ok}
+				jobs <- i
 			}
+			close(jobs)
 		}()
-		r := new(fileResult)
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				rp := newFileParser()
+				defer rp.close()
+				for i := range jobs {
+					sf := dis.files[i]
+					var buf []byte
+					select {
+					case buf = <-freeBufs:
+					default:
+					}
+					buf, ok := rp.p.readCST(sf.data, buf)
+					it := cstItem{idx: i, rec: sf, buf: buf, ok: ok}
+					if ok {
+						var res *fileResult
+						select {
+						case res = <-freeRes:
+						default:
+							res = new(fileResult)
+						}
+						res.reset(i, sf.rel)
+						scanMarkers(sf, res)
+						rp.decodeFile(sf, res, buf)
+						it.res = res
+					}
+					cstCh <- it
+				}
+			}()
+		}
+		go func() {
+			wg.Wait()
+			close(cstCh)
+		}()
 		done := 0
-		for it := range cstCh {
+		pending := map[int]cstItem{}
+		process := func(it cstItem) {
 			done++
 			if !opts.quiet && done%step == 0 {
 				printfln("  ... %d/%d files", done, n)
 			}
-			r.reset(it.idx, it.rec.rel)
-			scanMarkers(it.rec, r)
 			fr := &g.Files[it.rec.id-1]
 			if !it.ok {
-				r.err = true
 				nFailed++
 				fr.Parsed = 0
 				fr.NParseErrors++
 			} else {
-				decoder.decodeFile(it.rec, r, it.buf)
-				fr.NParseErrors = r.nErr
-				fr.NMissingNodes = r.nMissing
-				mergeResult(g, r)
+				res := it.res
+				fr.NParseErrors = res.nErr
+				fr.NMissingNodes = res.nMissing
+				mergeResult(g, res)
 				parsed++
-			}
-			if trees != nil {
-				trees[it.rec.id-1] = r.recs
-				r.recs = nil
+				if trees != nil {
+					trees[it.rec.id-1] = res.recs
+					res.recs = nil
+				}
+				if cap(res.ar) > 1<<20 {
+					res.ar = nil
+				}
+				select {
+				case freeRes <- res:
+				default:
+				}
 			}
 			dis.files[it.idx].data = nil
 			if cap(it.buf) > 2<<20 {
 				it.buf = make([]byte, 0, 1<<20)
 			}
-			freeBufs <- it.buf
+			select {
+			case freeBufs <- it.buf:
+			default:
+			}
+		}
+		for it := range cstCh {
+			if it.idx != done {
+				pending[it.idx] = it
+				continue
+			}
+			process(it)
+			for {
+				nx, ok := pending[done]
+				if !ok {
+					break
+				}
+				delete(pending, done)
+				process(nx)
+			}
 		}
 		close(freeBufs)
+		close(freeRes)
 	}
 	if nFailed > 0 && (nFailed > parsed/100 || !opts.quiet) {
 		eprintln("  WARNING: " + itoa(nFailed) + " of " + itoa(len(dis.files)) +
@@ -6984,10 +7051,7 @@ func (fp *fileParser) walkNodes(root tsNode, fn func(tsNode) bool) {
 }
 func (fp *fileParser) walkScope(root tsNode, rec srcFile, res *fileResult) {
 	stack := make([]scopeItem, 0, 32)
-	kids := fp.namedKids(root)
-	for _, kid := range slices.Backward(kids) {
-		stack = append(stack, scopeItem{kid, scope{}})
-	}
+	stack = pushNamedKids(stack, root, scope{})
 	for len(stack) > 0 {
 		it := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -7021,22 +7085,26 @@ func (fp *fileParser) walkScope(root tsNode, rec srcFile, res *fileResult) {
 			stack = fp.pushBody(stack, cur, inner)
 			continue
 		}
-		kids := fp.namedKids(cur)
-		for _, kid := range slices.Backward(kids) {
-			stack = append(stack, scopeItem{kid, sc})
-		}
+		stack = pushNamedKids(stack, cur, sc)
 	}
 }
+
+// pushNamedKids pushes the named children of n in reverse so the stack pops
+// them in document order (the order the old slices.Backward(namedKids) loop
+// produced), without allocating a child slice per visited node.
+func pushNamedKids(stack []scopeItem, n tsNode, sc scope) []scopeItem {
+	for i := int(nNamedChildCount(n)) - 1; i >= 0; i-- {
+		stack = append(stack, scopeItem{nNamedChildAt(n, uint32(i)), sc})
+	}
+	return stack
+}
+
 func (fp *fileParser) pushBody(stack []scopeItem, cur tsNode, inner scope) []scopeItem {
 	body := nField(cur, F.body)
 	if !nValid(body) {
 		body = cur
 	}
-	kids := fp.namedKids(body)
-	for _, kid := range slices.Backward(kids) {
-		stack = append(stack, scopeItem{kid, inner})
-	}
-	return stack
+	return pushNamedKids(stack, body, inner)
 }
 func (fp *fileParser) emitFunction(n tsNode, rec srcFile, res *fileResult,
 	sc scope, kind string) int32 {
@@ -9672,14 +9740,6 @@ func (fp *fileParser) internStr(s string) string {
 	}
 	fp.internMap[s] = s
 	return s
-}
-func (fp *fileParser) namedKids(n tsNode) []tsNode {
-	c := nNamedChildCount(n)
-	out := make([]tsNode, 0, c)
-	for i := uint32(0); i < uint32(c); i++ {
-		out = append(out, nNamedChildAt(n, i))
-	}
-	return out
 }
 func cgSplitLines(s string, fn func(line string)) {
 	if s == "" {

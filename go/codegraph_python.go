@@ -18,12 +18,14 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
@@ -570,6 +572,10 @@ func (p *tsParser) parse(src []byte) *tsTree {
 	if derr != nil {
 		panic(fmt.Sprintf("cli cst decode failed: %v", derr))
 	}
+	// Leave the scratch buffer empty. decodeCST has copied everything it
+	// needs; a non-empty p.outBuf here would be scanned as already-buffered
+	// CLI output by the next batch reader and silently mis-attribute blocks.
+	p.outBuf = p.outBuf[:0]
 	return t
 }
 
@@ -1813,7 +1819,7 @@ func splitLines(s string) []string {
 	if s == "" {
 		return nil
 	}
-	out := make([]string, 0, 64)
+	out := make([]string, 0, strings.Count(s, "\n")+1)
 	start := 0
 	for i := 0; i < len(s); {
 		r, size := utf8.DecodeRuneInString(s[i:])
@@ -2047,11 +2053,12 @@ var parserPool = sync.Pool{New: func() any { return tsParserNew() }}
 func getParser() *tsParser  { return parserPool.Get().(*tsParser) }
 func putParser(p *tsParser) { parserPool.Put(p) }
 
-func parseSource(rec *sourceFile) (*tsTree, tsNode, []string, error) {
+// parseSourceP is the per-file stdin invocation, for one batch file at a time.
+// The caller owns p, so a parallel worker reuses its own parser instead of
+// churning through the pool.
+func parseSourceP(p *tsParser, rec *sourceFile) (*tsTree, tsNode, []string, error) {
 	lines := splitLines(rec.text)
-	p := getParser()
 	t := p.parse(rec.data)
-	putParser(p)
 	if t == nil {
 		return nil, tsNode{}, lines, &parseErr{msg: "parse failed"}
 	}
@@ -2066,6 +2073,137 @@ func parseSource(rec *sourceFile) (*tsTree, tsNode, []string, error) {
 
 const batchSourceBytes = 4 << 20
 const batchMaxFiles = 512
+
+// CG_PIPELINE=1 prints a wall/reader/decoder/extract split so the reader side
+// of the parse pipeline can be told apart from the graph-building side.
+var cgPipeline = os.Getenv("CG_PIPELINE") != ""
+
+var (
+	pipeReadWait atomic.Int64
+	pipeStage    atomic.Int64
+	pipeDecode   atomic.Int64
+	pipeExtract  atomic.Int64
+)
+
+// parseBatchDecode parses one contiguous batch with the caller's own parser
+// and temp directory and returns exactly one parseResult per file, in file
+// order, without touching the graph. A file whose CST block does not decode
+// (and every file after it in the batch) falls back to a per-file stdin
+// invocation, matching the serial reader's behaviour byte for byte.
+//
+// When sink is non-nil each result is handed over the moment it is decoded,
+// so the serial reader extracts inline and never holds a batch of trees;
+// otherwise the results are collected in file order for the reorder buffer.
+func parseBatchDecode(p *tsParser, tmp *tsTemp, batch []*sourceFile,
+	sink func(parseResult)) []parseResult {
+	var items []parseResult
+	emit := func(pr parseResult) {
+		if sink != nil {
+			sink(pr)
+			return
+		}
+		items = append(items, pr)
+	}
+	var st time.Time
+	if cgPipeline {
+		st = time.Now()
+	}
+	okStage := tmp.stage(batch)
+	if cgPipeline {
+		pipeStage.Add(int64(time.Since(st)))
+	}
+	if !okStage {
+		tmp.discard()
+		appendPerFile(emit, p, batch, 0)
+		return items
+	}
+	rd, done := p.startPaths(tmp.paths)
+	if rd == nil {
+		tmp.discard()
+		appendPerFile(emit, p, batch, 0)
+		return items
+	}
+	used := 0
+	scan := 0
+	readErr := false
+	stop := false
+	next := 0
+	// The scan below treats everything in p.outBuf as this batch's CLI output;
+	// any bytes left from a previous stdin invocation would be attributed to
+	// the first file and the endByte clamp would hide the mismatch.
+	p.outBuf = p.outBuf[:0]
+	for !readErr && !stop {
+		for scan < len(p.outBuf) {
+			nl := bytes.IndexByte(p.outBuf[scan:], '\n')
+			if nl < 0 {
+				break
+			}
+			if next < len(batch) && isCSTMarker(p.outBuf[scan:scan+nl], tmp.paths[next]) {
+				pr, ok := decodeBlock(p.outBuf[used:scan], batch[next])
+				if !ok {
+					stop = true
+					break
+				}
+				emit(pr)
+				batch[next].text, batch[next].data = "", nil
+				next++
+				used = scan + nl + 1
+			}
+			scan += nl + 1
+		}
+		if readErr || stop {
+			break
+		}
+		if used > 0 {
+			n := copy(p.outBuf, p.outBuf[used:scan])
+			p.outBuf = p.outBuf[:n]
+			scan -= used
+			used = 0
+		}
+		if cap(p.outBuf)-len(p.outBuf) < 1<<16 {
+			p.grow(len(p.outBuf) + (1 << 16))
+		}
+		var rs time.Time
+		if cgPipeline {
+			rs = time.Now()
+		}
+		k, err := rd.Read(p.outBuf[len(p.outBuf):cap(p.outBuf)])
+		if cgPipeline {
+			pipeReadWait.Add(int64(time.Since(rs)))
+		}
+		p.outBuf = p.outBuf[:len(p.outBuf)+k]
+		if err != nil {
+			readErr = true
+		}
+	}
+	done()
+	// Release the read buffer between batches. A worker farm multiplies any
+	// retained big buffer by the worker count, and a single huge file (a 41k
+	// line literal) grows it to tens of MB; the residency is not worth the
+	// one realloc it saves on a later batch.
+	if p.bigBuf != nil {
+		p.bigBuf = nil
+		p.outBuf = make([]byte, 0, cstBufRetain)
+	} else {
+		p.outBuf = p.outBuf[:0]
+	}
+	appendPerFile(emit, p, batch, next)
+	tmp.discard()
+	return items
+}
+
+// appendPerFile parses batch[from:] one file per CLI invocation and hands each
+// result to emit. Every file must reach emit exactly once: a dropped result
+// would drop every symbol in that file from the graph without a trace.
+func appendPerFile(emit func(parseResult), p *tsParser, batch []*sourceFile, from int) {
+	for i := from; i < len(batch); i++ {
+		rec := batch[i]
+		tree, root, lines, err := parseSourceP(p, rec)
+		emit(parseResult{rec: rec, tree: tree, root: root,
+			src: rec.data, lines: lines, err: err})
+		rec.text, rec.data = "", nil
+	}
+}
 
 func (g *Graph) parseSerial(recs []*sourceFile, quiet bool) (failed, syntax int) {
 	n := len(recs)
@@ -2088,24 +2226,15 @@ func (g *Graph) parseSerial(recs []*sourceFile, quiet bool) (failed, syntax int)
 			sum += sz
 			hi++
 		}
-		batch := recs[lo:hi]
-		next, bf, bs := g.parseBatch(tmp, p, batch)
-		failed += bf
-		syntax += bs
-		tmp.discard()
-		for i := next; i < len(batch); i++ {
-			rec := batch[i]
-			tree, root, lines, err := parseSource(rec)
-			if !g.extractParsed(parseResult{rec: rec, tree: tree, root: root,
-				src: rec.data, lines: lines, err: err}) {
-				if err != nil && isSyntaxErr(err) {
+		parseBatchDecode(p, tmp, recs[lo:hi], func(pr parseResult) {
+			if !g.extractTimed(pr) {
+				if pr.err != nil && isSyntaxErr(pr.err) {
 					syntax++
 				} else {
 					failed++
 				}
 			}
-			rec.text, rec.data = "", nil
-		}
+		})
 		if !quiet && hi%step == 0 {
 			printfLn("  ... %d/%d files", hi, n)
 		}
@@ -2114,220 +2243,207 @@ func (g *Graph) parseSerial(recs []*sourceFile, quiet bool) (failed, syntax int)
 	return failed, syntax
 }
 
-func (g *Graph) parseBatch(tmp *tsTemp, p *tsParser, recs []*sourceFile) (next, failed, syntax int) {
-	if !tmp.stage(recs) {
-		return 0, 0, 0
+// decodeBlock turns one CST block into a parse result without touching the
+// graph. Extraction happens later, in file order, on the consumer side; this
+// separation is what lets the batch readers run in parallel.
+func decodeBlock(blk []byte, rec *sourceFile) (parseResult, bool) {
+	if cgPipeline {
+		t0 := time.Now()
+		defer func() { pipeDecode.Add(int64(time.Since(t0))) }()
 	}
-	rd, done := p.startPaths(tmp.paths)
-	if rd == nil {
-		return 0, 0, 0
-	}
-	used := 0
-	scan := 0
-	readErr := false
-	stop := false
-	for !readErr && !stop {
-		for scan < len(p.outBuf) {
-			nl := bytes.IndexByte(p.outBuf[scan:], '\n')
-			if nl < 0 {
-				break
-			}
-			if next < len(recs) && isCSTMarker(p.outBuf[scan:scan+nl], tmp.paths[next]) {
-				kind, ok := g.takeBlock(p.outBuf[used:scan], recs[next])
-				if !ok {
-					stop = true
-					break
-				}
-				if kind == 1 {
-					syntax++
-				}
-				recs[next].text, recs[next].data = "", nil
-				next++
-				used = scan + nl + 1
-			}
-			scan += nl + 1
-		}
-		if readErr || stop {
-			break
-		}
-		if used > 0 {
-			n := copy(p.outBuf, p.outBuf[used:scan])
-			p.outBuf = p.outBuf[:n]
-			scan -= used
-			used = 0
-		}
-		if cap(p.outBuf)-len(p.outBuf) < 1<<16 {
-			p.grow(len(p.outBuf) + (1 << 16))
-		}
-		k, err := rd.Read(p.outBuf[len(p.outBuf):cap(p.outBuf)])
-		p.outBuf = p.outBuf[:len(p.outBuf)+k]
-		if err != nil {
-			readErr = true
-		}
-	}
-	done()
-	if p.bigBuf != nil {
-		p.bigBuf = nil
-		p.outBuf = make([]byte, 0, cstBufRetain)
-	} else {
-		p.outBuf = p.outBuf[:0]
-	}
-	return next, failed, syntax
-}
-
-func (g *Graph) takeBlock(blk []byte, rec *sourceFile) (int, bool) {
 	t, derr := decodeCST(blk, rec.data)
 	if derr != nil {
-		return 0, false
+		return parseResult{}, false
 	}
 	if endByte(t.root()) != uint(len(rec.data)) {
 		t.free()
-		return 0, false
+		return parseResult{}, false
 	}
+	lines := splitLines(rec.text)
 	if hasErr(t.root()) {
 		t.free()
-		if g.extractParsed(parseResult{rec: rec, err: &parseErr{msg: "tree-sitter error node"},
-			lines: splitLines(rec.text)}) {
-			return 0, true
-		}
-		return 1, true
+		return parseResult{rec: rec, lines: lines,
+			err: &parseErr{msg: "tree-sitter error node"}}, true
 	}
-	if g.extractParsed(parseResult{rec: rec, tree: t, root: t.root(),
-		src: rec.data, lines: splitLines(rec.text)}) {
-		return 0, true
+	return parseResult{rec: rec, tree: t, root: t.root(),
+		src: rec.data, lines: lines}, true
+}
+
+// extractTimed is the single extraction entry point for both consumers.
+func (g *Graph) extractTimed(pr parseResult) bool {
+	if cgPipeline {
+		t0 := time.Now()
+		defer func() { pipeExtract.Add(int64(time.Since(t0))) }()
 	}
-	return 1, true
+	return g.extractParsed(pr)
+}
+
+// maxParseWorkers is the project-wide fan-out ceiling; more children than this
+// stop paying for themselves on a typical 4-10 core laptop.
+const maxParseWorkers = 8
+
+func defaultParseWorkers() int {
+	n := runtime.GOMAXPROCS(0)
+	if n > maxParseWorkers {
+		n = maxParseWorkers
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 func (g *Graph) parseAndExtract(recs []*sourceFile, workers int, quiet bool) (failed, syntax int) {
-	n := len(recs)
 	if workers < 1 {
 		workers = 1
 	}
-	if workers > n {
-		workers = n
+	if workers == 1 || len(recs) == 0 {
+		return g.parseSerial(recs, quiet)
 	}
+	if workers > len(recs) {
+		workers = len(recs)
+	}
+	return g.parseParallel(recs, workers, quiet)
+}
 
+// Parallel batch sizes. Smaller than the serial reader's 4 MB/512 because more
+// batches are what let the workers balance; the child startup (~10 ms) is
+// amortised over hundreds of KB of source.
+const (
+	parBatchSourceBytes = 256 << 10
+	parBatchMaxFiles    = 64
+)
+
+type parseBatchSpan struct{ lo, hi int }
+
+func planParseBatches(recs []*sourceFile) []parseBatchSpan {
+	var out []parseBatchSpan
+	for lo := 0; lo < len(recs); {
+		hi := lo
+		sum := 0
+		for hi < len(recs) && hi-lo < parBatchMaxFiles {
+			sz := len(recs[hi].data)
+			if hi > lo && sum+sz > parBatchSourceBytes {
+				break
+			}
+			sum += sz
+			hi++
+		}
+		out = append(out, parseBatchSpan{lo, hi})
+		lo = hi
+	}
+	return out
+}
+
+type parseFarmResult struct {
+	idx   int
+	items []parseResult
+}
+
+// parseParallel runs the batch decode on N workers, each with its own CLI
+// parser and staging directory, and extracts the results strictly in file
+// order on this goroutine. Parse completion order therefore never reaches the
+// graph: symbol ids and the dump are invariant under the worker count.
+//
+// A token is held from the start of a batch until that batch has been
+// extracted in order, which bounds how many decoded CST buffers (and staged
+// inputs) can be alive at once.
+func (g *Graph) parseParallel(recs []*sourceFile, workers int, quiet bool) (failed, syntax int) {
+	n := len(recs)
+	batches := planParseBatches(recs)
+	if len(batches) == 0 {
+		return 0, 0
+	}
+	if workers > len(batches) {
+		workers = len(batches)
+	}
 	step := n / 20
 	if step < 1 {
 		step = 1
 	}
-	if workers == 1 {
-		return g.parseSerial(recs, quiet)
-	}
 
-	out := make([]parseResult, n)
-	ready := make([]chan struct{}, n)
-	for i := range ready {
-		ready[i] = make(chan struct{}, 1)
-	}
-
-	depth := max(parseQueueDepth, 2)
-	inflight := make(chan struct{}, depth)
-
-	sem := newByteSem(int64(parseByteBudget))
-	jobs := make(chan int)
-	go func() {
-		defer close(jobs)
-		for i := range recs {
-			jobs <- i
-		}
-	}()
+	// Batches are pulled in index order. That is what keeps the token protocol
+	// deadlock-free: the batch the consumer is waiting for (emit) was always
+	// pulled before any of the other in-flight batches, so one worker is
+	// always making progress on it. A longest-processing-time order was tried
+	// and deadlocks when emit's batch is scheduled after the tokens run out.
+	var nextBatch atomic.Int64
+	results := make(chan parseFarmResult, workers)
+	tokens := make(chan struct{}, workers)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
-		wg.Go(func() {
-			for i := range jobs {
-
-				sz := fileCharge(int64(len(recs[i].data)))
-				sem.acquire(sz)
-				tree, root, lines, err := parseSource(recs[i])
-
-				sem.release(sz)
-				out[i] = parseResult{rec: recs[i], tree: tree, root: root,
-					src: recs[i].data, lines: lines, err: err, srcBytes: sz}
-				recs[i].text, recs[i].data = "", nil
-				ready[i] <- struct{}{}
-				<-inflight
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p := getParser()
+			defer putParser(p)
+			tmp := newTSTemp()
+			defer tmp.close()
+			for {
+				bi := int(nextBatch.Add(1)) - 1
+				if bi >= len(batches) {
+					return
+				}
+				tokens <- struct{}{}
+				sp := batches[bi]
+				items := parseBatchDecode(p, tmp, recs[sp.lo:sp.hi], nil)
+				results <- parseFarmResult{idx: bi, items: items}
 			}
-		})
+		}()
 	}
-	for i := range n {
-		inflight <- struct{}{}
-		<-ready[i]
-		ok := g.extractParsed(out[i])
-		out[i].src = nil
-		if !ok {
-			if out[i].err != nil && isSyntaxErr(out[i].err) {
-				syntax++
-			} else {
-				failed++
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	pending := make(map[int][]parseResult, workers)
+	emit := 0
+	done := 0
+	for res := range results {
+		pending[res.idx] = res.items
+		for {
+			items, ok := pending[emit]
+			if !ok {
+				break
 			}
-		}
-		if !quiet && (i+1)%step == 0 {
-			printfLn("  ... %d/%d files", i+1, n)
+			delete(pending, emit)
+			if sp := batches[emit]; len(items) != sp.hi-sp.lo {
+
+				panic(fmt.Sprintf("parse pipeline: batch %d produced %d results for %d files",
+					emit, len(items), sp.hi-sp.lo))
+			}
+			emit++
+			for i := range items {
+				pr := &items[i]
+				if !g.extractTimed(*pr) {
+					if pr.err != nil && isSyntaxErr(pr.err) {
+						syntax++
+					} else {
+						failed++
+					}
+				}
+				done++
+				if !quiet && done%step == 0 {
+					printfLn("  ... %d/%d files", done, n)
+				}
+			}
+			<-tokens
 		}
 	}
-	wg.Wait()
+	if emit != len(batches) {
+
+		panic(fmt.Sprintf("parse pipeline lost %d of %d batches", len(batches)-emit, len(batches)))
+	}
 	return failed, syntax
 }
 
-var parseQueueDepth = 2 * runtime.GOMAXPROCS(0)
-
-var parseByteBudget = int64(2 << 20)
-
-type byteSem struct {
-	mu    sync.Mutex
-	cond  *sync.Cond
-	free  int64
-	total int64
-}
-
-func newByteSem(total int64) *byteSem {
-	s := &byteSem{free: total, total: total}
-	s.cond = sync.NewCond(&s.mu)
-	return s
-}
-
-func (s *byteSem) acquire(n int64) {
-	if n >= s.total {
-
-		s.mu.Lock()
-		for s.free < s.total {
-			s.cond.Wait()
-		}
-		s.free = 0
-		s.mu.Unlock()
-		return
-	}
-	s.mu.Lock()
-	s.free -= n
-	for s.free < 0 {
-		s.cond.Wait()
-	}
-	s.mu.Unlock()
-}
-
-func (s *byteSem) release(n int64) {
-	if n >= s.total {
-		n = s.total
-	}
-	s.mu.Lock()
-	s.free += n
-	if s.free > s.total {
-		s.free = s.total
-	}
-	s.cond.Broadcast()
-	s.mu.Unlock()
-}
-
 type parseResult struct {
-	rec      *sourceFile
-	tree     *tsTree
-	root     tsNode
-	src      []byte
-	lines    []string
-	err      error
-	srcBytes int64
+	rec   *sourceFile
+	tree  *tsTree
+	root  tsNode
+	src   []byte
+	lines []string
+	err   error
 }
 
 type parseErr struct {
@@ -4075,57 +4191,72 @@ func (g *Graph) dynamicSites(root tsNode, src []byte, sid int32, rec *sourceFile
 	})
 }
 
-var bfsQueuePool = sync.Pool{New: func() any { return make([]walkQi, 0, 4096) }}
-
 type walkQi struct {
-	n tsNode
-	d int
+	t *tsTree
+	i int32
+	d int32
 }
 
 func walkNamedBFS(root tsNode, src []byte, fn func(tsNode)) {
-	queue := bfsQueuePool.Get().([]walkQi)[:0]
-	defer bfsQueuePool.Put(queue[:0])
-	queue = append(queue, walkQi{root, 0})
-	for len(queue) > 0 {
-		it := queue[0]
-		queue = queue[1:]
-		fn(it.n)
 
-		var push func(n tsNode, d int)
-		push = func(n tsNode, d int) {
-			switch kindID(n) {
-			case kBlock, kParenExpr, kArgList, kType, kElseClause, kFinallyClause,
-				kWithClause, kAsPattern, kPair, kConcatString:
+	queue := make([]walkQi, 0, 4096)
+	queue = append(queue, walkQi{root.t, root.i, 0})
 
-				forEachNamed(n, func(gc tsNode) { push(gc, d) })
-			case kDecoratedDef:
+	var push func(n tsNode, d int32)
+	push = func(n tsNode, d int32) {
+		switch kindID(n) {
+		case kBlock, kParenExpr, kArgList, kType, kElseClause, kFinallyClause,
+			kWithClause, kAsPattern, kPair, kConcatString:
 
-				eachNamedChild(n, func(gc tsNode) {
-					if kindID(gc) == kDecorator {
-						push(gc, d+1)
-						return
-					}
-					push(gc, d)
-				})
-			case kExprStmt:
-				if a := assignOf(n); hasNode(a) {
-					queue = append(queue, walkQi{a, d})
-					return
+			for c := firstChildN(n); hasNode(c); c = nextSiblingOf(c) {
+				if isNamedN(c) && kindID(c) != kComment {
+					push(c, d)
 				}
-				queue = append(queue, walkQi{n, d})
-			default:
-				queue = append(queue, walkQi{n, d})
 			}
+		case kDecoratedDef:
+
+			if def := fieldNode(n, fDefinition); hasNode(def) {
+				push(def, d)
+			}
+			for c := firstChildN(n); hasNode(c); c = nextSiblingOf(c) {
+				if isNamedN(c) && kindID(c) == kDecorator {
+					push(c, d+1)
+				}
+			}
+		case kExprStmt:
+			if a := assignOf(n); hasNode(a) {
+				queue = append(queue, walkQi{a.t, a.i, d})
+				return
+			}
+			queue = append(queue, walkQi{n.t, n.i, d})
+		default:
+			queue = append(queue, walkQi{n.t, n.i, d})
 		}
-		if vals, ok := boolOpValues(src, it.n); ok {
+	}
+
+	head := 0
+	for head < len(queue) {
+		it := queue[head]
+		head++
+		in := tsNode{t: it.t, i: it.i}
+		fn(in)
+		d := it.d + 1
+
+		if vals, ok := boolOpValues(src, in); ok {
 
 			for _, c := range vals {
-				push(c, it.d+1)
+				push(c, d)
 			}
-		} else if kindID(it.n) == kIfStmt {
+			continue
+		}
+		switch {
+		case kindID(in) == kIfStmt:
 
 			var chain tsNode
-			forEachNamed(it.n, func(c tsNode) {
+			for c := firstChildN(in); hasNode(c); c = nextSiblingOf(c) {
+				if !isNamedN(c) || kindID(c) == kComment {
+					continue
+				}
 				switch kindID(c) {
 				case kElifClause:
 					if !hasNode(chain) {
@@ -4133,27 +4264,73 @@ func walkNamedBFS(root tsNode, src []byte, fn func(tsNode)) {
 					}
 				case kElseClause:
 				default:
-					push(c, it.d+1)
+					push(c, d)
 				}
-			})
+			}
 			if hasNode(chain) {
-				push(chain, it.d+1)
-			} else if el := firstChildOfKind(it.n, kElseClause); hasNode(el) {
-				push(el, it.d+1)
+				push(chain, d)
+			} else if el := firstChildOfKind(in, kElseClause); hasNode(el) {
+				push(el, d)
 			}
-		} else if kindID(it.n) == kElifClause {
-			forEachNamed(it.n, func(c tsNode) { push(c, it.d+1) })
-
-			if nx := nextNamedSibling(it.n); hasNode(nx) {
-				switch kindID(nx) {
-				case kElifClause:
-					push(nx, it.d+1)
-				case kElseClause:
-					push(nx, it.d+1)
+		case kindID(in) == kElifClause:
+			for c := firstChildN(in); hasNode(c); c = nextSiblingOf(c) {
+				if isNamedN(c) && kindID(c) != kComment {
+					push(c, d)
 				}
 			}
-		} else {
-			eachNamedChild(it.n, func(c tsNode) { push(c, it.d+1) })
+
+			if nx := nextNamedSibling(in); hasNode(nx) {
+				switch kindID(nx) {
+				case kElifClause, kElseClause:
+					push(nx, d)
+				}
+			}
+		default:
+			switch kindID(in) {
+			case kDecoratedDef:
+				if def := fieldNode(in, fDefinition); hasNode(def) {
+					push(def, d)
+				}
+				for c := firstChildN(in); hasNode(c); c = nextSiblingOf(c) {
+					if isNamedN(c) && kindID(c) == kDecorator {
+						push(c, d)
+					}
+				}
+			case kCondExpr:
+				var kids [3]tsNode
+				nk := 0
+				for c := firstChildN(in); hasNode(c); c = nextSiblingOf(c) {
+					if !isNamedN(c) || kindID(c) == kComment {
+						continue
+					}
+					if nk < len(kids) {
+						kids[nk] = c
+					}
+					nk++
+				}
+				if nk == 3 {
+					push(kids[1], d)
+					push(kids[0], d)
+					push(kids[2], d)
+					break
+				}
+				for c := firstChildN(in); hasNode(c); c = nextSiblingOf(c) {
+					if isNamedN(c) && kindID(c) != kComment {
+						push(c, d)
+					}
+				}
+			default:
+				for c := firstChildN(in); hasNode(c); c = nextSiblingOf(c) {
+					if isNamedN(c) && kindID(c) != kComment {
+						push(c, d)
+					}
+				}
+			}
+		}
+		if head == len(queue) {
+
+			queue = queue[:0]
+			head = 0
 		}
 	}
 }
@@ -4243,15 +4420,6 @@ type hazardSeen struct {
 
 var _ = regexp.MustCompile
 var _ = strconv.Itoa
-
-const minFileSlot = 64 << 10
-
-func fileCharge(n int64) int64 {
-	if n < minFileSlot {
-		return minFileSlot
-	}
-	return n
-}
 
 func stmtEndLine(n tsNode) int32 {
 
@@ -13938,44 +14106,52 @@ func fStrV(s string) field {
 }
 
 func (f field) encode() string {
+	var buf []byte
+	return string(f.encodeTo(buf))
+}
+
+func (f field) encodeTo(buf []byte) []byte {
 	switch f.kind {
 	case fNull:
-		return `\N`
+		return append(buf, `\N`...)
 	case fInt:
-		return "i:" + strconv.FormatInt(f.i, 10)
+		buf = append(buf, 'i', ':')
+		return strconv.AppendInt(buf, f.i, 10)
 	case fFloat:
-		return "f:" + cgReprFloat(f.f)
+		buf = append(buf, 'f', ':')
+		return append(buf, cgReprFloat(f.f)...)
 	default:
-		return "s:" + escapeDump(f.s)
+		buf = append(buf, 's', ':')
+		return escapeDumpTo(buf, f.s)
 	}
 }
 
 func escapeDump(s string) string {
-	var b strings.Builder
-	b.Grow(len(s) + 8)
+	return string(escapeDumpTo(nil, s))
+}
+
+func escapeDumpTo(b []byte, s string) []byte {
+	const hexd = "0123456789ABCDEF"
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch c {
 		case '\\':
-			b.WriteString(`\\`)
+			b = append(b, '\\', '\\')
 		case '\n':
-			b.WriteString(`\n`)
+			b = append(b, '\\', 'n')
 		case '\t':
-			b.WriteString(`\t`)
+			b = append(b, '\\', 't')
 		case '\r':
-			b.WriteString(`\r`)
+			b = append(b, '\\', 'r')
 		default:
 			if c < 0x20 || c == 0x7F {
-				b.WriteString(`\x`)
-				const hexd = "0123456789ABCDEF"
-				b.WriteByte(hexd[c>>4])
-				b.WriteByte(hexd[c&0xF])
+				b = append(b, '\\', 'x', hexd[c>>4], hexd[c&0xF])
 			} else {
-				b.WriteByte(c)
+				b = append(b, c)
 			}
 		}
 	}
-	return b.String()
+	return b
 }
 
 func cgReprFloat(v float64) string {
@@ -14043,12 +14219,16 @@ func (d *dumper) line(s string) {
 
 func (d *dumper) table(name string, ncols int, rows [][]field) {
 	rowsOut := make([]string, 0, len(rows))
+	var buf []byte
 	for _, r := range rows {
-		parts := make([]string, len(r))
-		for i, f := range r {
-			parts[i] = f.encode()
+		buf = buf[:0]
+		for i := range r {
+			if i > 0 {
+				buf = append(buf, ' ')
+			}
+			buf = r[i].encodeTo(buf)
 		}
-		rowsOut = append(rowsOut, strings.Join(parts, " "))
+		rowsOut = append(rowsOut, string(buf))
 	}
 	sort.Strings(rowsOut)
 	blk := dumpBlock{name: name, lines: make([]string, 0, len(rowsOut)+2)}
@@ -15683,7 +15863,7 @@ func run(argv []string) int {
 		incGen      = fs.Bool("include-generated", false, "parse generated files too")
 		incVend     = fs.Bool("include-vendored", false, "parse vendored trees too")
 		only        = fs.String("only", "", "comma-separated question numbers or names")
-		workersFlag = fs.Int("workers", 1, "parse workers; 1 (default) is serial, 8 is the project-wide standard fan-out, 0 means one per core")
+		workersFlag = fs.Int("workers", defaultParseWorkers(), "parse workers; 1 is the serial reader, 0 means one per core")
 		cpuProf     = fs.String("cpuprofile", "", "write a CPU profile here")
 		memProf     = fs.String("memprofile", "", "write an alloc_space/inuse_space profile here")
 		profMs      = fs.Int("profilems", 0, "milliseconds between heap samples (0 = default)")
@@ -15795,6 +15975,17 @@ func run(argv []string) int {
 		*quiet = true
 	}
 
+	// Keep the heap tight: the parse pipeline holds several decoded batches at
+	// once and the default GOGC=100 lets peak RSS run ~30% above the serial
+	// reader. 30 matches the sibling ports' default (CG_GOGC overrides).
+	gogc := 30
+	if v := os.Getenv("CG_GOGC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			gogc = n
+		}
+	}
+	debug.SetGCPercent(gogc)
+
 	if *cpuProf != "" {
 		f, err := os.Create(*cpuProf)
 		if err != nil {
@@ -15834,6 +16025,11 @@ func run(argv []string) int {
 		g.keepTrees = *saveASTPath != ""
 
 		nFailed, nSyntax := g.parseAndExtract(recs, workers, *quiet)
+		if cgPipeline {
+			fmt.Fprintf(os.Stderr, "pipeline: wall=%dms readerBusy=%dms stageBusy=%dms decoderBusy=%dms extractBusy=%dms\n",
+				time.Since(t1)/1e6, pipeReadWait.Load()/1e6, pipeStage.Load()/1e6,
+				pipeDecode.Load()/1e6, pipeExtract.Load()/1e6)
+		}
 		if nFailed > 0 {
 			fmt.Fprintf(os.Stderr, "  WARNING: %d of %d file(s) FAILED to parse and contributed nothing.\n", nFailed, len(recs))
 			fmt.Fprintf(os.Stderr, "           Re-run with CODEGRAPH_DEBUG=1 for the tracebacks.\n")

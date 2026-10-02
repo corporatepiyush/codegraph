@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf16"
@@ -331,7 +332,7 @@ func (p *tsParser) readAll(r io.Reader) []byte {
 	buf := p.outBuf[:0]
 	for {
 		if len(buf) == cap(buf) {
-			grow := cap(buf) / 2
+			grow := cap(buf)
 			if grow < 1<<16 {
 				grow = 1 << 16
 			}
@@ -1525,19 +1526,38 @@ func childField(n tsNode, f tsFieldID) tsNode {
 	return fieldNode(n, f)
 }
 
-func namedChildren(n tsNode) []tsNode {
+// forEachNamedChild visits n's named children in document order. It walks the
+// record chain directly, which is O(k) for k children — namedChildAt restarts
+// at the first child, so an index loop over them is O(k^2).
+func forEachNamedChild(n tsNode, f func(tsNode)) {
 	if !hasNode(n) {
-		return nil
+		return
 	}
-	m := namedChildCount(n)
-	if m == 0 {
-		return nil
+	for c, end := n.i+1, n.t.recs[n.i].subEnd; c < end; c = n.t.recs[c].subEnd {
+		if n.t.recs[c].flags&tsFlagNamed != 0 {
+			f(tsNode{t: n.t, i: c})
+		}
 	}
-	out := make([]tsNode, 0, m)
-	for i := range m {
-		out = append(out, namedChildAt(n, i))
+}
+
+// pushNamedChildren appends n's named children to stack in document order and
+// reverses that segment, so the caller's LIFO pop visits them in document
+// order — byte-for-byte the order the old reversed namedChildAt loop produced,
+// at O(k) instead of O(k^2).
+func pushNamedChildren(stack []walkItem, n tsNode, sc scope) []walkItem {
+	if !hasNode(n) {
+		return stack
 	}
-	return out
+	start := len(stack)
+	for c, end := n.i+1, n.t.recs[n.i].subEnd; c < end; c = n.t.recs[c].subEnd {
+		if n.t.recs[c].flags&tsFlagNamed != 0 {
+			stack = append(stack, walkItem{tsNode{t: n.t, i: c}, sc})
+		}
+	}
+	for a, b := start, len(stack)-1; a < b; a, b = a+1, b-1 {
+		stack[a], stack[b] = stack[b], stack[a]
+	}
+	return stack
 }
 
 func hasPrefixAny(s string, pfx ...string) bool {
@@ -3679,6 +3699,7 @@ func (g *Graph) sigPut(s string) sigRef {
 		cgMu.Lock()
 		g.sigBases = append(g.sigBases, uint64(len(cgArena)))
 		cgArena = append(cgArena, make([]byte, sigBlockLen)...)
+		cgArenaBase.Store(unsafe.SliceData(cgArena))
 		cgMu.Unlock()
 		g.sigBlk = len(g.sigBases) - 1
 		g.sigOff = 0
@@ -3694,8 +3715,12 @@ func (g *Graph) sigString(r sigRef) string {
 	if r.blk < 0 {
 		return ""
 	}
-
-	return unsafe.String(&cgArena[g.sigBases[r.blk]+uint64(r.off)], int(r.n))
+	base := cgArenaBase.Load()
+	if base == nil {
+		return ""
+	}
+	return unsafe.String((*byte)(unsafe.Add(unsafe.Pointer(base),
+		uintptr(g.sigBases[r.blk]+uint64(r.off)))), int(r.n))
 }
 
 func (g *Graph) halvPut(v int64) { g.halv = append(g.halv, v) }
@@ -3822,7 +3847,8 @@ func (x *xctx) scanClassMeta(n tsNode) {
 		return
 	}
 	src := x.src
-	stack := namedChildren(body)
+	stack := x.metaSt[:0]
+	forEachNamedChild(body, func(c tsNode) { stack = append(stack, c) })
 	for len(stack) > 0 {
 		nd := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -3839,8 +3865,9 @@ func (x *xctx) scanClassMeta(n tsNode) {
 				x.callDetail(nd, meth, 0, true)
 			}
 		}
-		stack = append(stack, namedChildren(nd)...)
+		forEachNamedChild(nd, func(c tsNode) { stack = append(stack, c) })
 	}
+	x.metaSt = stack[:0]
 }
 
 func (x *xctx) functionFlags(n tsNode, sc scope, vis, name string) {
@@ -3969,8 +3996,7 @@ func (x *xctx) classBody(body tsNode, sid int32, short string, isCore bool, st *
 		return
 	}
 	src := x.src
-	kids := namedChildren(body)
-	for _, n := range kids {
+	forEachNamedChild(body, func(n tsNode) {
 		switch kindID(n) {
 		case kindMethod:
 			st.defs++
@@ -3990,7 +4016,7 @@ func (x *xctx) classBody(body tsNode, sid int32, short string, isCore bool, st *
 					Method: trunc(mtxt, 80), Operator: b2i(isOp),
 					Singleton: inSingleton, Line: int32(startRow(n) + 1)})
 			}
-			continue
+			return
 		case kindSingl:
 			st.defs++
 			st.cdefs++
@@ -4007,10 +4033,10 @@ func (x *xctx) classBody(body tsNode, sid int32, short string, isCore bool, st *
 					Method: trunc(mtxt, 80), Operator: b2i(isOp), Singleton: 1,
 					Line: int32(startRow(n) + 1)})
 			}
-			continue
+			return
 		case kindSingCls:
 			x.classBody(childField(n, fBody), sid, short, isCore, st, 1)
-			continue
+			return
 		case kindAssign, kindOpAsgn:
 			if left := childField(n, fLeft); hasNode(left) {
 				switch kindID(left) {
@@ -4022,14 +4048,14 @@ func (x *xctx) classBody(body tsNode, sid int32, short string, isCore bool, st *
 					st.globals++
 				}
 			}
-			continue
+			return
 		}
 		if kindID(n) != kindCall {
-			continue
+			return
 		}
 		mn := childField(n, fMethod)
 		if !hasNode(mn) {
-			continue
+			return
 		}
 		meth := textOf(src, mn)
 		args := childField(n, fArguments)
@@ -4038,10 +4064,10 @@ func (x *xctx) classBody(body tsNode, sid int32, short string, isCore bool, st *
 
 		switch {
 		case hasNode(args) && mixinKinds[meth] != "":
-			for _, a := range namedChildren(args) {
+			forEachNamedChild(args, func(a tsNode) {
 				mx := cgStrip(textOf(src, a))
 				if mx == "" || !isUpper(mx[0]) {
-					continue
+					return
 				}
 				st.mixins++
 				if strings.HasSuffix(mx, "Concern") {
@@ -4055,15 +4081,15 @@ func (x *xctx) classBody(body tsNode, sid int32, short string, isCore bool, st *
 					HostID: sid, FileID: x.rec.ID, Host: short,
 					Mixin: trunc(mx, 120), MixinShort: trunc(shortMix, 80),
 					Kind: mixinKinds[meth], InSingleton: inSingleton, Line: line})
-			}
+			})
 		case attrMacros[meth] != "" && hasNode(args):
 
 			col := attrMacros[meth]
 			typ := col[2:]
-			for _, a := range namedChildren(args) {
+			forEachNamedChild(args, func(a tsNode) {
 				an := strings.Trim(cgStrip(textOf(src, a)), ":\"' ")
 				if an == "" {
-					continue
+					return
 				}
 				st.attrs++
 				x.out.fields = append(x.out.fields, wField{
@@ -4071,7 +4097,7 @@ func (x *xctx) classBody(body tsNode, sid int32, short string, isCore bool, st *
 					Type: typ, Vis: "public", Line: line,
 					Static: inSingleton, Mutable: 1, Untyped: 1,
 				})
-			}
+			})
 		case meth == "delegate" || meth == "delegate_missing_to":
 
 			st.delegates++
@@ -4116,11 +4142,11 @@ func (x *xctx) classBody(body tsNode, sid int32, short string, isCore bool, st *
 				x.vis = append(x.vis, visRange{line, int32(endRow(body) + 1), visWord(meth)})
 			}
 		}
-	}
+	})
 
-	for _, n := range kids {
+	forEachNamedChild(body, func(n tsNode) {
 		if kindID(n) != kindIdent {
-			continue
+			return
 		}
 		txt := textOf(src, n)
 		if inSet(visibilityWords, txt) {
@@ -4128,7 +4154,7 @@ func (x *xctx) classBody(body tsNode, sid int32, short string, isCore bool, st *
 				int32(startRow(n) + 1),
 				int32(endRow(body) + 1), visWord(txt)})
 		}
-	}
+	})
 }
 
 var bareBlockHooks = map[string]bool{
@@ -8603,7 +8629,6 @@ type xctx struct {
 	nextID int32
 
 	st       symRow
-	opSeen   []bool
 	opStamp  []int32
 	gen      int32
 	opndGen  map[string]int32
@@ -8625,6 +8650,7 @@ type xctx struct {
 	exits    map[int32]int32
 	iterSt   []int32
 	scratch  []walkItem
+	metaSt   []tsNode
 }
 
 type cbState struct {
@@ -8643,7 +8669,6 @@ type blockRow struct {
 
 func newXctx() *xctx {
 	return &xctx{
-		opSeen:  make([]bool, 4096),
 		opStamp: make([]int32, 4096),
 		opndGen: make(map[string]int32, 4096),
 		exits:   make(map[int32]int32, 64),
@@ -8713,7 +8738,11 @@ func (x *xctx) runFileWith(fo *fileOut, p *tsParser, fidx int32, f *File, full s
 		x.opndGen = make(map[string]int32, 4096)
 	}
 
-	data, denied, tooBig := readCapped(full, maxFileBytes, maxLineBytes)
+	// x.src doubles as the reusable read buffer for this worker: the previous
+	// file's extraction is finished, and no string extracted from it aliases
+	// the bytes (textOf copies), so the buffer is dead.
+	data, reuse, denied, tooBig := readCapped(full, maxFileBytes, maxLineBytes, x.src)
+	x.src = reuse
 	if denied {
 		fo.denied = true
 		fo.fails = true
@@ -8915,27 +8944,34 @@ func countErrors(n tsNode, errs, miss *int32) {
 		} else if isMissingN(c) {
 			*miss++
 		}
-		m := childCount(c)
-		for i := range m {
-			stack = append(stack, childAt(c, i))
+		// Walk the record chain; childAt(c, i) restarts at the first child.
+		for cc, end := c.i+1, c.t.recs[c.i].subEnd; cc < end; cc = c.t.recs[cc].subEnd {
+			stack = append(stack, tsNode{t: c.t, i: cc})
 		}
 	}
 }
 
-func readCapped(path string, maxBytes, maxLine int64) (data []byte, denied, tooBig bool) {
+// readCapped reads path into buf, reusing its backing array (buf is owned by
+// the calling worker's xctx and is dead once extraction of the file finishes:
+// no extracted string aliases it). The (possibly regrown) buffer is returned
+// as reuse so the caller can keep it for the next file.
+func readCapped(path string, maxBytes, maxLine int64, buf []byte) (data, reuse []byte, denied, tooBig bool) {
 	f, err := openFile(path)
 	if err != nil {
-		return nil, true, false
+		return nil, buf, true, false
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return nil, true, false
+		return nil, buf, true, false
 	}
 	if st.Size() > maxBytes {
-		return nil, false, true
+		return nil, buf, false, true
 	}
-	buf := make([]byte, 0, int(st.Size())+1)
+	buf = buf[:0]
+	if cap(buf) < int(st.Size())+1 {
+		buf = make([]byte, 0, int(st.Size())+1)
+	}
 	for {
 		if len(buf) == cap(buf) {
 			grow := cap(buf) / 2
@@ -8953,7 +8989,7 @@ func readCapped(path string, maxBytes, maxLine int64) (data []byte, denied, tooB
 		}
 	}
 	if int64(len(buf)) > maxBytes {
-		return buf, false, true
+		return buf, buf, false, true
 	}
 
 	longest := 0
@@ -8970,9 +9006,9 @@ func readCapped(path string, maxBytes, maxLine int64) (data []byte, denied, tooB
 		longest = len(buf) - start
 	}
 	if int64(longest) > maxLine {
-		return buf, false, true
+		return buf, buf, false, true
 	}
-	return buf, false, false
+	return buf, buf, false, false
 }
 
 func (x *xctx) classifyRole(text []byte) {
@@ -9448,14 +9484,18 @@ type resolver struct {
 
 func (b *builder) resolve() {
 	g := b.g
+	nPend := 0
+	for _, c := range b.pendChunks {
+		nPend += len(c)
+	}
 	r := &resolver{
 		g:        g,
 		unique:   make(map[string]int32, 1024),
 		fileSc:   make(map[pair]int32, 8192),
 		qual:     make(map[string]int32, 8192),
 		extBy:    make(map[int32]int32, 1024),
-		edgeIdx:  make(map[pair]int32, len(b.pending)),
-		unresIdx: make(map[nameKey]int32, len(b.pending)/4+16),
+		edgeIdx:  make(map[pair]int32, nPend),
+		unresIdx: make(map[nameKey]int32, nPend/4+16),
 		loc:      make([]int64, len(g.Syms)+1),
 	}
 
@@ -9513,70 +9553,73 @@ func (b *builder) resolve() {
 		}
 	}
 
-	for i := range b.pending {
-		p := &b.pending[i]
-		name := normaliseCallee(p.name)
-		if name == "" {
-			continue
-		}
-		base := name
-		if i := strings.LastIndexAny(name, ".:"); i >= 0 {
-			base = name[i+1:]
-		}
-		var target int32
-		if p.typeName != "" {
-			target = typeTable[p.typeName+"\x00"+base]
-		}
-		if target == 0 {
-			target = r.qual[name]
-		}
-		if target == 0 {
-			target = fileTable[int64(fileBySym[p.sid])<<32|int64(hashStr(base))]
-		}
-		if target == 0 {
-			target = r.unique[base]
-		}
-		if target == 0 {
-			if isExternalName(name, base) {
-				r.extBy[p.sid]++
-				r.nExt++
-			} else {
-				nm := trunc(name, 160)
-				k := nameKey{p.sid, nm}
-				if i, ok := r.unresIdx[k]; ok {
-					g.Unres[i].N++
-				} else {
-					r.unresIdx[k] = int32(len(g.Unres))
-					g.Unres = append(g.Unres, Unresolved{})
-					u := &g.Unres[len(g.Unres)-1]
-					cgZeroRow(unsafe.Pointer(u), unsafe.Sizeof(*u))
-					u.Caller = p.sid
-					u.name = cgPut(nm)
-					u.N = 1
-					u.FirstLine = p.line
-				}
-				r.nUnres++
+	for ci := range b.pendChunks {
+		chunk := b.pendChunks[ci]
+		for i := range chunk {
+			p := &chunk[i]
+			name := normaliseCallee(p.name)
+			if name == "" {
+				continue
 			}
-			continue
+			base := name
+			if i := strings.LastIndexAny(name, ".:"); i >= 0 {
+				base = name[i+1:]
+			}
+			var target int32
+			if p.typeName != "" {
+				target = typeTable[p.typeName+"\x00"+base]
+			}
+			if target == 0 {
+				target = r.qual[name]
+			}
+			if target == 0 {
+				target = fileTable[int64(fileBySym[p.sid])<<32|int64(hashStr(base))]
+			}
+			if target == 0 {
+				target = r.unique[base]
+			}
+			if target == 0 {
+				if isExternalName(name, base) {
+					r.extBy[p.sid]++
+					r.nExt++
+				} else {
+					nm := trunc(name, 160)
+					k := nameKey{p.sid, nm}
+					if i, ok := r.unresIdx[k]; ok {
+						g.Unres[i].N++
+					} else {
+						r.unresIdx[k] = int32(len(g.Unres))
+						g.Unres = append(g.Unres, Unresolved{})
+						u := &g.Unres[len(g.Unres)-1]
+						cgZeroRow(unsafe.Pointer(u), unsafe.Sizeof(*u))
+						u.Caller = p.sid
+						u.name = cgPut(nm)
+						u.N = 1
+						u.FirstLine = p.line
+					}
+					r.nUnres++
+				}
+				continue
+			}
+			k := pair{p.sid, target}
+			if i, ok := r.edgeIdx[k]; ok {
+				g.Edges[i].NCalls++
+			} else {
+				cl := r.loc[p.sid]
+				tl := r.loc[target]
+				r.edgeIdx[k] = int32(len(g.Edges))
+				g.Edges = append(g.Edges, Edge{
+					Caller: p.sid, Callee: target, NCalls: 1,
+					SameFile:   b2i(cl>>32 == tl>>32),
+					SameModule: b2i(uint32(cl) == uint32(tl)),
+					Self:       b2i(p.sid == target),
+				})
+			}
+			if p.line != 0 {
+				r.sites = append(r.sites, CallSite{Caller: p.sid, Callee: target, Line: p.line})
+			}
+			r.nRes++
 		}
-		k := pair{p.sid, target}
-		if i, ok := r.edgeIdx[k]; ok {
-			g.Edges[i].NCalls++
-		} else {
-			cl := r.loc[p.sid]
-			tl := r.loc[target]
-			r.edgeIdx[k] = int32(len(g.Edges))
-			g.Edges = append(g.Edges, Edge{
-				Caller: p.sid, Callee: target, NCalls: 1,
-				SameFile:   b2i(cl>>32 == tl>>32),
-				SameModule: b2i(uint32(cl) == uint32(tl)),
-				Self:       b2i(p.sid == target),
-			})
-		}
-		if p.line != 0 {
-			r.sites = append(r.sites, CallSite{Caller: p.sid, Callee: target, Line: p.line})
-		}
-		r.nRes++
 	}
 	for sid, v := range r.extBy {
 		if int(sid) <= len(g.Syms) {
@@ -10432,9 +10475,7 @@ func (x *xctx) nodeName(n tsNode) string {
 func (x *xctx) walkScope(root tsNode, fid int32, sc scope) {
 	stack := x.scratch
 	stack = stack[:0]
-	for i := nNamed(root) - 1; i >= 0; i-- {
-		stack = append(stack, walkItem{namedChildAt(root, i), sc})
-	}
+	stack = pushNamedChildren(stack, root, sc)
 	x.scratch = stack[:0]
 	for len(stack) > 0 {
 		it := stack[len(stack)-1]
@@ -10452,9 +10493,7 @@ func (x *xctx) walkScope(root tsNode, fid int32, sc scope) {
 			if !hasNode(body) {
 				body = cur
 			}
-			for i := nNamed(body) - 1; i >= 0; i-- {
-				stack = append(stack, walkItem{namedChildAt(body, i), inner})
-			}
+			stack = pushNamedChildren(stack, body, inner)
 			continue
 		}
 		if k == kindClass || k == kindModule {
@@ -10472,14 +10511,10 @@ func (x *xctx) walkScope(root tsNode, fid int32, sc scope) {
 			if !hasNode(body) {
 				body = cur
 			}
-			for i := nNamed(body) - 1; i >= 0; i-- {
-				stack = append(stack, walkItem{namedChildAt(body, i), inner})
-			}
+			stack = pushNamedChildren(stack, body, inner)
 			continue
 		}
-		for i := nNamed(cur) - 1; i >= 0; i-- {
-			stack = append(stack, walkItem{namedChildAt(cur, i), s})
-		}
+		stack = pushNamedChildren(stack, cur, s)
 	}
 	x.scratch = stack[:0]
 }
@@ -11644,9 +11679,15 @@ func (g *Graph) dumpTo(path string) error {
 
 	t.table("symbols", 223, func() [][]byte {
 		rows := make([][]byte, len(g.Syms))
+		// Build each 223-cell row in one reused buffer, then copy it to an
+		// exact-size slice: appending from nil re-grows the row ~10 times, and
+		// a fixed 4 KB capacity over-allocates every short row.
+		var scratch []byte
 		for i := range g.Syms {
-			c := append([]byte("R "), g.appendSymCells(nil, i)...)
-			rows[i] = c
+			scratch = scratch[:0]
+			scratch = append(scratch, "R "...)
+			scratch = g.appendSymCells(scratch, i)
+			rows[i] = append([]byte(nil), scratch...)
 		}
 		return rows
 	})
@@ -11702,7 +11743,10 @@ func appendSymOrNull(dst []byte, present bool, v int32) []byte {
 
 func (t *tableWriter) table(name string, ncols int, fill func() [][]byte) {
 	rows := fill()
-	sort.Slice(rows, func(i, j int) bool { return string(rows[i]) < string(rows[j]) })
+	// Byte order is string order; this is the same ordering the previous
+	// string(rows[i]) < string(rows[j]) comparator produced, without the
+	// reflect.Swapper that sort.Slice uses on a [][]byte.
+	slices.SortFunc(rows, bytes.Compare)
 	t.buf = t.buf[:0]
 	t.buf = append(t.buf, 'T', ' ')
 	t.buf = append(t.buf, name...)
@@ -13132,10 +13176,19 @@ type cgStr struct{ Off, Ln uint64 }
 const cgExtBase = uint64(1) << 62
 
 var (
-	cgArena  []byte
-	cgExt    []byte
-	cgIntern map[string]cgStr
-	cgMu     sync.Mutex
+	cgArena []byte
+	// cgArenaBase is the atomic read side of cgArena. The parse workers hold
+	// cgStr values (file paths, names) and resolve them to strings while the
+	// main goroutine is still interning new ones in linkOne; reading the
+	// growable cgArena slice header there raced with append's reallocation.
+	// Publishing the backing-array base through an atomic pointer means
+	// readers never touch the mutable header, and a reallocation merely
+	// leaves an old (still GC-reachable through the reader's string) array
+	// behind. An in-place append never changes the base.
+	cgArenaBase atomic.Pointer[byte]
+	cgExt       []byte
+	cgIntern    map[string]cgStr
+	cgMu        sync.Mutex
 )
 
 func cgPut(s string) cgStr {
@@ -13149,6 +13202,7 @@ func cgPut(s string) cgStr {
 	}
 	off := uint64(len(cgArena))
 	cgArena = append(cgArena, s...)
+	cgArenaBase.Store(unsafe.SliceData(cgArena))
 	v := cgStr{off, uint64(len(s))}
 	if cgIntern == nil {
 		cgIntern = make(map[string]cgStr, 1<<16)
@@ -13179,7 +13233,11 @@ func (s cgStr) Str() string {
 	if s.Off >= cgExtBase {
 		return unsafe.String(&cgExt[s.Off-cgExtBase], int(s.Ln))
 	}
-	return unsafe.String(&cgArena[s.Off], int(s.Ln))
+	base := cgArenaBase.Load()
+	if base == nil {
+		return ""
+	}
+	return unsafe.String((*byte)(unsafe.Add(unsafe.Pointer(base), uintptr(s.Off))), int(s.Ln))
 }
 
 type File struct {
@@ -13663,7 +13721,7 @@ type builder struct {
 	symBase    int32
 	regNames   []regName
 	regQuals   []regQual
-	pending    []pendCall
+	pendChunks [][]pendCall
 	ruby4Files int32
 
 	symBlocks   [][]Sym
@@ -13964,7 +14022,14 @@ func (b *builder) linkOne(i int, fo *fileOut) {
 		fo.pend[k].sid += base
 		fo.pend[k].name = g.in.do(fo.pend[k].name)
 		fo.pend[k].typeName = g.in.do(fo.pend[k].typeName)
-		b.pending = append(b.pending, fo.pend[k])
+	}
+	// One exact-size chunk per file instead of growing one shared slice by
+	// doubling: the worker recycles fo.pend, so the copy is required either
+	// way, and chunk order (file order) is the order resolve consumes.
+	if len(fo.pend) > 0 {
+		chunk := make([]pendCall, len(fo.pend))
+		copy(chunk, fo.pend)
+		b.pendChunks = append(b.pendChunks, chunk)
 	}
 	b.ruby4Files += b2i(fo.ruby4)
 	b.recycle(fo)
@@ -15751,6 +15816,7 @@ func loadAST(path string) (*Graph, error) {
 
 	cgMu.Lock()
 	cgArena = arena
+	cgArenaBase.Store(unsafe.SliceData(cgArena))
 	cgMu.Unlock()
 
 	meta := make([]cgMetaRow, 0, len(metaSrc)+1)

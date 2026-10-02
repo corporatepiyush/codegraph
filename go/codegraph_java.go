@@ -3590,7 +3590,6 @@ type Graph struct {
 	Out CSR[Edge]
 	In  CSR[Edge]
 
-	byName    map[string][]int32
 	byQual    map[string]int32
 	fileScope map[scopeKey]int32
 	typeScope map[scopeKey]int32
@@ -3623,7 +3622,6 @@ type fileMod struct{ fid, mid int32 }
 func NewGraph() *Graph {
 	return &Graph{
 		Str:         NewInterner(),
-		byName:      make(map[string][]int32, 1<<14),
 		byQual:      make(map[string]int32, 1<<14),
 		fileScope:   make(map[scopeKey]int32, 1<<14),
 		typeScope:   make(map[scopeKey]int32, 1<<14),
@@ -3698,9 +3696,17 @@ func (g *Graph) outOfTree(target string) bool {
 
 func (g *Graph) buildIndexes() {
 	n := len(g.Sym)
+	// unique is a name -> id map for names with exactly one definition.  A
+	// second definition overwrites the entry with the 0 sentinel, which is
+	// what resolve() treats as "not unique" (it only assigns a non-zero
+	// target), so no separate candidate slices are needed.
 	for i := range g.Sym {
 		name := g.Str.get(g.Sym[i].Name)
-		g.byName[name] = append(g.byName[name], int32(i+1))
+		if _, seen := g.unique[name]; seen {
+			g.unique[name] = 0
+		} else {
+			g.unique[name] = int32(i + 1)
+		}
 	}
 
 	g.symLoc = make([]fileMod, n+1)
@@ -3736,11 +3742,6 @@ func (g *Graph) buildIndexes() {
 			if _, ok := g.byQual[key]; !ok {
 				g.byQual[key] = s.ID
 			}
-		}
-	}
-	for name, cands := range g.byName {
-		if len(cands) == 1 {
-			g.unique[name] = cands[0]
 		}
 	}
 	for i := range g.Files {
@@ -4890,8 +4891,10 @@ func (x *xctx) one(fo *fileOut, fidx int, f *File, dstr *Interner, cst, data []b
 
 	if utf8.Valid(data) {
 		x.text = unsafe.String(unsafe.SliceData(data), len(data))
+		x.textOK = true
 	} else {
 		x.text = cgDecode(data)
+		x.textOK = false
 	}
 
 	x.scanMarkers()
@@ -5500,7 +5503,12 @@ type xctx struct {
 	text     string
 	asciiOK  bool
 	asciiTxt string
-	rel      string
+	// textOK is set when text aliases src byte-for-byte (the file was valid
+	// UTF-8), so a node's byte range indexes text directly and a token slice
+	// needs no decode/allocation.  For invalid UTF-8, text is the decoded
+	// form and offsets do not line up.
+	textOK bool
+	rel    string
 
 	trackIdentifiers bool
 	curBody          tsNode
@@ -5600,9 +5608,11 @@ func (x *xctx) annotations(n tsNode) map[string]bool {
 	return out
 }
 
+var ee12GenericAnnos = newSet("Query", "Find", "FindAll", "Save", "Delete",
+	"Insert", "Update")
+
 func (x *xctx) qualifiedEE12Annos(n tsNode) int32 {
-	generic := newSet("Query", "Find", "FindAll", "Save", "Delete", "Insert",
-		"Update")
+	generic := ee12GenericAnnos
 	cnt := 0
 	for c := range eachNamedKid(n) {
 		if x.jk.names[c.kindID()] != "modifiers" {
@@ -5866,6 +5876,9 @@ func (x *xctx) signatureOf(n tsNode) string {
 	}
 	if x.asciiOK {
 		return strings.TrimSpace(x.asciiTxt[s:end])
+	}
+	if x.textOK {
+		return strings.TrimSpace(x.text[s:end])
 	}
 	return strings.TrimSpace(cgDecode(x.src[s:end]))
 }
@@ -6919,21 +6932,9 @@ func (x *xctx) onNode(node tsNode, st *bstats, loopDepth, nest int32,
 		x.onBinary(node, st, loopDepth)
 		return
 	case "unary_expression":
-		kids := namedKids(node)
-		real := kids[:0]
-		for _, k := range kids {
-			if x.jk.names[k.kindID()] != "comment" {
-				real = append(real, k)
-			}
-		}
-		if len(real) == 1 && x.jk.names[real[0].kindID()] == "method_invocation" {
-			nm := real[0].childByFieldName(fName)
-			if nm.ok() {
-				switch x.txt(nm) {
-				case "compareTo", "compare":
-				}
-			}
-		}
+		// The old body selected a single non-comment child and switched on
+		// its name with no cases -- no state was ever written.  Keep the
+		// case so the shape of onNode is unchanged; nothing to count.
 		return
 	case "assignment_expression":
 		x.onAssign(node, st, loopDepth)
@@ -6948,19 +6949,18 @@ func (x *xctx) onNode(node tsNode, st *bstats, loopDepth, nest int32,
 		st.s.NLambda++
 		return
 	case "update_expression":
-		kids := namedKids(node)
 		base := ""
-		for i, k := range kids {
+		for i := 0; i < node.namedChildCount(); i++ {
+			k := node.namedChild(i)
 			if x.jk.names[k.kindID()] != "comment" {
-				base = lastSegment(strings.TrimSpace(x.txt(kids[i])))
+				base = lastSegment(strings.TrimSpace(x.txt(k)))
 				break
 			}
 		}
 		st.events = append(st.events, event{kind: evUpdate, s1: base})
 		return
 	case "return_statement":
-		kids := namedKids(node)
-		if len(kids) > 0 && x.jk.names[kids[0].kindID()] == "null_literal" {
+		if kids := node.namedChild(0); kids.ok() && x.jk.names[kids.kindID()] == "null_literal" {
 			st.s.NNullReturns++
 		}
 
@@ -7038,18 +7038,6 @@ func bytesEq(n tsNode, src []byte, lit string) bool {
 		return false
 	}
 	return string(src[s:e]) == lit
-}
-
-func namedKids(n tsNode) []tsNode {
-	c := int(n.namedChildCount())
-	if c == 0 {
-		return nil
-	}
-	out := make([]tsNode, c)
-	for i := range c {
-		out[i] = n.namedChild(i)
-	}
-	return out
 }
 
 func eachNamedKid(n tsNode) iter.Seq[tsNode] {
@@ -7339,10 +7327,10 @@ func (x *xctx) pushCatch(node tsNode, st *bstats, loopDepth int32) {
 }
 
 func (x *xctx) pushThrow(node tsNode, st *bstats, loopDepth int32) {
-	kids := namedKids(node)
 	tn := ""
-	if len(kids) > 0 && x.jk.names[kids[0].kindID()] == "object_creation_expression" {
-		ty := kids[0].childByFieldName(fType)
+	if first := node.namedChild(0); first.ok() &&
+		x.jk.names[first.kindID()] == "object_creation_expression" {
+		ty := first.childByFieldName(fType)
 		if ty.ok() {
 			tn = simpleType(x.txt(ty))
 		}
@@ -10198,11 +10186,12 @@ func qCacheEvictDrift(g *Graph, mod string, lim int) ([]string, [][]any) {
 		"at"}
 	ai := g.buildAttrIndex()
 
+	cacheEvictAnnos := newSet("CacheEvict")
 	populated := populatedArgs(g, "Cacheable", "Caching")
 	rows := [][]any{}
 	for _, id := range g.scanOrder() {
 		s := &g.Sym[id-1]
-		attrs := g.attrsOf(&ai, s.ID, newSet("CacheEvict"))
+		attrs := g.attrsOf(&ai, s.ID, cacheEvictAnnos)
 		if len(attrs) == 0 {
 			continue
 		}
@@ -11511,7 +11500,6 @@ func mGraphBlindspots(g *Graph, mod string, lim int) ([]string, [][]any) {
 	}
 	byMod := map[int32]*agg{}
 	order := []int32{}
-	seen := map[int32]bool{}
 	for _, id := range g.scanOrder() {
 		s := &g.Sym[id-1]
 		if s.Kind != kindFunction && s.Kind != kindMethod &&
@@ -11527,7 +11515,6 @@ func mGraphBlindspots(g *Graph, mod string, lim int) ([]string, [][]any) {
 			byMod[s.ModuleID] = a
 			order = append(order, s.ModuleID)
 		}
-		seen[s.ID] = true
 		a.calls += s.NCalls
 		a.ext += s.NExternalCalls
 		a.unres += s.NUnresolved
@@ -11536,10 +11523,6 @@ func mGraphBlindspots(g *Graph, mod string, lim int) ([]string, [][]any) {
 	}
 	for _, mid := range order {
 		a := byMod[mid]
-		n := int32(0)
-		for id := range seen {
-			_ = id
-		}
 		a.fns = countFnInModule(g, mid)
 		if a.calls == 0 {
 			continue
@@ -11555,7 +11538,6 @@ func mGraphBlindspots(g *Graph, mod string, lim int) ([]string, [][]any) {
 		if a.calls != 0 {
 			pct = cut(100.0 * float64(a.unres) / float64(a.calls))
 		}
-		_ = n
 		rowsAppend(&rows, []any{g.modName(mid), int(a.fns), int(a.calls),
 			int(a.ext), int(a.unres), int(a.refl), int(a.handlers), int(fe),
 			pct})
@@ -12545,6 +12527,7 @@ func mSchedulerSurface(g *Graph, mod string, lim int) ([]string, [][]any) {
 	cols := []string{"module_", "scheduled_methods", "fixed_rate", "fixed_delay",
 		"io_heavy", "at"}
 	ai := g.buildAttrIndex()
+	scheduledAnnos := newSet("Scheduled")
 	type acc struct {
 		methods, rate, delay, heavy int32
 		atPath, atLine              any
@@ -12553,7 +12536,7 @@ func mSchedulerSurface(g *Graph, mod string, lim int) ([]string, [][]any) {
 	var order []int32
 	for _, id := range g.scanOrder() {
 		s := &g.Sym[id-1]
-		attrs := g.attrsOf(&ai, s.ID, newSet("Scheduled"))
+		attrs := g.attrsOf(&ai, s.ID, scheduledAnnos)
 		if len(attrs) == 0 {
 			continue
 		}
@@ -12968,6 +12951,9 @@ func (x *xctx) sliceToken(n tsNode, ascii bool, astr string) string {
 	if ascii {
 		return astr[s:e]
 	}
+	if x.textOK {
+		return x.text[s:e]
+	}
 	return cgDecode(x.src[s:e])
 }
 
@@ -12975,6 +12961,9 @@ func (x *xctx) txt(n tsNode) string {
 	s, e := int(n.startByte()), int(n.endByte())
 	if x.asciiOK {
 		return x.asciiTxt[s:e]
+	}
+	if x.textOK {
+		return x.text[s:e]
 	}
 	return cgDecode(x.src[s:e])
 }
@@ -14573,7 +14562,12 @@ func (x *xctx) functionFlags(node tsNode, name, kind string, sc scope,
 			jspec++
 		}
 	}
-	verAttr := len(x.annotationArgValues(node, "version"))
+	// A "version" argument cannot exist unless the modifiers text spells it,
+	// so skip the nested annotation walk for the ~all functions without it.
+	verAttr := 0
+	if strings.Contains(mods, "version") {
+		verAttr = len(x.annotationArgValues(node, "version"))
+	}
 
 	hasPub := strings.Contains(mods, "public")
 	hasProt := strings.Contains(mods, "protected")
@@ -15616,7 +15610,7 @@ func buildGraph(o *options, out *bufio.Writer) (*Graph, int, error) {
 	if o.saveAST != "" {
 		g.astTrees = make([]*tsTree, len(g.Files))
 	}
-	l := extractAll(g, disc, o.saveAST != "", o.quiet, out)
+	l := extractAll(g, disc, o.saveAST != "", o.quiet, out, o.threads)
 	nSym := len(g.Sym)
 	if !o.quiet {
 		fmt.Fprintf(out, "  %d symbols parsed in %.1fs\n", nSym,
@@ -15807,7 +15801,14 @@ func writeHeapProfile(path string) {
 	f.Close()
 }
 
-func extractAll(g *Graph, disc *discovered, keepTrees bool, quiet bool, out *bufio.Writer) *linker {
+type parsedFile struct {
+	src  []byte
+	cst  []byte
+	fidx int32
+}
+
+func extractAll(g *Graph, disc *discovered, keepTrees bool, quiet bool,
+	out *bufio.Writer, threads int) *linker {
 	p := newTSParser()
 	x := newXctx(p, g.Str)
 	x.keepTrees = keepTrees
@@ -15815,20 +15816,11 @@ func extractAll(g *Graph, disc *discovered, keepTrees bool, quiet bool, out *buf
 	fo := new(fileOut)
 	step := max(len(disc.parsed)/20, 1)
 	done := 0
-	var cstBuf, srcBuf []byte
-	for _, fidx := range disc.parsed {
-		f := &disc.files[fidx]
-		full := f.Full(disc.str)
-		src, err := readWholeFile(full, srcBuf[:0])
-		if err != nil {
-			src = nil
-		} else {
-			srcBuf = src
-		}
-		cst := p.parse(src, cstBuf[:0])
-		cstBuf = cst
+
+	consume := func(r parsedFile) {
+		f := &disc.files[r.fidx]
 		clear(x.kindLoc)
-		x.one(fo, int(fidx), f, disc.str, cst, src)
+		x.one(fo, int(r.fidx), f, disc.str, r.cst, r.src)
 		if fo.failed == 1 {
 			g.Files[fo.idx].Parsed = 0
 			g.Files[fo.idx].NParsErr++
@@ -15848,6 +15840,108 @@ func extractAll(g *Graph, disc *discovered, keepTrees bool, quiet bool, out *buf
 		if !quiet && done%step == 0 {
 			fmt.Fprintf(out, "  ... %d/%d files\n", done, len(disc.parsed))
 		}
+	}
+
+	n := len(disc.parsed)
+	nw := threads
+	if nw <= 0 {
+		nw = runtime.GOMAXPROCS(0)
+		if nw > 8 {
+			nw = 8
+		}
+	}
+	if nw > n {
+		nw = n
+	}
+	// Each worker runs the exact per-file command the serial path ran, so the
+	// CST bytes are identical.  Decode/link stays on this goroutine in file
+	// order, so every observable ordering (interner ids, symbol ids, edges)
+	// is unchanged; only the waiting for child processes overlaps.
+	//
+	// Worker w takes files w, w+nw, w+2nw, ...; the main goroutine reads the
+	// workers' channels round-robin, which is exactly file order.  A worker
+	// never waits on another worker, so this cannot deadlock, and each in-
+	// flight result carries its own buffers; consumed buffers are recycled
+	// opportunistically per worker (non-blocking send/receive).
+	//
+	// INVARIANT: a worker goroutine must not touch anything the main
+	// goroutine can mutate.  The only shared structures it reaches are the
+	// discovery slices (never written again) and the path strings computed
+	// below before any goroutine starts.  In particular it must not call
+	// Interner.get: File.Full(disc.str) reads pos/ln slice headers while the
+	// main goroutine's intern/commit appends to them.
+	if nw > 1 {
+		paths := make([]string, n)
+		for i, fidx := range disc.parsed {
+			paths[i] = disc.files[fidx].Full(disc.str)
+		}
+		outs := make([]chan parsedFile, nw)
+		rets := make([]chan []byte, nw)
+		for i := range outs {
+			outs[i] = make(chan parsedFile, 1)
+			// Capacity 2 so the consumer can return BOTH buffers (source and
+			// CST) of the file it just consumed without one being dropped.
+			rets[i] = make(chan []byte, 2)
+		}
+		var wg sync.WaitGroup
+		for w := 0; w < nw; w++ {
+			wp := newTSParser()
+			wg.Add(1)
+			go func(w int, wp *tsParser) {
+				defer wg.Done()
+				for i := w; i < n; i += nw {
+					fidx := disc.parsed[i]
+					var cstBuf, srcBuf []byte
+					select {
+					case cstBuf = <-rets[w]:
+					default:
+					}
+					select {
+					case srcBuf = <-rets[w]:
+					default:
+					}
+					src, err := readWholeFile(paths[i], srcBuf[:0])
+					if err != nil {
+						src = nil
+					}
+					cst := wp.parse(src, cstBuf[:0])
+					outs[w] <- parsedFile{src: src, cst: cst, fidx: fidx}
+				}
+			}(w, wp)
+		}
+		for i := 0; i < n; i++ {
+			w := i % nw
+			r := <-outs[w]
+			consume(r)
+			if cap(r.cst) > 0 {
+				select {
+				case rets[w] <- r.cst[:0]:
+				default:
+				}
+			}
+			if cap(r.src) > 0 {
+				select {
+				case rets[w] <- r.src[:0]:
+				default:
+				}
+			}
+		}
+		wg.Wait()
+		return l
+	}
+
+	var cstBuf, srcBuf []byte
+	for _, fidx := range disc.parsed {
+		f := &disc.files[fidx]
+		src, err := readWholeFile(f.Full(disc.str), srcBuf[:0])
+		if err != nil {
+			src = nil
+		} else {
+			srcBuf = src
+		}
+		cst := p.parse(src, cstBuf[:0])
+		cstBuf = cst
+		consume(parsedFile{src: src, cst: cst, fidx: fidx})
 	}
 	return l
 }

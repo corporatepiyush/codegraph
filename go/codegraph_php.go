@@ -25,7 +25,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -2322,6 +2321,196 @@ func (r *cstReader) runChild(src []byte) ([]byte, error) {
 		}
 	}
 	return out, nil
+}
+
+// The CLI prints one tree per file, concatenated with no separator. A root
+// line is the only line whose node kind sits at column 0: child lines carry
+// the depth as indentation before the kind name, and a raw newline inside a
+// token is escaped to \n, so every record occupies exactly one line. Splitting
+// on root lines is therefore exact for the files this reader produces -- but
+// the caller still verifies the count and every file's end shape against the
+// source it reads, falling back to one process per file on any disagreement.
+func skipSpaces(b []byte, i int) int {
+	for i < len(b) && (b[i] == ' ' || b[i] == '\t') {
+		i++
+	}
+	return i
+}
+
+// rootLineEnd parses `0:0 - R:C [•]program` and returns the end position the
+// CLI attributes to the tree, which must equal the parsed file's own end.
+func rootLineEnd(l []byte) (row, col int, ok bool) {
+	if len(l) < 11 || l[0] != '0' || l[1] != ':' || l[2] != '0' {
+		return 0, 0, false
+	}
+	i := skipSpaces(l, 3)
+	if i >= len(l) || l[i] != '-' {
+		return 0, 0, false
+	}
+	i = skipSpaces(l, i+1)
+	r0 := i
+	for i < len(l) && l[i] >= '0' && l[i] <= '9' {
+		i++
+	}
+	if i == r0 || i >= len(l) || l[i] != ':' {
+		return 0, 0, false
+	}
+	row, _ = atoiBytes(l[r0:i])
+	i++
+	c0 := i
+	for i < len(l) && l[i] >= '0' && l[i] <= '9' {
+		i++
+	}
+	if i == c0 {
+		return 0, 0, false
+	}
+	col, _ = atoiBytes(l[c0:i])
+	i = skipSpaces(l, i)
+	if i+3 <= len(l) && l[i] == 0xE2 && l[i+1] == 0x80 && l[i+2] == 0xA2 {
+		i += 3 // error marker the CLI prefixes to nodes inside an ERROR subtree
+	}
+	// The pinned CLI pads the kind name with trailing blanks on multi-file
+	// root lines; the PATH build being tested elsewhere does not.
+	end := len(l)
+	for end > i && (l[end-1] == ' ' || l[end-1] == '\t') {
+		end--
+	}
+	if string(l[i:end]) != "program" {
+		return 0, 0, false
+	}
+	return row, col, true
+}
+
+type rootMark struct {
+	off      int
+	row, col int
+}
+
+func splitRoots(out []byte) []rootMark {
+	var marks []rootMark
+	for i := 0; i < len(out); {
+		j := bytes.IndexByte(out[i:], '\n')
+		next := len(out)
+		line := out[i:]
+		if j >= 0 {
+			line = out[i : i+j]
+			next = i + j + 1
+		}
+		if row, col, ok := rootLineEnd(line); ok {
+			marks = append(marks, rootMark{off: i, row: row, col: col})
+		}
+		i = next
+	}
+	return marks
+}
+
+// runBatch parses several files with ONE tree-sitter process. ok is false when
+// the invocation itself is unusable and the caller must fall back to runChild
+// per file. A batch with parse errors exits 1 exactly like a single file does.
+func (r *cstReader) runBatch(recs []fileRec) ([]byte, bool) {
+	args := make([]string, 0, len(recs)+4)
+	args = append(args, "parse")
+	for i := range recs {
+		args = append(args, recs[i].abspath)
+	}
+	args = append(args, "--scope", tsScope, "--cst")
+	cmd := exec.Command(r.bin, args...)
+	cmd.Env = r.env
+	cmd.Stderr = nil
+	pr, perr := cmd.StdoutPipe()
+	if perr != nil {
+		return nil, false
+	}
+	if serr := cmd.Start(); serr != nil {
+		return nil, false
+	}
+	est := 1 << 16
+	for i := range recs {
+		est += int(recs[i].size) * 28
+	}
+	if est > 32<<20 {
+		est = 32 << 20
+	}
+	out := make([]byte, 0, est)
+	const chunk = 1 << 16
+	for {
+		if cap(out)-len(out) < chunk {
+			grown := make([]byte, len(out), 2*cap(out)+chunk)
+			copy(grown, out)
+			out = grown
+		}
+		n, rerr := pr.Read(out[len(out) : len(out)+chunk])
+		out = out[:len(out)+n]
+		if rerr != nil {
+			break
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			if c := ee.ExitCode(); c < 0 || c > 1 {
+				return nil, false
+			}
+		}
+		if len(out) == 0 {
+			return nil, false
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	// Every record is newline-terminated, so completed output always ends in
+	// one. Anything else is a partial write (a killed process, a full disk);
+	// refuse the batch rather than hand the decoder a truncated tree.
+	if out[len(out)-1] != '\n' {
+		return nil, false
+	}
+	return out, true
+}
+
+// readBatch returns the per-file batches for files [start,end) parsed by one
+// CLI process, or ok=false when the output cannot be split with certainty --
+// then the caller uses read() for every file in the range, byte-for-byte the
+// old per-file path.
+func (r *cstReader) readBatch(recs []fileRec, start, end int) ([]cstBatch, bool) {
+	section := recs[start:end]
+	out, ok := r.runBatch(section)
+	if !ok {
+		return nil, false
+	}
+	marks := splitRoots(out)
+	if len(marks) != len(section) {
+		return nil, false
+	}
+	batches := make([]cstBatch, 0, len(section))
+	for k, rec := range section {
+		stop := len(out)
+		if k+1 < len(marks) {
+			stop = marks[k+1].off
+		}
+		b := cstBatch{idx: int32(start + k), rec: rec, cst: out[marks[k].off:stop]}
+		src, err := readSource(rec.abspath)
+		if err != nil {
+			b.err = err
+			batches = append(batches, b)
+			continue
+		}
+		// The CLI parsed the file as it was on disk. If it changed shape
+		// between that read and this one, the tree's row/col offsets would
+		// not describe src -- fall back rather than decode a mismatched pair.
+		nl := bytes.Count(src, []byte{'\n'})
+		tail := len(src)
+		if i := bytes.LastIndexByte(src, '\n'); i >= 0 {
+			tail = len(src) - i - 1
+		}
+		if nl != marks[k].row || tail != marks[k].col {
+			return nil, false
+		}
+		h := sha1.Sum(src)
+		b.src = src
+		b.sum = hex.EncodeToString(h[:])
+		batches = append(batches, b)
+	}
+	return batches, true
 }
 
 func (p *tsParser) decodeCST(out, src []byte) *tsTree {
@@ -11605,7 +11794,37 @@ type cstBatch struct {
 	err error
 }
 
-const cstChanCap = 8
+type fileRange struct{ start, end int }
+
+type cstBundle struct {
+	items   []cstBatch
+	results []*fileResult
+}
+
+// cstBatchPlan sizes one CLI batch. Enough files that every worker gets a turn
+// (amortising the per-process grammar load), capped by source bytes so a worker
+// never holds an unbounded CST: output measures ~28x source on this corpus.
+func cstBatchPlan(d *discovered, workers int) (int, int64) {
+	n := len(d.recs)
+	files := (n + workers - 1) / workers
+	if files < 4 {
+		files = 4
+	}
+	if files > 64 {
+		files = 64
+	}
+	if files > n {
+		files = n
+	}
+	budget := d.sourceBytes / int64(2*workers)
+	if budget < 64<<10 {
+		budget = 64 << 10
+	}
+	if budget > 512<<10 {
+		budget = 512 << 10
+	}
+	return files, budget
+}
 
 func parseAll(g *graph, d *discovered, o buildOpts, out *output) int {
 	n := len(d.recs)
@@ -11619,71 +11838,81 @@ func parseAll(g *graph, d *discovered, o buildOpts, out *output) int {
 	if workers > n {
 		workers = n
 	}
-	slots := workers * cstChanCap
-	if slots > n {
-		slots = n
-	}
-	ch := make(chan cstBatch)
-	permits := make(chan struct{}, slots)
-	ring := make([]cstBatch, slots)
-	for i := range ring {
-		ring[i].idx = -1
-	}
-	var next atomic.Int32
-	var wg sync.WaitGroup
-	step := max(1, n/20)
-	done := 0
-	nErr := 0
 
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	// Contiguous ranges, one CLI process each; each worker owns a contiguous
+	// block of ranges and sends whole batches. Decoding stays in file order on
+	// the consumer, so symbol ids are assigned exactly as before.
+	batchFiles, batchBytes := cstBatchPlan(d, workers)
+	ranges := make([]fileRange, 0, n/batchFiles+1)
+	for s := 0; s < n; {
+		e := s
+		var b int64
+		for e < n && e-s < batchFiles && (e == s || b+d.recs[e].size <= batchBytes) {
+			b += d.recs[e].size
+			e++
+		}
+		ranges = append(ranges, fileRange{s, e})
+		s = e
+	}
+	nw := min(workers, len(ranges))
+	chans := make([]chan cstBundle, nw)
+	for i := range chans {
+		chans[i] = make(chan cstBundle, 1)
+	}
+	for w := 0; w < nw; w++ {
+		lo := w * len(ranges) / nw
+		hi := (w + 1) * len(ranges) / nw
+		go func(w, lo, hi int) {
 			p := newCSTReader()
 			defer p.free()
-			for {
-				i := int(next.Add(1) - 1)
-				if i >= n {
-					return
+			pp := newPHPParser()
+			pp.keepTrees = o.keepTrees
+			defer pp.close()
+			for ri := lo; ri < hi; ri++ {
+				r := ranges[ri]
+				items, ok := p.readBatch(d.recs, r.start, r.end)
+				if !ok {
+					items = make([]cstBatch, 0, r.end-r.start)
+					for k := r.start; k < r.end; k++ {
+						items = append(items, p.read(int32(k), d.recs[k]))
+					}
 				}
-				permits <- struct{}{}
-				ch <- p.read(int32(i), d.recs[i])
+				// Decode on the producing goroutine: each parser owns its
+				// scratch and every fileResult is independent, so the consumer
+				// only has to merge in file order.
+				results := make([]*fileResult, len(items))
+				for i := range items {
+					results[i] = pp.decodeFile(items[i])
+				}
+				chans[w] <- cstBundle{items: items, results: results}
 			}
-		}()
+			close(chans[w])
+		}(w, lo, hi)
 	}
 
-	pa := newPHPParser()
-	pa.keepTrees = o.keepTrees
-	defer pa.close()
 	if o.keepTrees {
 		g.astTrees = make([][]tsRec, len(g.fils))
 	}
-	merge := 0
-	for merge < n {
-		b := <-ch
-		ring[b.idx%int32(slots)] = b
-		for {
-			s := &ring[merge%slots]
-			if int(s.idx) != merge {
-				break
-			}
-			fr := pa.decodeFile(*s)
-			if fr == nil {
-				nErr++
-				g.parseFailed = append(g.parseFailed, d.recs[merge].id)
-			} else {
-				mergeFile(g, fr)
-				if g.astTrees != nil && fr.fid >= 1 && int(fr.fid) <= len(g.astTrees) {
-					g.astTrees[fr.fid-1] = fr.trees
-					fr.trees = nil
+	step := max(1, n/20)
+	done := 0
+	nErr := 0
+	for w := 0; w < nw; w++ {
+		for b := range chans[w] {
+			for i, fr := range b.results {
+				if fr == nil {
+					nErr++
+					g.parseFailed = append(g.parseFailed, d.recs[b.items[i].idx].id)
+				} else {
+					mergeFile(g, fr)
+					if g.astTrees != nil && fr.fid >= 1 && int(fr.fid) <= len(g.astTrees) {
+						g.astTrees[fr.fid-1] = fr.trees
+						fr.trees = nil
+					}
 				}
-			}
-			s.idx = -1
-			merge++
-			done++
-			<-permits
-			if !o.quiet && done%step == 0 {
-				out.printf("  ... %d/%d files", done, n)
+				done++
+				if !o.quiet && done%step == 0 {
+					out.printf("  ... %d/%d files", done, n)
+				}
 			}
 		}
 	}

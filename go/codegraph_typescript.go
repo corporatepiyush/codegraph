@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
@@ -12697,129 +12698,245 @@ func grabBuf(free <-chan []byte) []byte {
 	return buf
 }
 
-func readAll(files []pendingFile, order []int, o *Options,
-	items chan<- cstItem, free <-chan []byte, stat *pipeStat) {
-	p := tsParserNew()
-	defer p.free()
-	stg := newTSStage()
-	defer stg.close()
+type cstBatch struct{ lo, hi int }
 
-	t0 := time.Now()
-	var busy, nchild, nbatch int64
-
-	paths := make([]string, 0, tsBatchFiles)
-	cuts := make([]cstPart, 0, tsBatchFiles)
-	parts := make([]cstPart, 0, tsBatchFiles)
-	one := make([]string, 1)
-
+func planBatches(files []pendingFile, order []int) []cstBatch {
+	var out []cstBatch
 	for i := 0; i < len(order); {
-		stg.clear()
 		lang := tsLangOf(files[order[i]].rel)
-		nw, nbytes := 1, files[order[i]].size
-		for i+nw < len(order) && nw < tsBatchFiles && nbytes < tsBatchBytes {
-			fi := order[i+nw]
+		n, nbytes := 1, files[order[i]].size
+		for i+n < len(order) && n < tsBatchFiles && nbytes < tsBatchBytes {
+			fi := order[i+n]
 			if tsLangOf(files[fi].rel) != lang {
 				break
 			}
 			nbytes += files[fi].size
-			nw++
+			n++
 		}
+		out = append(out, cstBatch{i, i + n})
+		i += n
+	}
+	return out
+}
 
-		paths = paths[:0]
-		parts = parts[:0]
-		for n := 0; n < nw; n++ {
-			fi := order[i+n]
-			pf := &files[fi]
-			pf.data = nil
-			pf.parsed = false
-			pf.denied = false
-			if d, err := os.ReadFile(pf.full); err != nil {
-				if os.IsPermission(err) {
-					pf.denied = true
+// batchReader is the per-worker state for decoding CST batches: its own CLI
+// parser, its own staging directory, and scratch slices reused across batches.
+type batchReader struct {
+	p     *tsParser
+	stg   *tsStage
+	free  <-chan []byte
+	paths []string
+	cuts  []cstPart
+	parts []cstPart
+	one   []string
+}
+
+func newBatchReader(free <-chan []byte) *batchReader {
+	return &batchReader{
+		p: tsParserNew(), stg: newTSStage(), free: free,
+		paths: make([]string, 0, tsBatchFiles),
+		cuts:  make([]cstPart, 0, tsBatchFiles),
+		parts: make([]cstPart, 0, tsBatchFiles),
+		one:   make([]string, 1),
+	}
+}
+
+// parseBatch reads and parses batches[bi] and returns exactly the cstItem
+// stream the serial reader emitted for that batch, in the same order. Every
+// returned item owns its buffer and its part slice, so the scratch slices can
+// be reused immediately.
+func (r *batchReader) parseBatch(files []pendingFile, order []int, o *Options,
+	batches []cstBatch, bi int) ([]cstItem, int64, int64, int64) {
+	start, end := batches[bi].lo, batches[bi].hi
+	r.stg.clear()
+	lang := tsLangOf(files[order[start]].rel)
+	var busy, nchild, nbatch int64
+
+	paths := r.paths[:0]
+	parts := r.parts[:0]
+	for n := start; n < end; n++ {
+		fi := order[n]
+		pf := &files[fi]
+		pf.data = nil
+		pf.parsed = false
+		pf.denied = false
+		if d, err := os.ReadFile(pf.full); err != nil {
+			if os.IsPermission(err) {
+				pf.denied = true
+			}
+		} else {
+			pf.data = d
+			scanBuffer(pf, d, o)
+		}
+		if pf.parsed {
+			paths = append(paths, r.stg.put(strconv.Itoa(fi), pf.full, pf.data))
+			parts = append(parts, cstPart{fi: fi, lang: lang, pend: true})
+		} else {
+			parts = append(parts, cstPart{fi: fi, lang: lang})
+		}
+	}
+	r.paths = paths
+	r.parts = parts[:0]
+
+	items := make([]cstItem, 0, 2)
+	if len(paths) == 0 {
+		items = append(items, cstItem{parts: append([]cstPart(nil), parts...)})
+		return items, busy, nchild, nbatch
+	}
+
+	buf := grabBuf(r.free)
+	if len(paths) > 1 {
+		bs := time.Now()
+		parsed, ok := r.p.parse(buf[:0], paths, lang)
+		busy += int64(time.Since(bs))
+		nchild++
+		if ok {
+			r.cuts = cutCST(parsed, r.cuts, lang, len(paths))
+			if len(r.cuts) == len(paths) {
+				nbatch++
+				k := 0
+				for j := range parts {
+					if !parts[j].pend {
+						continue
+					}
+					parts[j].pend = false
+					parts[j].off = r.cuts[k].off
+					parts[j].ln = r.cuts[k].ln
+					parts[j].has = true
+					k++
 				}
-			} else {
-				pf.data = d
-				scanBuffer(pf, d, o)
+				items = append(items, cstItem{buf: parsed,
+					parts: append([]cstPart(nil), parts...)})
+				return items, busy, nchild, nbatch
 			}
-			if pf.parsed {
-				paths = append(paths, stg.put(strconv.Itoa(fi), pf.full, pf.data))
-				parts = append(parts, cstPart{fi: fi, lang: lang, pend: true})
-			} else {
-				parts = append(parts, cstPart{fi: fi, lang: lang})
-			}
+			r.cuts = r.cuts[:0]
 		}
-		i += nw
+	}
 
-		if len(paths) == 0 {
-			items <- cstItem{parts: append([]cstPart(nil), parts...)}
+	k := 0
+	for j := range parts {
+		pt := parts[j]
+		if !pt.pend {
+			items = append(items, cstItem{parts: []cstPart{pt}})
 			continue
 		}
-
-		buf := grabBuf(free)
-		if len(paths) > 1 {
-			bs := time.Now()
-			out, ok := p.parse(buf[:0], paths, lang)
-			busy += int64(time.Since(bs))
-			nchild++
-			if ok {
-				cuts = cutCST(out, cuts, lang, len(paths))
-				if len(cuts) == len(paths) {
-					nbatch++
-					k := 0
-					for j := range parts {
-						if !parts[j].pend {
-							continue
-						}
-						parts[j].pend = false
-						parts[j].off = cuts[k].off
-						parts[j].ln = cuts[k].ln
-						parts[j].has = true
-						k++
-					}
-					items <- cstItem{buf: out,
-						parts: append([]cstPart(nil), parts...)}
-					continue
-				}
-				cuts = cuts[:0]
-			}
+		pf := &files[pt.fi]
+		r.one[0] = paths[k]
+		k++
+		bs := time.Now()
+		parsed, ok := r.p.parse(buf[:0], r.one, lang)
+		busy += int64(time.Since(bs))
+		nchild++
+		if !ok {
+			pf.parsed = false
+			pf.data = nil
+			items = append(items, cstItem{parts: []cstPart{{fi: pt.fi, lang: lang}}})
+			parsed = nil
+		} else {
+			items = append(items, cstItem{buf: parsed, parts: []cstPart{{
+				fi: pt.fi, off: 0, ln: int32(len(parsed)), lang: lang,
+				has: true}}})
 		}
+		if parsed == nil {
+			buf = grabBuf(r.free)
+		} else {
+			buf = parsed
+		}
+	}
+	return items, busy, nchild, nbatch
+}
 
-		k := 0
-		for j := range parts {
-			pt := parts[j]
-			if !pt.pend {
-				items <- cstItem{parts: []cstPart{pt}}
-				continue
-			}
-			pf := &files[pt.fi]
-			one[0] = paths[k]
-			k++
-			bs := time.Now()
-			out, ok := p.parse(buf[:0], one, lang)
-			busy += int64(time.Since(bs))
-			nchild++
+type cstResult struct {
+	batch int
+	items []cstItem
+}
+
+// readWorker pulls batches off a shared counter in index order and parses
+// them, so a slow batch only delays the in-order stream, never the other
+// workers. results is consumed by readAll's reorder buffer.
+func readWorker(files []pendingFile, order []int, o *Options, batches []cstBatch,
+	next *atomic.Int64, results chan<- cstResult, tokens chan struct{},
+	free <-chan []byte, stat *pipeStat) {
+	r := newBatchReader(free)
+	defer r.p.free()
+	defer r.stg.close()
+
+	t0 := time.Now()
+	for {
+		bi := int(next.Add(1)) - 1
+		if bi >= len(batches) {
+			break
+		}
+		// A token is held from the start of a batch until that batch is
+		// emitted in order; the pool bounds how far ahead of the in-order
+		// stream the workers may run, and therefore how many CST buffers
+		// the reorder buffer can hold at once.
+		tokens <- struct{}{}
+		items, busy, nchild, nbatch := r.parseBatch(files, order, o, batches, bi)
+		results <- cstResult{batch: bi, items: items}
+		stat.readerBusy += busy
+		stat.children += nchild
+		stat.nbatch += nbatch
+	}
+	stat.readerWall = int64(time.Since(t0))
+}
+
+func readAll(files []pendingFile, order []int, o *Options,
+	items chan<- cstItem, free <-chan []byte, stat *pipeStat) {
+	batches := planBatches(files, order)
+	if len(batches) == 0 {
+		close(items)
+		return
+	}
+	nw := o.Workers
+	if nw < 1 {
+		nw = 1
+	}
+	if nw > len(batches) {
+		nw = len(batches)
+	}
+
+	var next atomic.Int64
+	results := make(chan cstResult, nw)
+	tokens := make(chan struct{}, 2*nw)
+	stats := make([]pipeStat, nw)
+	var wg sync.WaitGroup
+	for w := 0; w < nw; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			readWorker(files, order, o, batches, &next, results, tokens, free, &stats[w])
+		}(w)
+	}
+
+	pending := make(map[int][]cstItem, nw+2)
+	emit := 0
+	for emit < len(batches) {
+		res := <-results
+		pending[res.batch] = res.items
+		for {
+			its, ok := pending[emit]
 			if !ok {
-				pf.parsed = false
-				pf.data = nil
-				items <- cstItem{parts: []cstPart{{fi: pt.fi, lang: lang}}}
-				out = nil
-			} else {
-				items <- cstItem{buf: out, parts: []cstPart{{
-					fi: pt.fi, off: 0, ln: int32(len(out)), lang: lang,
-					has: true}}}
+				break
 			}
-			if out == nil {
-				buf = grabBuf(free)
-			} else {
-				buf = out
+			delete(pending, emit)
+			for _, it := range its {
+				items <- it
 			}
+			<-tokens
+			emit++
 		}
 	}
 	close(items)
-	stat.readerWall = int64(time.Since(t0))
-	stat.readerBusy = busy
-	stat.children = nchild
-	stat.nbatch = nbatch
+	wg.Wait()
+	for w := range stats {
+		if stats[w].readerWall > stat.readerWall {
+			stat.readerWall = stats[w].readerWall
+		}
+		stat.readerBusy += stats[w].readerBusy
+		stat.children += stats[w].children
+		stat.nbatch += stats[w].nbatch
+	}
 }
 
 type pipeStat struct {
