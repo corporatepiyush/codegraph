@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
@@ -899,7 +898,14 @@ type apiuseW struct {
 	Line     int32
 }
 
+type parseMsg struct {
+	fileID int32
+	line   int32
+	msg    string
+}
+
 type fileOut struct {
+	perr                      []parseMsg
 	symA                      *symBlock
 	symLo, symN               int32
 	rareN                     int32
@@ -998,15 +1004,20 @@ func (a *symBlock) at(lo, n int32) []symW {
 }
 
 type fnSite struct {
-	name string
-	sid  int32
-	fid  int32
-	mid  int32
+	static bool
+	name   string
+	sid    int32
+	fid    int32
+	mid    int32
 }
 
 type Graph struct {
 	Modules []Module
 	Files   []File
+
+	// what the parser could not read, for --parse-errors. Not part of the
+	// graph and not saved: it describes this run, not the code.
+	ParseMsgs []parseMsg
 
 	Symbols  []*Symbol
 	symStore []Symbol
@@ -1080,109 +1091,6 @@ func realpath(p string) string {
 	return r
 }
 
-func decodeReplace(data []byte) []byte {
-	i := 0
-	for i < len(data) {
-		if data[i] < 0x80 {
-			i++
-			continue
-		}
-		n := utf8SeqLen(data[i])
-		if n == 0 || i+n > len(data) || !validSeq(data[i:i+n]) {
-			return decodeSlow(data)
-		}
-		i += n
-	}
-	return data
-}
-
-func utf8SeqLen(b byte) int {
-	switch {
-	case b&0xE0 == 0xC0:
-		return 2
-	case b&0xF0 == 0xE0:
-		return 3
-	case b&0xF8 == 0xF0:
-		return 4
-	}
-	return 0
-}
-
-func validSeq(s []byte) bool {
-	switch len(s) {
-	case 2:
-		return s[0] >= 0xC2 && s[1]&0xC0 == 0x80
-	case 3:
-		if s[1] < 0x80 {
-			return false
-		}
-		if s[0] == 0xE0 {
-			return s[1] >= 0xA0
-		}
-		if s[0] == 0xED {
-			return s[1] <= 0x9F
-		}
-		return s[1]&0xC0 == 0x80 && s[2]&0xC0 == 0x80
-	case 4:
-		if s[0] == 0xF0 {
-			return s[1] >= 0x90
-		}
-		if s[0] == 0xF4 {
-			return s[1] <= 0x8F
-		}
-		return s[0] >= 0xF1 && s[0] <= 0xF3 &&
-			s[1]&0xC0 == 0x80 && s[2]&0xC0 == 0x80 && s[3]&0xC0 == 0x80
-	}
-	return false
-}
-
-func decodeSlow(data []byte) []byte {
-	out := make([]byte, 0, len(data)+16)
-	for i := 0; i < len(data); {
-		c := data[i]
-		if c < 0x80 {
-			out = append(out, c)
-			i++
-			continue
-		}
-		n := utf8SeqLen(c)
-		if n > 0 && i+n <= len(data) && validSeq(data[i:i+n]) {
-			out = append(out, data[i:i+n]...)
-			i += n
-			continue
-		}
-
-		j := i + 1
-		for k := 1; k < n && j < len(data); k++ {
-			if data[j]&0xC0 != 0x80 {
-				break
-			}
-			if k == 1 && !leadSecondOK(c, data[j]) {
-				break
-			}
-			j++
-		}
-		out = append(out, ef...)
-		i = j
-	}
-	return out
-}
-
-func leadSecondOK(lead, b byte) bool {
-	lo, hi := byte(0x80), byte(0xBF)
-	switch lead {
-	case 0xE0:
-		lo = 0xA0
-	case 0xED:
-		hi = 0x9F
-	case 0xF0:
-		lo = 0x90
-	case 0xF4:
-		hi = 0x8F
-	}
-	return b >= lo && b <= hi
-}
-
 var ef = []byte{0xEF, 0xBF, 0xBD}
 
 func runeLen(b []byte) int {
@@ -1205,16 +1113,6 @@ func isIdentPart(c byte) bool {
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
-func isWS(c byte) bool {
-	switch c {
-	case ' ', '\t', '\r', '\n', '\v', '\f':
-		return true
-	case 0x1c, 0x1d, 0x1e, 0x1f, 0x85, 0xa0:
-		return true
-	}
-	return false
-}
-
 func isStripSpace(c byte) bool {
 	switch c {
 	case ' ', '\t', '\r', '\n', '\v', '\f', 0x1c, 0x1d, 0x1e, 0x1f, 0x85, 0xa0:
@@ -1225,14 +1123,6 @@ func isStripSpace(c byte) bool {
 
 func isHardWS(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
-}
-
-func lstripIdx(s string) int {
-	i := 0
-	for i < len(s) && (isHardWS(s[i]) || s[i] == '\v' || s[i] == '\f') {
-		i++
-	}
-	return i
 }
 
 func trimSpace(s string) string {
@@ -1278,37 +1168,6 @@ func wordBefore(b []byte, i int) bool {
 func wordAfter(b []byte, i int) bool {
 	return i < len(b) && isWordByte(b[i])
 }
-func sizeishName(w string) bool {
-	switch w {
-	case "len", "size", "count":
-		return true
-	}
-	for _, suf := range [...]string{"len", "size", "cnt", "count"} {
-		if len(w) > len(suf) && strings.HasSuffix(w, suf) {
-			head := w[:len(w)-len(suf)]
-			ok := true
-			for i := 0; i < len(head); i++ {
-				if !isIdentPart(head[i]) {
-					ok = false
-					break
-				}
-			}
-			if ok {
-				return true
-			}
-		}
-	}
-	if len(w) >= 3 && w[0] == 'n' && w[1] == '_' && w[2] >= 'a' && w[2] <= 'z' {
-		return true
-	}
-	return false
-}
-func skipHTStr(s string, i int) int {
-	for i < len(s) && isPySpace(s[i]) {
-		i++
-	}
-	return i
-}
 func identEndStr(s string, i int) int {
 	if i >= len(s) || !isIdentStart(s[i]) {
 		return i
@@ -1324,22 +1183,6 @@ func pathBase(p string) string {
 		return p[i+1:]
 	}
 	return p
-}
-func isPySpace(c byte) bool {
-	switch c {
-	case ' ', '\t', '\n', '\r', '\v', '\f':
-		return true
-	}
-	return false
-}
-
-func isBlank(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if !isStripSpace(s[i]) {
-			return false
-		}
-	}
-	return true
 }
 
 func splitBounds(b []byte) (int, []int32, int) {
@@ -1432,19 +1275,6 @@ func nlOffsets(b []byte) []int32 {
 		}
 	}
 	return offs
-}
-
-func lineOf(offs []int32, pos int) int {
-	lo, hi := 0, len(offs)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		if int(offs[mid]) <= pos {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return lo + 1
 }
 
 func blankBuf(buf []byte, src []byte) []byte {
@@ -1540,46 +1370,6 @@ func indexByteFrom(b []byte, c byte, from int) int {
 		}
 	}
 	return -1
-}
-
-func lastIndexByte(b []byte, c byte) int {
-	for i, v := range slices.Backward(b) {
-		if v == c {
-			return i
-		}
-	}
-	return -1
-}
-
-func lastIndexStr(b []byte, s string) int {
-	if len(b) < len(s) {
-		return -1
-	}
-	for i := len(b) - len(s); i >= 0; i-- {
-		if string(b[i:i+len(s)]) == s {
-			return i
-		}
-	}
-	return -1
-}
-
-func sortStrings(s []string) { sort.Strings(s) }
-
-func eachSplitLine(b []byte, fn func(lnNo int, seg []byte)) {
-	n, start, i := 1, 0, 0
-	for i < len(b) {
-		if isSplitBound(b, i) {
-			fn(n, b[start:i])
-			i = skipBoundary(b, i)
-			start = i
-			n++
-			continue
-		}
-		i++
-	}
-	if start < len(b) || n == 1 {
-		fn(n, b[start:])
-	}
 }
 
 func cgRepr(f float64) string {
@@ -1763,8 +1553,6 @@ var cKeywords = map[string]bool{
 	"volatile":       true,
 	"while":          true,
 }
-
-func isKeywordBytes(b []byte) bool { return cKeywords[string(b)] }
 
 var typeWords = map[string]bool{
 	"_Atomic":  true,
@@ -4515,27 +4303,6 @@ func cTestName(fn string) bool {
 
 var cmtPrefixes = [...]string{"//", "#", "/*", "*", "*/", `"""`, "'''", "--", ";;", "%"}
 
-func isCommentLine(line string) bool {
-	s := strings.TrimLeft(line, " \t")
-	if len(s) > 3 {
-		s = s[:3]
-	} else if len(s) < 3 {
-
-		for _, p := range cmtPrefixes {
-			if s == p {
-				return len(strings.TrimSpace(line)) > 0
-			}
-		}
-		return false
-	}
-	for _, p := range cmtPrefixes {
-		if s == p {
-			return len(strings.TrimSpace(line)) > 0
-		}
-	}
-	return false
-}
-
 type walker struct {
 	g        *Graph
 	root     string
@@ -4656,7 +4423,10 @@ func (w *walker) consider(full, fn string, viaLink bool) {
 		}
 	}
 	rel := filepath.ToSlash(mustRel(w.root, full))
-	nLines, sloc, blank, cmt, maxLine := fileLineStatsBytes(data)
+	nLines, _, _, _, maxLine := fileLineStatsBytes(data)
+	codeL, cmtL, _ := classifyLines(data)
+	sloc, cmt := int(codeL), int(cmtL)
+	blank := max(nLines-sloc-cmt, 0)
 	head := data
 	if len(head) > 2000 {
 		head = head[:2000]
@@ -4740,6 +4510,85 @@ func hasLongLine(data []byte) bool {
 		}
 	}
 	return false
+}
+
+// classifyLines counts the lines of C text that hold code, the lines that
+// hold only comment, and the lines that hold nothing. A line with both is
+// code. It tracks block comments across lines and does not look for comment
+// openers inside string or character literals.
+//
+// It replaces two prefix tests: one compared a line's first THREE bytes for
+// equality with a two-byte opener and so never matched (a 959-line file
+// reported 3 comment lines), the other took any line starting with `*` for a
+// comment, `*p = 0;` included. And "sloc" was every non-blank line, licence
+// header and all.
+func classifyLines(b []byte) (code, cmt, blank int32) {
+	inBlock := false
+	hasCode, hasCmt := false, false
+	endLine := func() {
+		switch {
+		case hasCode:
+			code++
+		case hasCmt:
+			cmt++
+		default:
+			blank++
+		}
+		hasCode, hasCmt = false, false
+	}
+	n := len(b)
+	for i := 0; i < n; i++ {
+		c := b[i]
+		if c == '\n' || c == '\r' {
+			if c == '\r' && i+1 < n && b[i+1] == '\n' {
+				i++
+			}
+			endLine()
+			continue
+		}
+		if inBlock {
+			if c == '*' && i+1 < n && b[i+1] == '/' {
+				inBlock = false
+				hasCmt = true
+				i++
+			} else if c != ' ' && c != '\t' {
+				hasCmt = true
+			}
+			continue
+		}
+		switch c {
+		case ' ', '\t', '\f', '\v':
+		case '/':
+			if i+1 < n && b[i+1] == '/' {
+				hasCmt = true
+				for i+1 < n && b[i+1] != '\n' && b[i+1] != '\r' {
+					i++
+				}
+			} else if i+1 < n && b[i+1] == '*' {
+				inBlock, hasCmt = true, true
+				i++
+			} else {
+				hasCode = true
+			}
+		case '"', '\'':
+			hasCode = true
+			for i+1 < n && b[i+1] != c && b[i+1] != '\n' && b[i+1] != '\r' {
+				if b[i+1] == '\\' && i+2 < n && b[i+2] != '\n' && b[i+2] != '\r' {
+					i++
+				}
+				i++
+			}
+			if i+1 < n && b[i+1] == c {
+				i++
+			}
+		default:
+			hasCode = true
+		}
+	}
+	if hasCode || hasCmt {
+		endLine()
+	}
+	return
 }
 
 func fileLineStatsBytes(b []byte) (n, sloc, blank, cmt, maxLen int) {
@@ -4840,16 +4689,6 @@ func wEnd(b []byte, i int) int {
 	return i
 }
 
-func countByte(b []byte, c byte) int {
-	n := 0
-	for _, x := range b {
-		if x == c {
-			n++
-		}
-	}
-	return n
-}
-
 func countStr(b []byte, s string) int {
 	if len(s) == 0 {
 		return 0
@@ -4892,13 +4731,6 @@ func countCast(b []byte) int {
 }
 
 var compoundOps = [...]string{"+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="}
-
-func skipLine(b []byte, i int) int {
-	for i < len(b) && b[i] != '\n' {
-		i++
-	}
-	return i + 1
-}
 
 func intrinsicName(w string) bool {
 	lo := func(c byte) bool {
@@ -4944,15 +4776,6 @@ func intrinsicName(w string) bool {
 		return splitAt(2)
 	}
 	return false
-}
-
-func atLineStart(b []byte, i int) bool {
-	if i == 0 {
-		return true
-	}
-	c := b[i-1]
-	return c == '\n' || c == '\r' || c == 0x0b || c == 0x0c || c == 0x1c ||
-		c == 0x1d || c == 0x1e
 }
 
 var blankPool = sync.Pool{New: func() any { return new([]byte) }}
@@ -5120,14 +4943,92 @@ func countSignedCmp(b []byte) int {
 
 type memopHitUnused struct{}
 
-func isLockShaped(name string) bool {
-	low := asciiLower(name)
-	if strings.Contains(low, "lock") || strings.Contains(low, "mutex") ||
-		strings.HasSuffix(low, "_lck") || strings.HasPrefix(low, "sem") ||
-		strings.Contains(low, "spin") {
-		return true
+// lockWord classifies one word of an identifier: 1 acquire, 2 release, 3 a lock
+// word that is neither (mutex, sem), 0 not about locking. Words, because the
+// substring test this replaces matched `block`, `unblock`, `clock` and
+// `deadlock`: on redis 5 of 6 rows in the locks table were not locks.
+func lockWord(w string) int {
+	switch w {
+	case "lock", "trylock", "rdlock", "wrlock", "tryrdlock", "trywrlock",
+		"timedlock", "timedrdlock", "timedwrlock", "spinlock", "acquire":
+		return 1
+	case "unlock", "release":
+		return 2
+	case "mutex", "mtx", "rwlock", "spin", "sem", "semaphore", "futex", "lck",
+		"locked", "unlocked":
+		return 3
 	}
-	return false
+	return 0
+}
+
+// lockShape splits name on `_` and on lower-to-upper case changes and reports
+// (is about a lock, acquires, releases). `acquire` and `release` only count
+// beside a real lock word, since both are ordinary verbs.
+func lockShape(name string) (shaped, acq, rel bool) {
+	var words [12]string
+	nw := 0
+	start := 0
+	flush := func(end int) {
+		if end > start && nw < len(words) {
+			words[nw] = asciiLower(name[start:end])
+			nw++
+		}
+		start = end
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c == '_':
+			flush(i)
+			start = i + 1
+		case c >= 'A' && c <= 'Z' && i > 0 && name[i-1] >= 'a' && name[i-1] <= 'z':
+			flush(i)
+		}
+	}
+	flush(len(name))
+	hard := false
+	verbAcq, verbRel := false, false
+	for _, w := range words[:nw] {
+		switch lockWord(w) {
+		case 1:
+			if w == "acquire" {
+				verbAcq = true
+			} else {
+				acq, hard = true, true
+			}
+		case 2:
+			if w == "release" {
+				verbRel = true
+			} else {
+				rel, hard = true, true
+			}
+		case 3:
+			hard = true
+		}
+	}
+	if !hard {
+		// advisory file locks: whether one acquires is in its ARGUMENT
+		// (LOCK_UN, F_ULOCK), which the caller checks
+		switch name {
+		case "flock", "lockf", "flockfile", "ftrylockfile":
+			return true, true, false
+		case "funlockfile":
+			return true, false, true
+		}
+		return false, false, false
+	}
+	if rel || verbRel {
+		return true, false, true
+	}
+	if w0 := words[0]; nw > 1 && w0 == "sem" {
+		switch words[nw-1] {
+		case "wait", "trywait", "timedwait":
+			return true, true, false
+		case "post":
+			return true, false, true
+		}
+	}
+	return true, acq || verbAcq, false
 }
 
 var narrowTypes = [...]string{"uint8_t", "int8_t", "uint16_t", "int16_t",
@@ -5174,97 +5075,6 @@ func countNarrowCasts(b []byte) int {
 }
 
 type signCmpHit struct{ name string }
-
-func cmpWidth(b []byte, i int) int {
-	for _, op := range [...]string{"<=", ">=", "==", "!=", "<", ">"} {
-		if isWordAt(b, i, op) {
-			return len(op)
-		}
-	}
-	return 0
-}
-
-func scanSignCmps(b []byte, fn func(signCmpHit)) {
-	for i := 0; i < len(b); {
-		if n, name := signCmpArm1(b, i); n > 0 {
-			fn(signCmpHit{name: name})
-			i += n
-			continue
-		}
-		if n, name := signCmpArm2(b, i); n > 0 {
-			fn(signCmpHit{name: name})
-			i += n
-			continue
-		}
-		i++
-	}
-}
-
-func signCmpArm1(b []byte, i int) (int, string) {
-	if !isIdentStart(b[i]) || wordBefore(b, i) {
-		return 0, ""
-	}
-	w := b[i:identEnd(b, i)]
-	if string(w) != "if" && string(w) != "while" && string(w) != "for" {
-		return 0, ""
-	}
-	j := skipHardWS(b, i+len(w))
-	if j >= len(b) || b[j] != '(' {
-		return 0, ""
-	}
-	j = skipHardWS(b, j+1)
-	if j < len(b) && b[j] == '!' {
-		j = skipHardWS(b, j+1)
-	}
-	nameEnd := identEnd(b, j)
-	if nameEnd == j {
-		return 0, ""
-	}
-	name := string(b[j:nameEnd])
-	k := skipHardWS(b, nameEnd)
-	w2 := cmpWidth(b, k)
-	if w2 == 0 {
-		return 0, ""
-	}
-	k += w2
-	k = skipHardWS(b, k)
-	if isWordAt(b, k, "sizeof") && !wordAfter(b, k+6) {
-		m := skipHardWS(b, k+6)
-		if m < len(b) && b[m] == '(' {
-			m = skipHardWS(b, m+1)
-			q := skipHardWS(b, wEnd(b, m))
-			if q < len(b) && b[q] == ')' {
-				return q + 1 - i, name
-			}
-		}
-
-		return k + 6 - i, name
-	}
-	if e := identEnd(b, k); e > k {
-		return e - i, name
-	}
-	return 0, ""
-}
-
-func signCmpArm2(b []byte, i int) (int, string) {
-	if !isIdentStart(b[i]) || wordBefore(b, i) {
-		return 0, ""
-	}
-	e := identEnd(b, i)
-	if !sizeishName(string(b[i:e])) || wordAfter(b, e) {
-		return 0, ""
-	}
-	k := skipHardWS(b, e)
-	w2 := cmpWidth(b, k)
-	if w2 == 0 {
-		return 0, ""
-	}
-	k = skipHardWS(b, k+w2)
-	if e2 := identEnd(b, k); e2 > k {
-		return e2 - i, string(b[i:e])
-	}
-	return 0, ""
-}
 
 func gRetNeg(b []byte) int {
 	n := 0
@@ -5775,29 +5585,6 @@ func scanUringBarrier(b []byte) int {
 	return n
 }
 
-func scanFirstArgCall(b []byte, names []string, fn func(name string)) {
-	for i := range b {
-		if !isIdentStart(b[i]) || wordBefore(b, i) {
-			continue
-		}
-		e := identEnd(b, i)
-		w := string(b[i:e])
-		hit := slices.Contains(names, w)
-		if !hit {
-			continue
-		}
-		j := skipHardWS(b, e)
-		if j >= len(b) || b[j] != '(' {
-			continue
-		}
-		j = skipHardWS(b, j+1)
-		k := identEnd(b, j)
-		if k > j {
-			fn(string(b[j:k]))
-		}
-	}
-}
-
 func countCall(b []byte, names ...string) int {
 	n := 0
 	for i := 0; i < len(b); i++ {
@@ -5878,55 +5665,6 @@ func countReallocSelf(b []byte) int {
 	return n
 }
 
-func countVLA(b []byte) int {
-	n := 0
-	for i := 0; i < len(b); i++ {
-		if !isIdentStart(b[i]) || wordBefore(b, i) {
-			continue
-		}
-		e := identEnd(b, i)
-		w := string(b[i:e])
-		ok := false
-		switch w {
-		case "char", "int", "double", "float", "short", "long", "unsigned":
-			ok = true
-		default:
-			if (strings.HasPrefix(w, "uint") || strings.HasPrefix(w, "int")) &&
-				strings.HasSuffix(w, "_t") && len(w) > 5 {
-				ok = true
-				for _, c := range w[4 : len(w)-2] {
-					if !isDigit(byte(c)) {
-						ok = false
-					}
-				}
-			}
-		}
-		if !ok {
-			continue
-		}
-		j := skipHardWS(b, e)
-		k := identEnd(b, j)
-		if k == j {
-			continue
-		}
-		j = skipHardWS(b, k)
-		if j >= len(b) || b[j] != '[' {
-			continue
-		}
-		j = skipHardWS(b, j+1)
-		if j >= len(b) || !isIdentStart(b[j]) {
-			continue
-		}
-		m := identEnd(b, j)
-		m = skipHardWS(b, m)
-		if m < len(b) && b[m] == ']' {
-			n++
-			i = m
-		}
-	}
-	return n
-}
-
 func countAssertSide(b []byte) int {
 	n := 0
 	alt := func(i int) bool {
@@ -5935,6 +5673,18 @@ func countAssertSide(b []byte) int {
 			return true
 		}
 		if i+1 < len(b) && b[i] == '=' && b[i+1] != '=' {
+			// `==`, `!=`, `<=` and `>=` end in an `=` that assigns nothing;
+			// `<<=` and `>>=` do assign
+			prev := byte(0)
+			if i > 0 {
+				prev = b[i-1]
+			}
+			switch prev {
+			case '=', '!':
+				return false
+			case '<', '>':
+				return i > 1 && b[i-2] == prev
+			}
 			return true
 		}
 		return i+1 < len(b) && ((b[i] == '+' && b[i+1] == '+') ||
@@ -6038,52 +5788,8 @@ func derefAfter(tail []byte, name string) bool {
 	return false
 }
 
-func eachLineStart(b []byte, fn func(start, j int) int) {
-	for i := 0; i < len(b); {
-		if !atLineStart(b, i) {
-			i++
-			continue
-		}
-		switch r := fn(i, skipHT(b, i)); {
-		case r < 0:
-			return
-		case r > 0:
-			i = r
-		default:
-			i = skipLine(b, i)
-		}
-	}
-}
-
 func isWordAt(b []byte, i int, s string) bool {
 	return i+len(s) <= len(b) && string(b[i:i+len(s)]) == s
-}
-
-func squeezeStr(s []byte) string {
-	var sb strings.Builder
-	sb.Grow(len(s))
-	sp := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' ||
-			c == '\f' || c == 0x1c || c == 0x1d || c == 0x1e {
-			sp = true
-			continue
-		}
-		if sp {
-			sb.WriteByte(' ')
-			sp = false
-		}
-		sb.WriteByte(c)
-	}
-	if sp {
-		sb.WriteByte(' ')
-	}
-	return sb.String()
-}
-
-func isHexDigit(c byte) bool {
-	return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
 func asciiLower(s string) string {
@@ -6094,29 +5800,6 @@ func asciiLower(s string) string {
 		}
 	}
 	return string(b)
-}
-
-func containsFold(hay, pat string) bool {
-	if len(pat) == 0 || len(pat) > len(hay) {
-		return false
-	}
-	for i := 0; i+len(pat) <= len(hay); i++ {
-		ok := true
-		for j := 0; j < len(pat); j++ {
-			c := hay[i+j]
-			if c >= 'A' && c <= 'Z' {
-				c += 32
-			}
-			if c != pat[j] {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return true
-		}
-	}
-	return false
 }
 
 var secretPats = func() []string {
@@ -6151,6 +5834,11 @@ type extractor struct {
 	fnByName                              map[string][]int32
 	fnByNameF                             map[string][]int32
 	fnByNameM                             map[string][]int32
+	fnByNameS                             map[string][]bool
+	incAdj                                map[int32][]int32
+	pickMore                              []int
+	ambigN                                int32
+	incReach                              map[int32]map[int32]bool
 	macroSID                              map[string]int32
 	declared                              map[string]bool
 	byBasename                            map[string]int32
@@ -6171,6 +5859,7 @@ func newExtractor(g *Graph) *extractor {
 		fnByName:   map[string][]int32{},
 		fnByNameF:  map[string][]int32{},
 		fnByNameM:  map[string][]int32{},
+		fnByNameS:  map[string][]bool{},
 		macroSID:   map[string]int32{},
 		declared:   map[string]bool{},
 		byBasename: map[string]int32{},
@@ -6187,6 +5876,11 @@ type fld struct {
 	depth   int32
 	inUnion int32
 	line    int32
+
+	// size already known from a definition in this file: a nested or
+	// earlier struct/union, or a typedef of one
+	kn            bool
+	ksz, kal, kex int32
 }
 
 func jtrunc(s string, n int) string {
@@ -6280,6 +5974,54 @@ func replaceWord(s, w, rep string) string {
 	return sb.String()
 }
 
+// size is one member's (bytes, alignment, exact).
+func (f *fld) size() (int32, int32, int32) {
+	sz, al, ex := typeSizeOf(f.ftype, f.ptr, f.alen)
+	if f.kn && f.ptr == 0 {
+		sz, al, ex = f.ksz, f.kal, f.kex
+		if f.alen > 0 {
+			sz *= f.alen
+		} else if f.alen < 0 {
+			sz, ex = 0, 0
+		}
+	}
+	return sz, al, ex
+}
+
+// packedSize is the smallest size the struct's direct members can occupy:
+// what a compiler produces when they are declared widest-alignment-first.
+// Sorting by alignment is optimal here because every alignment is a power of
+// two and every size is a multiple of its own alignment, so no hole can open
+// between two members -- only tail padding remains. Returns 0 unless every
+// member is exactly sized.
+func packedSize(flds []fld) int32 {
+	type sa struct{ sz, al int32 }
+	var m []sa
+	for i := range flds {
+		if flds[i].depth != 0 || flds[i].inUnion != 0 {
+			continue
+		}
+		sz, al, ex := flds[i].size()
+		if ex == 0 || al <= 0 {
+			return 0
+		}
+		m = append(m, sa{sz, al})
+	}
+	sort.SliceStable(m, func(i, j int) bool { return m[i].al > m[j].al })
+	off, maxAl := int32(0), int32(1)
+	for _, x := range m {
+		if r := off % x.al; r != 0 {
+			off += x.al - r
+		}
+		off += x.sz
+		maxAl = max(maxAl, x.al)
+	}
+	if r := off % maxAl; r != 0 {
+		off += maxAl - r
+	}
+	return off
+}
+
 func layoutStruct(flds []fld, isUnion bool) ([][5]int32, int32, int32, int32, int32) {
 	off := int32(0)
 	maxAlign := int32(1)
@@ -6290,7 +6032,7 @@ func layoutStruct(flds []fld, isUnion bool) ([][5]int32, int32, int32, int32, in
 			out = append(out, [5]int32{f.ordinal, -1, 0, 0, 0})
 			continue
 		}
-		sz, al, ex := typeSizeOf(f.ftype, f.ptr, f.alen)
+		sz, al, ex := f.size()
 		if ex == 0 {
 			allExact = 0
 		}
@@ -6378,31 +6120,6 @@ func eventFamily(fn string) string {
 	return "kqueue"
 }
 
-func matchBraceClose(b []byte, openIdx int) int {
-	d := 0
-	for i := openIdx; i < len(b); i++ {
-		switch b[i] {
-		case '{':
-			d++
-		case '}':
-			d--
-			if d == 0 {
-				return i
-			}
-		}
-	}
-	return -1
-}
-
-func isCompoundOp(s string) bool {
-	for _, c := range compoundOps {
-		if c == s {
-			return true
-		}
-	}
-	return false
-}
-
 func nsIntersects(used, want map[string]bool) bool {
 	for k := range want {
 		if used[k] {
@@ -6442,75 +6159,7 @@ func countGuard(g string, b []byte) int {
 	return 0
 }
 
-func sizeofArg(s string) (string, bool) {
-	i := strings.Index(s, "sizeof")
-	if i < 0 {
-		return "", false
-	}
-	j := i + 6
-	for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
-		j++
-	}
-	if j >= len(s) || s[j] != '(' {
-		return "", false
-	}
-	k := j + 1
-	for k < len(s) && (s[k] == ' ' || s[k] == '\t' || s[k] == '\n' || s[k] == '\r') {
-		k++
-	}
-	e := k
-	for e < len(s) && s[e] != ')' && s[e] != '\n' {
-		e++
-	}
-	if e >= len(s) || s[e] != ')' {
-		return "", false
-	}
-	return strings.TrimRight(s[k:e], " \t\r\n"), true
-}
-
 var typedSizeofWords = []string{"struct", "union", "enum"}
-
-func typedSizeof(operand string) bool {
-	for _, w := range typedSizeofWords {
-		if strings.HasPrefix(operand, w+" ") {
-			r := skipHTStr(operand, len(w))
-			return r > len(w) && identEndStr(operand, r) > r
-		}
-	}
-	for _, t := range [...]string{"uint8_t", "uint16_t", "uint32_t", "uint64_t",
-		"int8_t", "int16_t", "int32_t", "int64_t"} {
-		if strings.HasPrefix(operand, t) {
-			return true
-		}
-	}
-	for _, t := range [...]string{"char", "int", "long", "short", "float",
-		"double", "size_t"} {
-		if strings.HasPrefix(operand, t) {
-			return true
-		}
-	}
-	if strings.HasPrefix(operand, "unsigned") {
-		r := skipHTStr(operand, 8)
-		return r > 8 && identEndStr(operand, r) > r
-	}
-	return false
-}
-
-func trailingIdent(operand string) (string, bool) {
-	e := len(operand)
-	for e > 0 && (operand[e-1] == ' ' || operand[e-1] == '\t' ||
-		operand[e-1] == '\n' || operand[e-1] == '\r') {
-		e--
-	}
-	st := e
-	for st > 0 && isIdentPart(operand[st-1]) {
-		st--
-	}
-	if st == e {
-		return "", false
-	}
-	return operand[st:e], true
-}
 
 func firstIdent(s string) (string, bool) {
 	for i := 0; i < len(s); i++ {
@@ -6549,134 +6198,7 @@ func isPathTailSep(c byte) bool {
 	return c == '.' || c == '>' || c == '[' || c == ']'
 }
 
-func scanAttrs(sig string, fn func(args string)) {
-	i := 0
-	for {
-		j := strings.Index(sig[i:], "__attribute__")
-		if j < 0 {
-			return
-		}
-		j += i
-		k := j + 13
-		for k < len(sig) && (sig[k] == ' ' || sig[k] == '\t' || sig[k] == '\n' || sig[k] == '\r') {
-			k++
-		}
-		if k+2 > len(sig) || sig[k] != '(' || sig[k+1] != '(' {
-			i = j + 1
-			continue
-		}
-		k += 2
-		e := k
-		for e < len(sig) && sig[e] != ')' {
-			e++
-		}
-		if e+1 >= len(sig) || sig[e+1] != ')' {
-			i = j + 1
-			continue
-		}
-		fn(sig[k:e])
-		i = e + 2
-	}
-}
-
 var magicOKCache sync.Map
-
-func okMagic(tok string) bool {
-	if v, ok := magicOKCache.Load(tok); ok {
-		return v.(bool)
-	}
-	t := strings.TrimRight(tok, "uUlL")
-	n, ok := cgInt0(t)
-	r := ok && magicOK[n]
-	magicOKCache.Store(tok, r)
-	return r
-}
-
-func cgInt0(s string) (int64, bool) {
-	neg := false
-	if s != "" && (s[0] == '+' || s[0] == '-') {
-		neg = s[0] == '-'
-		s = s[1:]
-	}
-	if s == "" {
-		return 0, false
-	}
-	base := 10
-	body := s
-	if s[0] == '0' && len(s) > 1 {
-		switch {
-		case s[1] == 'x' || s[1] == 'X':
-			base, body = 16, s[2:]
-		case s[1] == 'o' || s[1] == 'O':
-			base, body = 8, s[2:]
-		case s[1] == 'b' || s[1] == 'B':
-			base, body = 2, s[2:]
-		default:
-
-			allZero := true
-			for i := 0; i < len(s); i++ {
-				if s[i] != '0' {
-					allZero = false
-					break
-				}
-			}
-			if !allZero {
-				return 0, false
-			}
-			return 0, true
-		}
-	}
-	if body == "" {
-		return 0, false
-	}
-	var u uint64
-	ub := uint64(base)
-	for i := 0; i < len(body); i++ {
-		c := body[i]
-		var d uint64
-		switch {
-		case c >= '0' && c <= '9':
-			d = uint64(c - '0')
-		case c >= 'a' && c <= 'f':
-			d = uint64(c-'a') + 10
-		case c >= 'A' && c <= 'F':
-			d = uint64(c-'A') + 10
-		default:
-			return 0, false
-		}
-		if d >= ub {
-			return 0, false
-		}
-		u = u*ub + d
-		if u > (1 << 62) {
-			return 0, false
-		}
-	}
-	n := int64(u)
-	if neg {
-		n = -n
-	}
-	return n, true
-}
-
-func countCommentLines(body []byte) int32 {
-	var n int32
-	for i := 0; i < len(body); {
-		st := i
-		for i < len(body) && !isSplitBound(body, i) {
-			i++
-		}
-		t := trimSpaceBytes(body[st:i])
-		if bytes.HasPrefix(t, []byte("/*")) || bytes.HasPrefix(t, []byte("//")) ||
-			bytes.HasPrefix(t, []byte("*")) {
-			n++
-		}
-		if i < len(body) {
-			i = skipBoundary(body, i)
-		}
-	}
-	return n
-}
 
 func (g *Graph) tSymbols() [][]fval {
 	out := make([][]fval, 0, len(g.Symbols))
@@ -7018,15 +6540,17 @@ var _ = bufio.NewWriter
 
 func build(g *Graph, root string, opts runOpts, quiet bool) int {
 
-	prevGC := debug.SetGCPercent(200)
-	defer debug.SetGCPercent(prevGC)
+	// No GC target is set here. This used to raise it to 200, which paid when
+	// a run made three times the garbage it does now; measured on PostgreSQL
+	// after the allocation work, the default is exactly as fast and peaks
+	// 380 MB lower -- and overriding it also overrode the user's GOGC.
 	abs, _ := filepath.Abs(root)
 	g.fileByRel = map[string]int32{}
 	g.byName = map[string][]int32{}
 	g.Meta = map[string]string{}
 
 	if !quiet {
-		fmt.Println("  parser: C23 lexer + hide-set preprocessor + recursive-descent parser (stdlib only)")
+		fmt.Fprintln(os.Stderr, "  parser: C23 lexer + hide-set preprocessor + recursive-descent parser (stdlib only)")
 	}
 	tDisc := time.Now()
 	parseIDs := discover(abs, g, opts)
@@ -7036,26 +6560,34 @@ func build(g *Graph, root string, opts runOpts, quiet bool) int {
 
 	g.FilesParsed = int32(len(parseIDs))
 	if !quiet {
-		fmt.Printf("  %d c files discovered in %.1fs\n", len(parseIDs),
+		fmt.Fprintf(os.Stderr, "  %d c files discovered in %.1fs\n", len(parseIDs),
 			time.Since(tDisc).Seconds())
 	}
 
 	ppSrcMu.Lock()
 	ppSrcCache = map[string][]byte{}
+	treePaths := make([]string, 0, len(g.Files))
 	for i := range g.Files {
+		full := filepath.Join(abs, filepath.FromSlash(g.Files[i].Path()))
+		treePaths = append(treePaths, full)
 		if data := source[i]; len(data) > 0 {
-			ppSrcCache[filepath.Join(abs, filepath.FromSlash(g.Files[i].Path()))] = data
+			ppSrcCache[full] = data
 		}
 	}
 	ppSrcMu.Unlock()
+	buildTreeIdx(treePaths)
+	ppTreeRoot = abs
 	for i := range source {
 		source[i] = nil
 	}
 
 	e := newExtractor(g)
 	t1 := time.Now()
-	step := max(len(parseIDs)/20, 1)
+	step := max(len(parseIDs)/4, 1)
 	outs := e.runC23(abs, g, parseIDs, quiet, step, opts.keepAST)
+	lexCache.Clear()
+	lexCacheToks.Store(0)
+	dropTokBufs()
 	e.reserve(g, outs)
 	for i, o := range outs {
 		if o == nil {
@@ -7064,23 +6596,23 @@ func build(g *Graph, root string, opts runOpts, quiet bool) int {
 		e.merge(g, o)
 		outs[i] = nil
 		if !quiet && (i+1)%step == 0 {
-			fmt.Printf("  ... %d/%d files\n", i+1, len(parseIDs))
+			fmt.Fprintf(os.Stderr, "  ... %d/%d files\n", i+1, len(parseIDs))
 		}
 	}
 	if !quiet {
-		fmt.Printf("  %d symbols parsed in %.1fs\n", len(g.Symbols),
+		fmt.Fprintf(os.Stderr, "  %d symbols parsed in %.1fs\n", len(g.Symbols),
 			time.Since(t1).Seconds())
 	}
 
+	nres := e.resolveImportTargets(abs)
 	t2 := time.Now()
 	e.resolveCalls()
 	if !quiet {
-		fmt.Printf("  call graph built in %.1fs\n", time.Since(t2).Seconds())
+		fmt.Fprintf(os.Stderr, "  call graph built in %.1fs\n", time.Since(t2).Seconds())
 	}
 
 	collapseHazards(g)
 
-	nres := e.resolveImportTargets(abs)
 	nimp := 0
 	for i := range g.Imports {
 		if g.Imports[i].HasTargetID {
@@ -7095,12 +6627,12 @@ func build(g *Graph, root string, opts runOpts, quiet bool) int {
 	t3 := time.Now()
 	e.materialize()
 	if !quiet {
-		fmt.Printf("  aggregates materialized in %.1fs\n", time.Since(t3).Seconds())
+		fmt.Fprintf(os.Stderr, "  aggregates materialized in %.1fs\n", time.Since(t3).Seconds())
 	}
 	t4 := time.Now()
 	e.postBuild()
 	if !quiet {
-		fmt.Printf("  indexed in %.1fs\n", time.Since(t4).Seconds())
+		fmt.Fprintf(os.Stderr, "  indexed in %.1fs\n", time.Since(t4).Seconds())
 	}
 
 	g.Meta["schema_version"] = "2"
@@ -7145,6 +6677,102 @@ const grammarNote = "no compiler frontend and no third-party package: C23 " +
 
 type edgeKey struct{ c, d int32 }
 
+// includes reports whether file `from` reaches file `to` through #include,
+// directly or through a chain. Both arms of an #if are followed: the include
+// table records every directive, taken or not.
+func (e *extractor) includes(from, to int32) bool {
+	if e.incAdj == nil {
+		e.incAdj = map[int32][]int32{}
+		for i := range e.g.Imports {
+			im := &e.g.Imports[i]
+			if im.HasTargetID && im.TargetID != im.FileID {
+				e.incAdj[im.FileID] = append(e.incAdj[im.FileID], im.TargetID)
+			}
+		}
+		e.incReach = map[int32]map[int32]bool{}
+	}
+	r, ok := e.incReach[from]
+	if !ok {
+		r = map[int32]bool{}
+		stack := append([]int32(nil), e.incAdj[from]...)
+		for len(stack) > 0 {
+			f := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if r[f] {
+				continue
+			}
+			r[f] = true
+			stack = append(stack, e.incAdj[f]...)
+		}
+		e.incReach[from] = r
+	}
+	return r[to]
+}
+
+// pickCallee chooses which definition of name a call in file fid reaches, by
+// the rules the linker uses, and returns -1 when those rules do not decide:
+//
+//  1. a definition in the calling file
+//  2. a static definition in a file the caller #includes (a header's
+//     `static inline`, or a .c pulled in as a backend)
+//  3. the one definition with external linkage -- or, of several, the one in
+//     the caller's own module
+//
+// A static function in some OTHER translation unit is never a candidate: the
+// caller cannot name it. Taking the first definition regardless, as this used
+// to, gave one file's `static parseOptions` every call made to its namesakes
+// and left the namesakes looking dead.
+func (e *extractor) pickCallee(name string, fid, mid int32) int {
+	files := e.fnByNameF[name]
+	for x, f := range files {
+		if f == fid {
+			return x
+		}
+	}
+	stat := e.fnByNameS[name]
+	mods := e.fnByNameM[name]
+	ext, extN, extMod, extModN := -1, 0, -1, 0
+	inc := -1
+	for x, f := range files {
+		if stat[x] {
+			if e.includes(fid, f) {
+				// several included files defining it are the #if-selected
+				// backends of one interface (ae_epoll.c / ae_kqueue.c): the
+				// call reaches whichever was compiled in, so it has an edge
+				// to each rather than to the alphabetically first
+				if inc < 0 {
+					inc = x
+				} else {
+					e.pickMore = append(e.pickMore, x)
+				}
+			}
+			continue
+		}
+		if extN == 0 {
+			ext = x
+		}
+		extN++
+		if mods[x] == mid {
+			if extModN == 0 {
+				extMod = x
+			}
+			extModN++
+		}
+	}
+	switch {
+	case inc >= 0:
+		return inc
+	case extN == 1:
+		return ext
+	case extModN == 1:
+		return extMod
+	}
+	if extN > 1 {
+		e.ambigN++
+	}
+	return -1
+}
+
 func (e *extractor) resolveCalls() {
 	g := e.g
 	edges := map[edgeKey]*Edge{}
@@ -7166,19 +6794,23 @@ func (e *extractor) resolveCalls() {
 		lines := e.pendLine[i]
 		cnt := int32(len(lines))
 		line := lines[0]
-		if cands, ok := e.fnByName[name]; ok {
-			ti := 0
-			if len(cands) > 1 {
-				for x, sfid := range e.fnByNameF[name] {
-					if sfid == fid {
-						ti = x
-						break
-					}
-				}
+		ti := -1
+		cands, ok := e.fnByName[name]
+		if ok {
+			e.pickMore = e.pickMore[:0]
+			ti = e.pickCallee(name, fid, mid)
+			if ti < 0 {
+				e.pickMore = e.pickMore[:0]
 			}
-			target := cands[ti]
-			tf := e.fnByNameF[name][ti]
-			tm := e.fnByNameM[name][ti]
+		}
+		for pick := -1; ti >= 0 && pick < len(e.pickMore); pick++ {
+			tx := ti
+			if pick >= 0 {
+				tx = e.pickMore[pick]
+			}
+			target := cands[tx]
+			tf := e.fnByNameF[name][tx]
+			tm := e.fnByNameM[name][tx]
 			for _, site := range lines {
 				k := edgeKey{caller, target}
 				ed, ok := edges[k]
@@ -7197,6 +6829,8 @@ func (e *extractor) resolveCalls() {
 					csOrder = append(csOrder, ck)
 				}
 			}
+		}
+		if ti >= 0 {
 			e.edgeN += cnt
 			if allocNameRe.MatchString(name) {
 				allocHz = append(allocHz, hazardW{SymbolID: caller,
@@ -7209,6 +6843,26 @@ func (e *extractor) resolveCalls() {
 			mac[caller] += cnt
 			macroUses[msid] += cnt
 			e.macroN += cnt
+			continue
+		}
+		// Defined in this tree, but linkage did not say which definition: that
+		// is a call the graph could not follow, not a call that left the tree.
+		if ok {
+			nm := jtrunc(name, 160)
+			k := [2]any{caller, nm}
+			if u, seen := unres[k]; seen {
+				u.N += cnt
+			} else {
+				u = &Unresolved{}
+				cgZeroRow(unsafe.Pointer(u), unsafe.Sizeof(*u))
+				u.CallerID = caller
+				u.name = cgPut(nm)
+				u.N = cnt
+				u.FirstLine = line
+				unres[k] = u
+				unresOrder = append(unresOrder, k)
+			}
+			e.unresN += cnt
 			continue
 		}
 		if e.isExternal(name) {
@@ -7285,7 +6939,8 @@ func (e *extractor) resolveCalls() {
 		itoa(int(e.macroN)) + " via macro / " + itoa(int(e.externN)) +
 		" external (" + itoa(int(e.declN)) +
 		" of them declared-here-defined-elsewhere) / " +
-		itoa(int(e.unresN)) + " unresolved -- " + itoa(int(pct)) + "% of " +
+		itoa(int(e.unresN)) + " unresolved (" + itoa(int(e.ambigN)) +
+		" names defined more than once with external linkage) -- " + itoa(int(pct)) + "% of " +
 		itoa(int(den)) + " call sites accounted for"
 }
 
@@ -7472,11 +7127,6 @@ func cmpOr(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func makeClassish(c byte) bool {
-	return c == '_' || c == '.' || c == '/' || c == '$' || c == '(' || c == ')' ||
-		c == '{' || c == '}' || c == '-' || isWordByte(c)
 }
 
 func matchMakeRule(ln string) string {
@@ -7839,6 +7489,7 @@ func (e *extractor) reserve(g *Graph, outs []*fileOut) {
 }
 
 func (e *extractor) merge(g *Graph, o *fileOut) {
+	g.ParseMsgs = append(g.ParseMsgs, o.perr...)
 	base := int32(len(g.Symbols))
 	syms := o.symA.at(o.symLo, o.symN)
 	for i := range syms {
@@ -8024,6 +7675,7 @@ func (e *extractor) merge(g *Graph, o *fileOut) {
 		e.fnByName[fs.name] = append(e.fnByName[fs.name], fs.sid+base)
 		e.fnByNameF[fs.name] = append(e.fnByNameF[fs.name], fs.fid)
 		e.fnByNameM[fs.name] = append(e.fnByNameM[fs.name], fs.mid)
+		e.fnByNameS[fs.name] = append(e.fnByNameS[fs.name], fs.static)
 	}
 
 	for i := range o.params {
@@ -8733,7 +8385,10 @@ func qQ1(g *Graph, p params) ([]string, [][]fval) {
 }
 
 func qQ2(g *Graph, p params) ([]string, [][]fval) {
-	cols := []string{"name", "cyclo", "nest", "io", "locals", "fan_in", "sloc", "at"}
+	cols := []string{"name", "frame_bytes", "levels_per_mb", "unsized", "cyclo",
+		"nest", "fan_in", "sloc", "at"}
+	frame := g.shapeCounts("frame_bytes")
+	uns := g.shapeCounts("frame_unsized")
 	var rows [][]fval
 	for _, s := range g.syms() {
 		if s.IsRecursive != 1 || s.Kind() != "function" {
@@ -8742,11 +8397,14 @@ func qQ2(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.Cyclomatic),
-			fI32(s.MaxNesting), fI32(s.NIO), fI32(s.NLocals), fI32(s.FanIn),
-			fI32(s.Sloc), fStr(g.at(s))})
+		// 48 bytes of return address, saved registers and spill per level is
+		// a floor for a non-leaf function on either LP64 ABI
+		per := frame[s.ID] + 48
+		rows = append(rows, []fval{fStr(s.Name()), fI32(frame[s.ID]),
+			fI32((1 << 20) / per), fI32(uns[s.ID]), fI32(s.Cyclomatic),
+			fI32(s.MaxNesting), fI32(s.FanIn), fI32(s.Sloc), fStr(g.at(s))})
 	}
-	orderBy(rows, dI(1), cmpS(0))
+	orderBy(rows, dI(1), dI(4), cmpS(0))
 	return cols, limit(rows, p)
 }
 
@@ -8950,9 +8608,13 @@ func qQ10(g *Graph, p params) ([]string, [][]fval) {
 func qQ11(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "kind", "sloc", "cyclo", "ext_calls", "at"}
 	var rows [][]fval
+	named := g.namedAsValue()
 	for _, s := range g.syms() {
 		if s.FanIn != 0 || s.IsPublic != 0 || s.IsTest != 0 ||
 			s.IsEntrypoint != 0 || s.IsOverride != 0 || s.IsAbstract != 0 {
+			continue
+		}
+		if named(s) {
 			continue
 		}
 		switch s.Kind() {
@@ -9214,12 +8876,25 @@ func qQ19(g *Graph, p params) ([]string, [][]fval) {
 	return cols, limit(rows, p)
 }
 
+// shapeCounts collects one `shape` hazard pattern per symbol.
+func (g *Graph) shapeCounts(pat string) map[int32]int32 {
+	m := map[int32]int32{}
+	for _, h := range g.Hazards {
+		if h.Category() == "shape" && h.Pattern() == pat {
+			m[h.SymbolID] += h.N
+		}
+	}
+	return m
+}
+
 func qQ20(g *Graph, p params) ([]string, [][]fval) {
-	cols := []string{"name", "arith_ops", "div_in_loop", "comparisons",
-		"null_checks", "cyclo", "fan_in", "at"}
+	cols := []string{"name", "unguarded_divs", "var_divs", "div_in_loop",
+		"n_params", "cyclo", "fan_in", "at"}
+	ung := g.shapeCounts("div_unguarded")
+	all := g.shapeCounts("div_by_var")
 	var rows [][]fval
 	for _, s := range g.syms() {
-		if s.NArith <= 0 || s.NCmp >= s.NArith {
+		if ung[s.ID] <= 0 {
 			continue
 		}
 		f := g.fileOf(s.ID)
@@ -9229,11 +8904,11 @@ func qQ20(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NArith),
-			fI32(g.rv(s).DivInLoop), fI32(s.NCmp), fI32(s.NNullCheck),
-			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))})
+		rows = append(rows, []fval{fStr(s.Name()), fI32(ung[s.ID]), fI32(all[s.ID]),
+			fI32(g.rv(s).DivInLoop), fI32(s.NParams), fI32(s.Cyclomatic),
+			fI32(s.FanIn), fStr(g.at(s))})
 	}
-	orderBy(rows, dI(1), dI(6))
+	orderBy(rows, dI(1), dI(6), cmpS(0))
 	return cols, limit(rows, p)
 }
 
@@ -9311,10 +8986,13 @@ func qQ23(g *Graph, p params) ([]string, [][]fval) {
 }
 
 func qQ24(g *Graph, p params) ([]string, [][]fval) {
-	cols := []string{"name", "loops", "returns", "cyclo", "fan_in", "sloc", "at"}
+	cols := []string{"name", "no_exit_loops", "forever_loops", "returns", "cyclo",
+		"fan_in", "sloc", "at"}
+	nox := g.shapeCounts("loop_forever_noexit")
+	all := g.shapeCounts("loop_forever")
 	var rows [][]fval
 	for _, s := range g.syms() {
-		if s.NLoops <= 0 || s.NReturns != 0 || s.FanIn <= 0 || s.Kind() != "function" {
+		if nox[s.ID] <= 0 || s.Kind() != "function" {
 			continue
 		}
 		f := g.fileOf(s.ID)
@@ -9324,18 +9002,40 @@ func qQ24(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NLoops), fI32(s.NReturns),
-			fI32(s.Cyclomatic), fI32(s.FanIn), fI32(s.Sloc), fStr(g.at(s))})
+		rows = append(rows, []fval{fStr(s.Name()), fI32(nox[s.ID]), fI32(all[s.ID]),
+			fI32(s.NReturns), fI32(s.Cyclomatic), fI32(s.FanIn), fI32(s.Sloc),
+			fStr(g.at(s))})
 	}
-	orderBy(rows, dI(1), dI(4), cmpS(0))
+	orderBy(rows, dI(1), dI(5), cmpS(0))
 	return cols, limit(rows, p)
 }
 
 func qQ25(g *Graph, p params) ([]string, [][]fval) {
-	cols := []string{"name", "returns_value", "fan_in", "cyclo", "sloc", "at"}
+	cols := []string{"name", "ignored_sites", "call_sites", "pct_ignored",
+		"callers_ignoring", "returns", "at"}
+	ign := map[string]int32{}
+	who := map[string]int32{}
+	for _, h := range g.Hazards {
+		if h.Category() == "discard" {
+			ign[h.Pattern()] += h.N
+			who[h.Pattern()]++
+		}
+	}
+	// a name defined twice cannot say which definition was called
+	defs := map[string]int32{}
+	for _, s := range g.syms() {
+		if s.Kind() == "function" {
+			defs[s.Name()]++
+		}
+	}
 	var rows [][]fval
 	for _, s := range g.syms() {
-		if g.rv(s).RetVal != 1 || s.FanIn <= 5 {
+		n := ign[s.Name()]
+		if n <= 0 || s.Kind() != "function" || defs[s.Name()] != 1 {
+			continue
+		}
+		rt := strings.TrimSpace(s.ReturnType())
+		if rt == "" || rt == "void" || strings.HasSuffix(rt, " void") {
 			continue
 		}
 		f := g.fileOf(s.ID)
@@ -9345,10 +9045,12 @@ func qQ25(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).RetVal), fI32(s.FanIn),
-			fI32(s.Cyclomatic), fI32(s.Sloc), fStr(g.at(s))})
+		sites := max(s.NCallsites, n)
+		rows = append(rows, []fval{fStr(s.Name()), fI32(n), fI32(sites),
+			fI32(pct(int64(n), int64(sites))), fI32(who[s.Name()]),
+			fStr(jtrunc(rt, 24)), fStr(g.at(s))})
 	}
-	orderBy(rows, dI(2))
+	orderBy(rows, dI(1), dI(3), cmpS(0))
 	return cols, limit(rows, p)
 }
 
@@ -10737,18 +10439,45 @@ func qQ68(g *Graph, p params) ([]string, [][]fval) {
 	return cols, limit(rows, p)
 }
 
+// namedAsValue returns a test for "this function's name is used as a value
+// somewhere it is visible": passed as a callback, stored in a field, or listed
+// in a file-scope table. A static function is only visible in its own file,
+// unless that file is a header.
+func (g *Graph) namedAsValue() func(*Symbol) bool {
+	any := map[string]bool{}
+	inFile := map[string]map[int32]bool{}
+	for _, a := range g.Addr {
+		nm := a.Name()
+		any[nm] = true
+		m := inFile[nm]
+		if m == nil {
+			m = map[int32]bool{}
+			inFile[nm] = m
+		}
+		m[a.FileID] = true
+	}
+	return func(s *Symbol) bool {
+		nm := s.Name()
+		if !any[nm] {
+			return false
+		}
+		if s.IsStatic == 0 || inFile[nm][s.FileID] {
+			return true
+		}
+		f := g.fileOf(s.ID)
+		return f != nil && strings.HasPrefix(f.Ext(), ".h")
+	}
+}
+
 func qQ69(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "sloc", "cyclo", "calls", "only_file", "at"}
-	taken := map[string]bool{}
-	for _, a := range g.Addr {
-		taken[a.Name()] = true
-	}
+	named := g.namedAsValue()
 	var rows [][]fval
 	for _, s := range g.syms() {
 		if s.Kind() != "function" || s.IsStatic != 1 || s.FanIn != 0 {
 			continue
 		}
-		if taken[s.Name()] || !likeMatch(g.modName(s.ModuleID), p.mod) {
+		if named(s) || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
 		f := g.fileOf(s.ID)
@@ -11516,31 +11245,6 @@ func qQ114(g *Graph, p params) ([]string, [][]fval) {
 		}, cmpI(1), cmpI(3))
 }
 
-func qQ114b(g *Graph, p params) ([]string, [][]fval) {
-	cols := []string{"name", "sized_arrays", "cyclo", "fan_in", "at"}
-	var rows [][]fval
-	for _, s := range g.syms() {
-		if g.rv(s).NStackszArray <= 0 {
-			continue
-		}
-		ok := false
-		for j := range g.APIUses {
-			a := &g.APIUses[j]
-			if a.SymbolID == s.ID && (a.NS() == "signal.h" || a.NS() == "pthread.h") {
-				ok = true
-				break
-			}
-		}
-		if !ok || !likeMatch(g.modName(s.ModuleID), p.mod) {
-			continue
-		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NStackszArray),
-			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))})
-	}
-	orderBy(rows, dI(1), dI(3))
-	return cols, limit(rows, p)
-}
-
 func qQ115(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "broken_checks", "cyclo", "fan_in", "at"}
 	return apiQ(cols, []string{"memcpy", "memmove", "memset", "malloc", "realloc",
@@ -11665,21 +11369,12 @@ func pct(a, b int64) int32 {
 	return int32(float64(a) * 100.0 / float64(b))
 }
 
-func minI(a, b int32) int32 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func maxI(a, b int32) int32 {
 	if a > b {
 		return a
 	}
 	return b
 }
-
-func i32f(f float64) int32 { return int32(f) }
 
 func limit(rows [][]fval, p params) [][]fval {
 	if p.lim >= 0 && len(rows) > p.lim {
@@ -11697,10 +11392,6 @@ func (r rowSorter) Len() int      { return len(r.rows) }
 func (r rowSorter) Swap(i, j int) { r.rows[i], r.rows[j] = r.rows[j], r.rows[i] }
 func (r rowSorter) Less(i, j int) bool {
 	return r.less(i, j)
-}
-
-func sortRows(rows [][]fval, less func(i, j int) bool) {
-	sort.SliceStable(rows, less)
 }
 
 func cmpI(col int) func(a, b []fval) int {
@@ -11729,18 +11420,6 @@ func cmpLine(col int) func(a, b []fval) int {
 
 func cmpS(col int) func(a, b []fval) int {
 	return func(a, b []fval) int { return strings.Compare(a[col].s, b[col].s) }
-}
-
-func cmpF(col int) func(a, b []fval) int {
-	return func(a, b []fval) int {
-		switch {
-		case a[col].f < b[col].f:
-			return -1
-		case a[col].f > b[col].f:
-			return 1
-		}
-		return 0
-	}
 }
 
 func then(cs ...func(a, b []fval) int) func(a, b []fval) int {
@@ -11775,19 +11454,6 @@ func distinctStrings(in []string) []string {
 
 func containsStr(list []string, s string) bool {
 	return slices.Contains(list, s)
-}
-
-func isFnKind(k string) bool {
-	return k == "function" || k == "method" || k == "constructor" || k == "closure"
-}
-
-func isTypeKind(k string) bool {
-	switch k {
-	case "class", "struct", "interface", "trait", "enum", "union", "record",
-		"protocol", "type", "module", "impl", "object", "mixin":
-		return true
-	}
-	return false
 }
 
 func (g *Graph) sym(id int32) *Symbol {
@@ -12234,8 +11900,9 @@ func mM9(g *Graph, p params) ([]string, [][]fval) {
 }
 
 func mM10(g *Graph, p params) ([]string, [][]fval) {
-	cols := []string{"struct_", "kind", "sz", "pad", "tail", "pct_waste",
-		"lines64", "algn", "at"}
+	cols := []string{"struct_", "kind", "sz", "pad", "tail", "packed_sz",
+		"saves", "lines64", "lines64_packed", "algn", "at"}
+	packed := g.shapeCounts("packed_size")
 	var rows [][]fval
 	for _, ss := range g.SSize {
 		if ss.Exact != 1 || ss.TotalPad <= 0 {
@@ -12245,12 +11912,16 @@ func mM10(g *Graph, p params) ([]string, [][]fval) {
 		if s == nil || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
+		best := ss.TotalSize
+		if v := packed[ss.SymbolID]; v > 0 {
+			best = v
+		}
 		rows = append(rows, []fval{fStr(s.Name()), fStr(s.Kind()),
 			fI32(ss.TotalSize), fI32(ss.TotalPad), fI32(ss.TailPad),
-			fI32(pct(int64(ss.TotalPad), int64(ss.TotalSize))), fI32(ss.NLines64),
-			fI32(ss.MaxAlign), fStr(g.at(s))})
+			fI32(best), fI32(ss.TotalSize - best), fI32(ss.NLines64),
+			fI32((best + 63) / 64), fI32(ss.MaxAlign), fStr(g.at(s))})
 	}
-	orderBy(rows, dI(3))
+	orderBy(rows, dI(6), dI(3), cmpS(0))
 	return cols, limit(rows, p)
 }
 
@@ -12325,9 +11996,81 @@ func mM12(g *Graph, p params) ([]string, [][]fval) {
 	return cols, limit(rows, p)
 }
 
+// chainBytes is, per function, the most automatic storage any acyclic call
+// path starting there can have live at once: its own frame plus the deepest
+// callee's. An edge back into a function already on the path is recursion and
+// is not followed -- `cyc` reports that the figure is a floor for that row.
+func (g *Graph) chainBytes(frame map[int32]int32) (total map[int32]int64, depth map[int32]int32, cyc map[int32]bool) {
+	out := map[int32][]int32{}
+	for _, ed := range g.Edges {
+		if ed.IsSelf == 0 {
+			out[ed.CallerID] = append(out[ed.CallerID], ed.CalleeID)
+		}
+	}
+	total = map[int32]int64{}
+	depth = map[int32]int32{}
+	cyc = map[int32]bool{}
+	state := map[int32]uint8{} // 1 on the path, 2 done
+	type fr struct {
+		id   int32
+		next int
+		best int64
+		dep  int32
+	}
+	for _, s := range g.syms() {
+		if s.Kind() != "function" || state[s.ID] == 2 {
+			continue
+		}
+		stack := []fr{{id: s.ID}}
+		state[s.ID] = 1
+		for len(stack) > 0 {
+			f := &stack[len(stack)-1]
+			kids := out[f.id]
+			if f.next < len(kids) {
+				c := kids[f.next]
+				f.next++
+				switch state[c] {
+				case 0:
+					state[c] = 1
+					stack = append(stack, fr{id: c})
+				case 1:
+					cyc[f.id] = true
+				case 2:
+					if total[c] > f.best {
+						f.best, f.dep = total[c], depth[c]
+					}
+					if cyc[c] {
+						cyc[f.id] = true
+					}
+				}
+				continue
+			}
+			total[f.id] = int64(frame[f.id]) + f.best
+			depth[f.id] = f.dep + 1
+			state[f.id] = 2
+			done := *f
+			stack = stack[:len(stack)-1]
+			if len(stack) > 0 {
+				par := &stack[len(stack)-1]
+				if total[done.id] > par.best {
+					par.best, par.dep = total[done.id], depth[done.id]
+				}
+				if cyc[done.id] {
+					cyc[par.id] = true
+				}
+			}
+		}
+	}
+	return
+}
+
 func mM13(g *Graph, p params) ([]string, [][]fval) {
-	cols := []string{"name", "locals", "ptrs", "rec", "depth", "sloc",
-		"params", "at"}
+	cols := []string{"name", "frame_bytes", "biggest_local", "unsized", "locals",
+		"chain_bytes", "chain_depth", "cyclic", "rec", "at"}
+	frame := g.shapeCounts("frame_bytes")
+	big := g.shapeCounts("frame_max_local")
+	uns := g.shapeCounts("frame_unsized")
+	total, depth, cyc := g.chainBytes(frame)
 	var rows [][]fval
 	for _, s := range g.syms() {
 		if s.Kind() != "function" || s.NLocals <= 0 {
@@ -12336,11 +12079,12 @@ func mM13(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NLocals),
-			fI32(s.NPtrLocals), fI32(s.IsRecursive), fI32(s.MaxLoopDepth),
-			fI32(s.Sloc), fI32(s.NParams), fStr(g.at(s))})
+		rows = append(rows, []fval{fStr(s.Name()), fI32(frame[s.ID]),
+			fI32(big[s.ID]), fI32(uns[s.ID]), fI32(s.NLocals),
+			fval{kind: fkInt, i: total[s.ID]}, fI32(depth[s.ID]),
+			fI32(b2i(cyc[s.ID])), fI32(s.IsRecursive), fStr(g.at(s))})
 	}
-	orderBy(rows, dI(1), dI(3), cmpS(0))
+	orderBy(rows, dI(5), dI(1), cmpS(0))
 	return cols, limit(rows, p)
 }
 
@@ -12842,13 +12586,6 @@ func mM29(g *Graph, p params) ([]string, [][]fval) {
 	}
 	orderBy(rows, dI(5), dI(7), cmpS(0))
 	return cols, limit(rows, p)
-}
-
-func numOrNeg(v fval) int64 {
-	if v.kind == fkNull {
-		return -1 << 40
-	}
-	return v.i
 }
 
 func mM30(g *Graph, p params) ([]string, [][]fval) {
@@ -13712,16 +13449,16 @@ func mM50(g *Graph, p params) ([]string, [][]fval) {
 
 var queries = []qentry{
 	{"untrusted-frontier", "Parses attacker bytes AND does pointer/size arithmetic", "ANSWERS the functions where a memory-safety bug is actually reachable.\nACT this is the CWE-190 shape: a length from the wire, a shift or a cast,\n     then a copy. Review these before anything else on the risk list.\nMISLEADS io counts RAW descriptor calls only; a function fed by a caller\n     that did the read is just as exposed and is invisible here.", qQ1},
-	{"stack-exhaustion", "Self-recursive functions: unbounded input depth is a stack DoS", "ANSWERS where a deeply nested input can exhaust the C stack.\nACT every one of these needs a depth cap that is TESTED at the cap.\nMISLEADS DIRECT self-recursion only. Mutual recursion through two\n     functions, or through a function pointer, does not appear here.", qQ2},
+	{"stack-exhaustion", "Self-recursive functions, by how much stack each level costs", "ANSWERS where a deeply nested input can exhaust the C stack, and how deep\n     it has to be: `frame_bytes` is the automatic storage one call declares,\n     `levels_per_mb` how many nested calls fit in a megabyte of stack.\nACT every one of these needs a depth cap that is TESTED at the cap. A row\n     with levels_per_mb in the hundreds overflows a 512 KB thread stack on\n     input a fuzzer finds in seconds.\nMISLEADS DIRECT self-recursion only: mutual recursion through two functions\n     or a function pointer does not appear. frame_bytes sums every local\n     the body declares -- sibling scopes share slots, so it is an upper\n     bound -- and leaves out the `unsized` ones (types from headers this\n     file does not define, and VLAs), so it is also a floor. Read both.", qQ2},
 	{"ownership-review", "Allocates but never frees in the same function", "ANSWERS where allocation ownership crosses a function boundary.\nACT each row must have a NAMED owner that frees it on EVERY path --\n     including the early returns and the goto-out ladder.\nMISLEADS this is a REVIEW list, not a leak list. Transferring ownership\n     to the caller is the normal C idiom and looks identical here.", qQ3},
 	{"allocator-mixing", "Files that use libc malloc AND a project allocator", "ANSWERS which files split their memory across two accounting systems.\nACT pick ONE per file. A project allocator usually exists to track or cap\n     usage, and a libc allocation in the same file is invisible to it.\nMISLEADS a project allocator is recognised by NAME SHAPE (anything ending\n     in alloc/free/strdup), so an unconventionally named one is missed and\n     an unrelated `list_free` is counted. Also, mixing is sometimes right:\n     tracked buffers through the wrapper, private scratch through libc.", qQ4},
-	{"alloc-per-iteration", "malloc/realloc inside a loop body", "ANSWERS which loops pay the allocator once per item.\nACT hoist the allocation, or reserve capacity before the loop.\nMISLEADS a realloc-grow loop is amortised O(1) and belongs here anyway;\n     the count is of SITES, and one site in a hot loop beats ten cold ones.", qQ5},
+	{"alloc-per-iteration", "An allocation inside a loop body", "ANSWERS which loops pay the allocator once per item.\nACT hoist the allocation, or reserve capacity before the loop.\nMISLEADS a realloc-grow loop is amortised O(1) and belongs here anyway;\n     the count is of SITES, and one site in a hot loop beats ten cold ones.\n     An allocator is recognised by NAME -- the libc ones and anything ending\n     in alloc, strdup or memdup (zmalloc, xcalloc) -- so a wrapper with\n     another name is missed and a non-allocating `*alloc` accessor is\n     counted.", qQ5},
 	{"bypass-tax", "Allocates BEFORE it knows the fast path applies", "ANSWERS which functions pay setup cost on inputs they then refuse.\nACT probe FIRST, allocate second. This is the classic bypass candidate.\nMISLEADS an allocation before a loop is usually just the output buffer,\n     which has to be allocated up front and is not a tax at all.", qQ6},
 	{"race-surface", "Mutable, non-atomic, non-const file-scope state", "ANSWERS what two threads could be writing at the same time.\nACT every row needs a lock, an atomic, a thread-local, or a written proof\n     that only one thread ever touches it.\nMISLEADS it does not know which modules are threaded. The last column is\n     the only evidence offered: how many functions in the same module use\n     a concurrency primitive at all.", qQ7},
 	{"per-element-dispatch", "A switch INSIDE a loop: type dispatch paid once per element", "ANSWERS where a loop re-decides the same thing on every iteration.\nACT hoist the switch out, or specialise the loop per case.\nMISLEADS a bytecode interpreter's dispatch loop is exactly this shape and\n     is correct by design. So is a state machine.", qQ8},
 	{"loop-invariant-strlen", "strlen() inside a loop: accidental O(n^2)", "ANSWERS where a length is recomputed that cannot have changed.\nACT hoist it, or carry the length beside the string.\nMISLEADS a strlen over a SHORT string is a few cycles, and a loop whose\n     body mutates the string has to recompute it.", qQ9},
 	{"error-shape-mix", "Functions that report failure in more than one shape", "ANSWERS where a caller can plausibly check the wrong thing.\nACT a function returning both NULL and -1 is one that callers get wrong\n     roughly half the time. Pick one convention per function and document\n     it in the header, where the caller is actually looking.\nMISLEADS returning 0 for success AND 0 as a legitimate value is the worst\n     case of all and is completely invisible here.", qQ10},
-	{"dead-code", "Nothing in this tree calls these", "ANSWERS what might be deletable.\nACT grep the name as a STRING before deleting anything: a registry entry,\n     a config value or a reflective call keeps a symbol alive with no edge\n     to show for it.\nMISLEADS this is the query most likely to be wrong, and `graph-blindspots`\n     measures by how much. Public symbols are excluded because a caller\n     outside this tree cannot be seen at all, so what is left is private\n     and unreferenced -- a much weaker claim than dead.", qQ11},
+	{"dead-code", "Nothing in this tree calls these or names them", "ANSWERS what might be deletable: private functions with no caller and whose\n     name is never used as a value -- not passed as a callback, not stored\n     in a field, not listed in a file-scope table.\nACT grep the name as a STRING before deleting anything: a name assembled by\n     token pasting or looked up at run time keeps a symbol alive with no\n     reference to show for it.\nMISLEADS `graph-blindspots` measures how much of the call graph is unseen.\n     Public symbols are excluded because a caller outside this tree cannot\n     be seen at all. A function whose only caller is itself dead is NOT\n     listed -- this is one layer, not a transitive sweep. The functions kept\n     alive only by a table or a callback are in dispatch-table-orphan and\n     fnptr-blindspot-callers.", qQ11},
 	{"nonreentrant-under-threads", "a libc call with a shared static buffer, in a function that also touches threads", "ANSWERS CERT CON33-C and MSC24-C, which clang-tidy states as a per-call\n     rule and cppcheck barely states at all: `localtime`, `strerror`,\n     `getenv`, `basename` and friends return a pointer into one static\n     buffer. Single-threaded that is correct and cheap. In a function that\n     also creates threads or takes locks it is a data race that corrupts\n     the OTHER thread's result, silently, under load.\nACT use the _r form -- localtime_r, strerror_r, getpwnam_r -- or copy the\n     result before releasing the lock. `patterns` names exactly which\n     calls, so the fix is mechanical.\nMISLEADS a function that touches threads is not necessarily called from\n     more than one, and pthread_create in main() next to a getenv() at\n     startup is fine. This sees categories in the same body, not the\n     happens-before between them.", qQ12},
 	{"unchecked-conversion-on-an-io-path", "atoi/strtol in a function that also reads input", "ANSWERS CERT ERR34-C, which flawfinder and clang-tidy report on every\n     `atoi` in the tree. `atoi(\"42\")` on a literal is fine. `atoi` on\n     bytes that just came off a socket or a file returns 0 for the string\n     \"0\" and for garbage alike, and sets no errno to distinguish them.\n     The graph supplies the missing half: whether the same function also\n     performs I/O.\nACT use strtol with an end pointer and check both `end` and `errno`, or\n     reject the input outright. `conversions` names the exact calls;\n     `returns_value` says whether the function can even report a failure\n     to its caller, and a 0 there means the error has nowhere to go.\nMISLEADS co-occurrence in one body is not dataflow -- a function may read\n     a file and separately parse a constant. A wrapper that validates\n     before calling this one makes the row correct and harmless, and that\n     wrapper is not visible in the row.", qQ13},
 	{"buffer-overflow-surface", "sprintf/strcpy/strcat/gets without bounds (CERT STR31-C)", "ANSWERS where unbounded buffer operations are used: sprintf, strcpy,\n     strcat, gets. Each can write past the end of a buffer if the input\n     is larger than expected.\nACT use snprintf, strncpy (or strlcpy), strncat, fgets. Check return values.\nMISLEADS a sprintf on a buffer known to be large enough is safe, but the\n     graph cannot prove the buffer size.", qQ14},
@@ -13730,12 +13467,12 @@ var queries = []qentry{
 	{"double-free-surface", "free called more than once on same pointer (CERT MEM40-C)", "ANSWERS where a function has more free calls than alloc calls, which may\n     indicate a double-free if the same pointer is freed on multiple paths.\nACT track the pointer state; set to NULL after free and check before.\nMISLEADS a function that frees pointers allocated in other functions has\n     more frees than allocs by design. The imbalance is a signal, not proof.", qQ17},
 	{"null-deref-surface", "Pointer dereference without null check (CERT ERR30-C)", "ANSWERS where a function dereferences pointers but has no null checks,\n     which means a NULL pointer will crash the program.\nACT check for NULL before dereferencing, especially after malloc/calloc.\nMISLEADS a pointer known to be non-null (from a trusted source) does not\n     need a check. The graph sees n_null_check but not which pointers.", qQ18},
 	{"integer-overflow-surface", "Arithmetic without bounds checking (CERT INT32-C)", "ANSWERS where integer arithmetic is performed without overflow checking,\n     which is UB for signed integers and wraps for unsigned.\nACT use checked arithmetic (__builtin_add_overflow) or validate inputs.\nMISLEADS arithmetic on known-small constants is safe. The graph counts\n     arithmetic sites but not the operand ranges.", qQ19},
-	{"division-by-zero-surface", "Division without zero check (CERT INT33-C)", "ANSWERS where division is performed but the function has no comparison\n     that could be a zero-check on the divisor.\nACT check for zero before dividing.\nMISLEADS a division by a constant is safe. The graph sees n_arith but\n     cannot distinguish division from other arithmetic.", qQ20},
+	{"division-by-zero-surface", "Division by a variable the function never tests (CERT INT33-C)", "ANSWERS where `/` or `%` has a plain variable as its divisor and that name\n     is never compared with anything or used as a condition anywhere in the\n     function. `var_divs` is every non-literal divisor, for scale.\nACT follow the divisor back to its source. A parameter needs a guard here or\n     a documented precondition; a length or count needs its empty case.\nMISLEADS the test is function-wide and by NAME: a guard in the caller, or on\n     an alias of the same value, is invisible and the row is a false alarm.\n     A divisor that is an expression (`a->n`, `f(x)`, `n + 1`) is counted in\n     var_divs but never judged, so its absence here proves nothing.", qQ20},
 	{"switch-no-default", "Switch without a default case (MISRA-C 16.4)", "ANSWERS where a switch statement has no default case, so unhandled values\n     fall through silently. MISRA-C requires a default in every switch.\nACT add a default case, even if it only asserts or does nothing.\nMISLEADS a switch over an exhaustive enum may not need a default, but a\n     future value will be silently ignored.", qQ21},
 	{"race-condition-surface", "Shared static variable accessed from concurrent context (CERT CON33-C)", "ANSWERS where a function reads/writes a static variable and also touches\n     threads, locks, or atomics, indicating potential data races.\nACT protect the shared variable with a mutex, or use thread-local storage.\nMISLEADS a static variable set once at startup and only read afterward is\n     safe. The graph sees co-occurrence, not the happens-before relation.", qQ22},
 	{"signal-handler-unsafe", "Unsafe function called inside a signal handler (CERT SIG30-C)", "ANSWERS where a function that may be called as a signal handler calls\n     non-async-signal-safe functions (malloc, printf, syslog).\nACT only call async-signal-safe functions inside signal handlers.\nMISLEADS relies on function name matching (contains 'sig' or 'handler'),\n     which is crude; a function registered via signal(2) at runtime with a\n     non-obvious name is not detected.", qQ23},
-	{"infinite-loop", "Functions with loops but no return statements (CERT MSC53-C)", "ANSWERS where a function has loops but no return paths at all, which may\n     indicate an infinite loop with no exit condition.\nACT ensure there is a break, return, or condition that exits the loop.\nMISLEADS an event loop or a scheduler is intentionally infinite. The graph\n     sees n_loops and n_returns but not the exit condition. A function that\n     exits via a called function's longjmp is not captured.", qQ24},
-	{"unused-return-value", "Function whose return value is ignored by callers (CERT EXP12-C)", "ANSWERS where a function returns a value but its callers do not check it,\n     so errors are silently lost. fan_in says how many call sites exist;\n     a high fan_in with no error-checking callers is a systemic problem.\nACT check the return value at every call site, or use a must-check attribute.\nMISLEADS a function that returns void has no return value to check. The\n     graph sees fan_in but not whether individual callers check the result.", qQ25},
+	{"infinite-loop", "A constant-true loop with no way out (CERT MSC53-C)", "ANSWERS which `while (1)` / `for (;;)` loops contain no break, return, goto\n     or call to exit/abort/longjmp anywhere in their body.\nACT confirm each one is a thread main or an event loop that is meant to run\n     until the process dies -- and that something outside can stop it.\nMISLEADS a worker thread and a scheduler are intentionally endless and are\n     most of this list in a healthy tree. A loop left only through a called\n     function that never returns (a project `fatal()`, pthread_cancel) is\n     reported; a loop whose only break belongs to a nested switch is not.", qQ24},
+	{"unused-return-value", "Calls that drop a non-void result on the floor (CERT EXP12-C)", "ANSWERS which functions return a value that callers throw away, counted per\n     call SITE: `f(x);` as a whole statement, with f returning non-void.\nACT a status code that most callers ignore is an error channel nobody reads:\n     check it, or change the function to void and say so. `(void)f(x);` is\n     the way to mark a deliberate discard and is not counted.\nMISLEADS chaining APIs return their argument for convenience (a builder, an\n     sds-style append used for its side effect) and are correct to ignore.\n     Sites are matched by NAME, so a function defined more than once is left\n     out entirely, and a call through a pointer is never seen.", qQ25},
 	{"macro-side-effect", "Heavily-used function-like macro that may evaluate arguments twice (CERT PRE31-C)", "ANSWERS the function-like macros with the most use sites -- each use\n     passes its arguments through the macro body once PER REFERENCE in\n     that body, so an argument with side effects (i++, f()) is\n     evaluated however many times the body names it. `uses` is the\n     call-shaped reference count from call resolution.\nACT convert the top rows to static inline functions: identical\n     runtime cost, but types checked, breakpoints possible, and the\n     double-evaluation hazard gone.\nMISLEADS a macro that references each argument exactly once is safe\n     and lands here anyway (the body text is captured in macros.body\n     -- read it before acting); a macro used only as a non-call token\n     shows zero uses.", qQ26},
 	{"vtable-risk", "Functions reached through function pointers or dynamic member calls", "ANSWERS where runtime target ambiguity is densest: the reads through\n     `ops->`-style members and `(*fp)()` calls that a static call graph\n     cannot resolve. Every one is a site whose callee is decided at runtime.\nACT audit the dispatch site: is the function-pointer slot ever written with\n     something other than the one obvious initializer? If so, the edge here\n     is a security boundary, not an abstraction.\nMISLEADS counts CALL SITES, not distinct targets, and the brace scanner\n     sees the `->`-shaped member call syntax only; a struct passed around\n     and invoked through a local alias (`ops->read` copied into a local\n     `fp`) shows up as the alias's direct call instead.", qQ27},
 	{"header-scope-ratio", "User-header vs system-header include ratio per file", "ANSWERS which files lean almost entirely on system headers (<...>) and so\n     carry little project-local coupling -- and which pull in mostly user\n     headers (\"...\"), marking them as tightly coupled to the tree.\nACT a file at ~0%% user headers is often a portability shim; a file at\n     100%% user headers that is itself widely included deserves a look for\n     layering violations.\nMISLEADS a `<system>` include that RESOLVES inside the tree is counted as\n     user here (the analyzer treats project headers on the include path as\n     internal), so the ratio is about the include SPELLING, not about where\n     the file actually lives.", qQ28},
@@ -13750,17 +13487,17 @@ var queries = []qentry{
 	{"risky-process-apis", "Sites of dangerous process/temp APIs (CERT ENV33-C, flawfinder)", "ANSWERS reachable sites of the dangerous process and temp-file API set:\n     system/popen/exec for process boundaries, mktemp/tmpnam/tempnam for\n     race-prone temp files, access for TOCTOU-prone checks.\nACT replace mktemp with mkstemp; interrogate every system/popen -- each\n     is a command-injection review item when the argument is not a\n     constant; prefer execve with an explicit argv over execl/execvp\n     when the argument list is built at runtime.\nMISLEADS the capture is the call scanner, independent of resolution, so\n     libc calls that would otherwise classify as external still appear;\n     the denylist is the fixed set above -- rand/setenv are NOT captured\n     and are absent by design (their risk is caller-context, which this\n     query does not model); errno-checking callers are not distinguished.", qQ37},
 	{"hardcoded-secret-candidates", "Credential-shaped string literals (OWASP G07)", "ANSWERS string literals at least 12 chars long whose text names a\n     credential (password, token, api_key, secret, bearer, jwt, ...) --\n     the literal that a committed secret looks like.\nACT rotate and move to a secret manager; never commit the literal.\nMISLEADS a format string or test fixture containing the WORD token/pass\n     reads as a candidate (the filter is the literal's own text, not its\n     use); values over 200 chars are truncated at capture; a secret\n     built from parts or read from an env var is invisible here. This\n     is a candidate list, not a verdict.", qQ38},
 	{"include-cycles", "User headers that include each other, directly or via a chain", "ANSWERS user headers that include each other: the include graph is a\n     DAG in any well-formed project, so a cycle means the headers are\n     mutually dependent and the build order is an accident of include\n     guards.\nACT break the cycle with a forward declaration or by shrinking one\n     header; rows name both endpoints and the cycle length.\nMISLEADS include guards make cycles harmless at compile time, so this\n     is a maintainability smell, not a defect; the cycle set is\n     computed at BUILD time (bounded DFS, depth cap 8) into the\n     include_cycles table -- a recursive-CTE version of this query\n     enumerated paths rather than cycles and never finished on large\n     trees; is_relative=1 means user \"...\" includes, and a <...>\n     include that resolves in-tree is excluded from the walk.", qQ39},
-	{"const-cast-away", "Casts that drop const from const-declared names (CERT EXP05-C)", "ANSWERS `(T*)name` casts applied to a name declared const: the\n     const-qualified promise is stripped by the cast, and any write\n     through the result is UB in the caller's face.\nACT remove the cast, or drop const from the declaration if the\n     function genuinely mutates (and say why).\nMISLEADS the const test is against the local/param declaration in the\n     SAME function: a const GLOBAL or a const from another translation\n     unit is invisible here; `(void*)` casts and casts of expressions\n     (not bare names) are not counted; a cast of a name that is NOT\n     const-declared reads clean by construction.", qQ40},
-	{"fnptr-blindspot-callers", "Functions used only through &fn -- invisible to the call graph", "ANSWERS functions with fan_in 0 whose address is taken somewhere:\n     they ARE used, but every call goes through a function pointer, so\n     dead-code and every fan-in-based number understate them.\nACT read these as live API surface; a fnptr-dispatched function is a\n     plugin point or a table-driven dispatch entry.\nMISLEADS &fn text capture catches address-takes in function bodies; an\n     address taken in a struct initializer at file scope (the dominant\n     dispatch-table pattern) is NOT here -- dispatch-table-orphan owns\n     those rows, and dead-code must be read with both pages open.", qQ41},
+	{"const-cast-away", "Casts that drop const from const-declared names (CERT EXP05-C)", "ANSWERS `(T*)name` casts applied to a name declared const: the\n     const-qualified promise is stripped by the cast, and any write\n     through the result is UB in the caller's face.\nACT remove the cast, or drop const from the declaration if the\n     function genuinely mutates (and say why).\nMISLEADS the const test is against the local/param declaration in the\n     SAME function: a const GLOBAL or a const from another translation\n     unit is invisible here. The cast's TARGET type is not examined, so\n     `(const char *)p` on a const p -- which drops nothing -- and a\n     `(void *)p` handed to a hashing helper are both counted.", qQ40},
+	{"fnptr-blindspot-callers", "Functions with no caller whose name is used as a value in a body", "ANSWERS functions with fan_in 0 that some function body names without\n     calling: passed as a callback, stored in a field, or taken with &.\n     They ARE used, but every call goes through a pointer, so every\n     fan-in-based number understates them.\nACT read these as live API surface; a pointer-dispatched function is a\n     plugin point or a registered handler.\nMISLEADS only uses inside function BODIES are here. A name listed in a\n     file-scope initializer (the dominant dispatch-table pattern) is in\n     dispatch-table-orphan instead. `addr_taken` also counts `&x` of a\n     local that happens to share the function's name.", qQ41},
 	{"extern-symbol-asymmetry", "Declared in a prototype, never defined in the tree", "ANSWERS names with a prototype/extern declaration but no definition\n     anywhere in the tree: either the definition lives in a library\n     this run skipped (fine), or the symbol is promised but missing\n     (a link error waiting for the first caller).\nACT for each row decide: library boundary (ignore) or genuinely\n     missing (define or delete the prototype).\nMISLEADS a definition behind `#ifdef` that the scan excluded reads as\n     missing; static functions are excluded from the definition side\n     only when their name matches -- a same-named static in one file\n     does NOT satisfy an extern promise in another; libc prototypes in\n     system headers are not scanned (only this tree's files are).", qQ42},
 	{"toctou-access-open", "access(X) then open(X) on the same variable (CERT POS01-C)", "ANSWERS functions that both access(X) and open(X) with the same\n     variable: the permission check and the use are two system calls,\n     and the file can be swapped between them. The window is the whole\n     race.\nACT open first, then fstat the descriptor; never trust access for\n     security decisions.\nMISLEADS same-function variable-name pairing, not data flow: access on\n     a path built from a different variable than the open is missed,\n     and access+open on a CONSTANT path (no race on most filesystems\n     in practice) reads the same as the race; `faccessat` with\n     AT_EACCESS is a different capture and is absent.", qQ43},
-	{"lock-imbalance", "Acquires a lock more often than it releases it", "ANSWERS the functions where an early return or a goto-out ladder can\n     leave a mutex held: acquire sites outnumber release sites in one\n     body. The next caller to take that lock blocks forever -- and if\n     the lock is taken under load first, the hang looks like a load\n     problem, not a code problem.\nACT pair every acquire with a release on EVERY path, or move to\n     pthread_mutex_trylock with explicit unlock on the failure path.\nMISLEADS counts SITES, not paths: two acquires and two releases can\n     still leak (both releases behind the same `if`), and a function\n     whose contract is 'returns with the lock held' (an allocator's\n     arena lock, a lazy initializer) is correct and lands here anyway.\n     A release inside a called cleanup function is invisible.", qQ44},
+	{"lock-imbalance", "Acquires a lock more often than it releases it", "ANSWERS the functions where an early return or a goto-out ladder can\n     leave a mutex held: acquire sites outnumber release sites in one\n     body. The next caller to take that lock blocks forever -- and if\n     the lock is taken under load first, the hang looks like a load\n     problem, not a code problem.\nACT pair every acquire with a release on EVERY path, or move to\n     pthread_mutex_trylock with explicit unlock on the failure path.\nMISLEADS counts SITES, not paths: two acquires and two releases can\n     still leak (both releases behind the same `if`), and a function\n     whose contract is 'returns with the lock held' (an allocator's\n     arena lock, a lazy initializer) is correct and lands here anyway.\n     A release inside a called cleanup function is invisible. A call is\n     a lock operation when one WORD of its name is lock, unlock, trylock,\n     rdlock, wrlock, mutex or the like (pthread_mutex_lock, spin_unlock,\n     LOCK): a project wrapper named otherwise is not seen at all.", qQ44},
 	{"lock-under-io", "A lock is held across a call that can sleep or block I/O", "ANSWERS where a function both takes a lock and performs raw descriptor\n     I/O in the same body: read/write/recv/send/mmap while holding a\n     pthread mutex. Every other thread wanting that lock stalls for the\n     duration of the I/O -- the classic latency cliff under load, and\n     with a non-recursive mutex plus a nested acquisition, a deadlock.\nACT shrink the critical section: copy what is needed under the lock,\n     release, then do the I/O. If the I/O must be covered, document why\n     and bound it (timeout, O_NONBLOCK).\nMISLEADS co-occurrence in one body is not ordering: the I/O may run\n     strictly before the first acquire or after the last release, and\n     this cannot see which. Buffered stdio (fprintf) is excluded here\n     on purpose -- it lives in its own query family; a blocking call\n     reached THROUGH a callee while the lock is held is invisible.", qQ45},
 	{"memcpy-sizeof-mismatch", "Copy whose size argument names neither dst nor src", "ANSWERS the copy sites where the SIZE expression dereferences a\n     buffer that is neither argument: memcpy(a, b, sizeof(c)) copies\n     by c's width -- CERT ARR38-C's shape when a, b and c have\n     different element sizes. `size_buf` is the identifier the size\n     expression references (from its sizeof), '' when it names none.\nACT read every row: the fix is a size naming THE DESTINATION, or an\n     explicit MIN of both. Prefer strlcpy / memcpy_s where available.\nMISLEADS textual, not semantic: sizeof(*dst) vs sizeof(struct x) can\n     be equal; copying into a larger dst is legal; a length VARIABLE\n     as size reads clean here but is exactly where an unchecked value\n     bites -- this query finds the WRONG-BUFFER sites, not every bad\n     copy. Argument capture stops at one paren level.", qQ46},
 	{"alloc-without-sizeof", "malloc(n * k) with no sizeof in the size expression", "ANSWERS allocation sites whose size expression names no sizeof at all:\n     malloc(count * 4) hard-codes the element width, malloc(len) may be\n     confusing bytes with elements, and neither survives the element\n     type changing under it. Each row is the exact line to re-derive.\nACT write sizeof(*p) (or sizeof(T)) explicitly, and prefer calloc for\n     arrays so the overflow check is someone else's already-written bug\n     fix.\nMISLEADS a byte-oriented API (a raw network buffer, a string + 1) is\n     CORRECT without sizeof and will dominate this list in most trees;\n     a size expression built through a project macro (`s_malloc`,\n     `ALLOC_ARRAY`) hides its sizeof from this scan entirely.", qQ47},
 	{"global-writer-concentration", "Functions that WRITE file-scope state, ranked by how much they touch", "ANSWERS which functions mutate shared file-scope objects, and which\n     globals are written from the most places. `race-surface` says a\n     global EXISTS and is mutable; this says WHO actually writes it --\n     the half that turns 'could race' into 'here is the commit that\n     must take the lock'.\nACT every writer of a hot global is a serialization point: batch the\n     writes, shard the state, or make the field atomic.\nMISLEADS same-file globals only -- writes through an extern declared\n     in a header are invisible, so cross-TU writers undercount; a\n     local variable shadowing a global name is counted as the global;\n     and `g->field = x` through a pointer parameter reads as a write\n     only when the base name matches a captured global.", qQ48},
 	{"truncating-cast-flow", "Fixed-width narrowing casts on data that came from wide sources", "ANSWERS `(uint32_t)x`-style casts to a STRICTLY narrower fixed-width\n     type in functions that also do heavy arithmetic or I/O -- the\n     places where a 64-bit length, hash or offset silently becomes 32\n     bits. The wrap is not UB, which is exactly why nothing complains:\n     the value just comes back wrong on input above 4 GiB.\nACT before casting, range-check and reject; after casting, never use\n     the wide original again. Prefer size_t end-to-end.\nMISLEADS a cast to uint8_t for serialization into a wire format is\n     correct and common; the scan cannot know the value fits. Only\n     fixed-width targets are counted -- casts to int/long are\n     platform-dependent and deliberately absent.", qQ49},
-	{"signed-size-compare", "Signed value compared against a size or sizeof result", "ANSWERS comparisons of the form `if (i < sizeof(b))` / `while (n <=\n     len)` where the left side is a signed local or parameter: the\n     comparison promotes the signed value to size_t, so -1 becomes\n     SIZE_MAX and the bounds check PASSES for the one input that must\n     fail it (CERT INT31-C).\nACT make the index size_t, or compare in the signed domain against a\n     checked cast of the size.\nMISLEADS the left operand being declared signed is necessary but not\n     sufficient: a value proven non-negative before the compare makes\n     the row harmless, and the scan sees declarations, not proofs.", qQ50},
+	{"signed-size-compare", "Signed value compared against a size or sizeof result", "ANSWERS comparisons like `i < sizeof(b)` or `n <= len` where one side is a\n     local or parameter DECLARED signed (int, long, ssize_t ...) and the\n     other is a sizeof, a strlen, or a name declared size_t/unsigned. The\n     signed side converts, so -1 becomes SIZE_MAX and the bounds check\n     PASSES for the one input that must fail it (CERT INT31-C).\nACT make the index size_t, or compare in the signed domain against a\n     checked cast of the size.\nMISLEADS types come from declarations in the same function only: a struct\n     member, a global or a call other than strlen has no known type and is\n     never the size side, so this list is a floor. A value proven\n     non-negative before the compare makes its row harmless.", qQ50},
 	{"variadic-format-forwarder", "Variadic function forwarding to a vprintf-family call", "ANSWERS the wrappers that turn caller-supplied arguments into formatted\n     output: variadic definitions containing v?snprintf/v?printf/syslog.\n     Whether %n is reachable from outside depends ENTIRELY on whether\n     these forwarders pass through a caller-controlled format string --\n     they are the chokepoints worth auditing, because every other\n     printf-shaped call in the tree funnels through a handful of them.\nACT audit each: the format argument should be a literal or a fixed\n     table entry, never a parameter forwarded verbatim.\nMISLEADS a wrapper that hardcodes its own literal format ('%s') is safe\n     and indistinguishable here from one forwarding the caller's format\n     through; the format STRING itself is blanked during scanning (it is\n     a literal), so its content is not inspected.", qQ51},
 	{"dispatch-table-orphan", "Referenced ONLY in file-scope initializers: live but zero fan-in", "ANSWERS functions kept alive exclusively by a dispatch-table entry at\n     file scope -- an initializer reference (`static cmd_t cmds[] =\n     {&get, &set}`) or a generated-table argument\n     (`MAKE_CMD(...,getCommand,...)`). No body contains the use, so\n     dead-code and every fan-in-based number read zero while the\n     function is very much alive: these are the plugin points of a\n     table-driven C program.\nACT treat as public API: renaming one breaks a TABLE, silently, at\n     runtime. Any signature change needs the table's owning module in\n     the review. `refs` says how many tables list it.\nMISLEADS the capture is textual (argument position, file scope, macro\n     bodies skipped), so a same-named DATA object referenced in an\n     initializer can attach to a function of that name after pruning;\n     a table entry spelled through a project macro's PARAMETER is not\n     seen (macro bodies are excluded on purpose); and a function whose\n     address is taken BOTH in a table and in a body appears here only\n     for its body-level rows.", qQ52},
 	{"error-path-frees", "Allocations whose frees sit only behind error branches", "ANSWERS functions that allocate, free, and branch heavily: the shape\n    where the free list covers the error ladder but a NEW success-path\n    early return skips it. Unlike ownership-review (which flags 'no\n    free at all'), this finds the functions where a future edit is most\n    likely to introduce a leak, because the discipline exists but is\n    one return away from breaking. `allocs` counts direct\n    malloc/calloc/realloc/alloca sites; project wrappers are invisible\n    to it.\nACT when editing one of these, trace every new return against the free\n    ladder -- or convert to goto-cleanup, which makes skipping it\n    impossible.\nMISLEADS a heuristic by construction: alloc==free==1 with two branches\n    is usually fine; the ranking surfaces DENSITY of exits vs frees,\n    not an actual missing free. Transfers of ownership (returning the\n    buffer) look identical, and frees reached through a wrapper\n    function do not count, so a disciplined function using one can\n    read as frees=0 -- those land in ownership-review instead.", qQ53},
@@ -13842,10 +13579,10 @@ var metricsCat = []qentry{
 	{"nested-loops", "Loop depth >= 2: the O(n^k) candidates, with their per-iteration cost", "ANSWERS where cost grows super-linearly in the input.\nACT check what bounds the INNER trip count. `divs` and `calls` are the\n     two per-iteration costs people forget; a divide is ~20-40 cycles and\n     a loop-invariant one should be a reciprocal multiply.\nMISLEADS depth counts LEXICAL nesting, not asymptotics: an inner loop\n     bounded by a constant is O(1).", mM7},
 	{"vectorisation-blocked", "Loops that CANNOT vectorise: a libm call in the body", "ANSWERS which loops are categorically unvectorizable as written.\nACT a libm call in a loop body is a hard stop for the auto-vectoriser --\n     it cannot prove the call is pure or replace it with a vector form.\n     Use a vectorised math library, or a polynomial approximation.\nMISLEADS it does not know the loop is hot, and -ffast-math plus a vector\n     libm changes the answer entirely.", mM8},
 	{"explicit-simd", "Hand-written intrinsics and branch hints", "ANSWERS where the code already commits to a specific ISA.\nACT every intrinsic site needs a scalar fallback that is BUILT in CI, not\n     merely present -- an unbuilt fallback is an unrun fallback.\nMISLEADS a high intrinsic count is not a fast function, and `likely` hints\n     are frequently wrong and never re-measured.", mM9},
-	{"struct-padding", "Byte-accurate layout: bytes lost to alignment holes", "ANSWERS which structs waste memory on padding, and exactly how much.\nACT reorder fields largest-alignment-first. This is free: no algorithm\n     changes, no API changes, and it compounds across every instance.\nMISLEADS LP64 model, and exact=1 rows only -- a struct containing another\n     struct cannot be sized here and is simply absent from this list.", mM10},
+	{"struct-padding", "Byte-accurate layout: what reordering the fields would save", "ANSWERS which structs waste memory on padding and exactly what the fix\n     buys: `packed_sz` is the size with members declared widest-alignment\n     first, `saves` the bytes back PER INSTANCE, and lines64_packed whether\n     it then spans fewer cache lines.\nACT reorder to get packed_sz. No algorithm changes, and it compounds across\n     every instance in every array. A row where lines64 drops is also one\n     fewer cache miss per access.\nMISLEADS LP64 model, exact=1 rows only: a struct holding a type this file\n     does not define cannot be sized and is absent. A struct whose layout is\n     an ABI -- written to disk, sent on the wire, shared with assembly --\n     cannot be reordered at all, and one grouped for cache locality (hot\n     fields first) may be right as it is: packed_sz is the floor, not a\n     recommendation to ignore both.", mM10},
 	{"cache-line-crossers", "Structs just over a 64-byte cache line", "ANSWERS which hot objects need two cache lines where one would do.\nACT 65-128 bytes is the painful band: shrink below 64 and every access\n     halves its memory traffic. Removing the padding is often enough.\nMISLEADS a struct that is never hot does not care, and an object always\n     touched in full needs both lines anyway.", mM11},
 	{"cache-hostile-layout", "Pointer-dense structs: each pointer field defeats the prefetcher", "ANSWERS which structures drag a whole cache line to reach one field, and\n     then send you somewhere else in memory to read it.\nACT candidates for splitting the hot fields into a parallel array (SoA).\nMISLEADS TOP-LEVEL fields only -- union arms are alternatives, not extra\n     fields -- and a node in a linked structure is pointer-dense by nature.", mM12},
-	{"stack-pressure", "Functions with the most locals, and the most pointer locals", "ANSWERS which frames are large enough to matter.\nACT a big frame in a RECURSIVE function multiplies by depth, and that\n     product is what actually overflows the stack.\nMISLEADS counts DECLARATIONS, not simultaneous liveness -- the compiler\n     reuses slots -- and it cannot see arrays sized at run time.", mM13},
+	{"stack-pressure", "Stack bytes per function, and down the deepest call chain under it", "ANSWERS which frames are large, and which entry points sit on top of the\n     most stack: `chain_bytes` is this function's frame plus the heaviest\n     acyclic path of callees below it, `chain_depth` how many frames that is.\nACT compare chain_bytes for every thread entry point against that thread's\n     stack size. `biggest_local` names the usual culprit -- one buffer that\n     belongs on the heap or in a static.\nMISLEADS frame_bytes sums DECLARATIONS: sibling scopes share slots, so it\n     overstates; `unsized` locals (a type this file does not define, a VLA)\n     and saved registers are left out, so it understates. chain_bytes follows\n     only calls the graph resolved -- nothing through a pointer -- and where\n     `cyclic` is 1 a call back into the path was cut, so the true figure is\n     unbounded and this one is a floor.", mM13},
 	{"cast-density", "Pointer casts: where the type system was overruled", "ANSWERS the places a wrong assumption becomes a memory bug.\nACT each cast is a claim the compiler cannot check. A cast next to I/O\n     and shifting is where attacker-controlled bytes become a pointer.\nMISLEADS the pattern counts some compound literals and some macro\n     parameter lists as casts.", mM14},
 	{"macro-machinery", "Function-like macros, by how much work they do", "ANSWERS the code the call graph cannot see into at all.\nACT a heavily-used multi-line macro is a function that skipped review: no\n     type checking, no breakpoint, no stack frame, and its cost is\n     multiplied by every use site rather than shared.\nMISLEADS `uses` counts sites where the name was called and no function of\n     that name exists in the tree, so a macro shadowed by a real function\n     somewhere reads as unused.", mM15},
 	{"config-gated", "Code behind a CONFIG_/HAVE_/USE_ flag", "ANSWERS which regions a plain build silently omits.\nACT build each flag in CI, or the code inside it is unrun and unreviewed\n     and will not compile the day someone needs it.\nMISLEADS lists DIRECTIVES, not region sizes: one #ifdef can gate a\n     thousand lines or a single semicolon.", mM16},
@@ -13947,30 +13684,59 @@ func report(g *Graph) {
 
 	fmt.Fprintf(w, "\n%s\nHOW MUCH OF THIS TO TRUST\n%s\n", bar.String(), dash.String())
 
-	errFiles := int32(0)
-	totCalls := int32(0)
+	errFiles, errTotal := int32(0), int32(0)
 	for i := range g.Files {
 		if g.Files[i].NParseErrors > 0 {
 			errFiles++
+			errTotal += g.Files[i].NParseErrors
 		}
 	}
+	var direct, viaMacro, external, viaPtr int64
 	for i := range g.Symbols {
-		totCalls += g.Symbols[i].NCalls
+		s := g.Symbols[i]
+		r := g.rv(s)
+		viaMacro += int64(r.NMacroCalls)
+		external += int64(r.NExternalCalls)
+		viaPtr += int64(r.NFnptrCalls)
+	}
+	for _, ed := range g.Edges {
+		direct += int64(ed.NCalls)
+	}
+	named := direct + viaMacro + external + int64(unres)
+	pctOf := func(n, d int64) string {
+		if d == 0 {
+			return "-"
+		}
+		return strconv.FormatInt((n*1000/d+5)/10, 10) + "%"
 	}
 	if parsed == 0 {
 		fmt.Fprintln(w, " NOTHING WAS PARSED. Every number below is zero because no file")
 		fmt.Fprintln(w, " was read, not because this repository is empty or clean.")
 	}
-	fmt.Fprintf(w, " %-30s %d file(s)\n", "files with parse errors", errFiles)
-	if totCalls != 0 {
-		fmt.Fprintf(w, " %-30s %d of %d call sites (%d%%)\n",
-			"calls we could NOT resolve", unres, totCalls, int(100*unres/totCalls))
-	} else {
-		fmt.Fprintf(w, " %-30s no calls were recorded at all -- this is the absence of\n", "")
-		fmt.Fprintf(w, " %-30s data, not a clean result\n", "")
+	fmt.Fprintf(w, " %-30s %d of %d parsed file(s), %d diagnostic(s)\n",
+		"files with parse diagnostics", errFiles, parsed, errTotal)
+	if errFiles > 0 {
+		fmt.Fprintln(w, "   functions near a diagnostic may be missing or merged: --parse-errors")
 	}
-	fmt.Fprintln(w, " A high unresolved share means the call-graph queries below see less")
-	fmt.Fprintln(w, " than they imply. `v_blindspot` lists exactly where.")
+	if named+viaPtr == 0 {
+		fmt.Fprintf(w, " %-30s none recorded -- this is the absence of data, not a clean result\n",
+			"calls")
+	} else {
+		fmt.Fprintf(w, " %-30s %d\n", "call sites that name a callee", named)
+		fmt.Fprintf(w, "   %-28s %-8d %s\n", "followed to a definition", direct, pctOf(direct, named))
+		fmt.Fprintf(w, "   %-28s %-8d %s  (libc and other code outside this tree)\n",
+			"external by design", external, pctOf(external, named))
+		fmt.Fprintf(w, "   %-28s %-8d %s  (a macro the preprocessor left unexpanded)\n",
+			"macro, not a function", viaMacro, pctOf(viaMacro, named))
+		fmt.Fprintf(w, "   %-28s %-8d %s  <- the blind share\n",
+			"NOT followed", unres, pctOf(int64(unres), named))
+		fmt.Fprintf(w, " %-30s %d  (no callee name at all; never in the call graph)\n",
+			"calls through a pointer", viaPtr)
+		fmt.Fprintln(w, " Fan-in, reachability and dead-code are computed from the first line only.")
+		fmt.Fprintln(w, " `--metrics graph-blindspots` breaks the blind share down per module, and")
+		fmt.Fprintln(w, " the `calls_resolved` row of the meta table says how much of it is names")
+		fmt.Fprintln(w, " defined more than once, where linkage alone cannot pick the target.")
+	}
 
 	fmt.Fprintf(w, "\n%s\nBIGGEST MODULES\n%s\n", bar.String(), dash.String())
 	mods := make([]Module, 0, len(g.Modules))
@@ -14117,7 +13883,6 @@ func fInt(v int) fval    { return fval{kind: fkInt, i: int64(v)} }
 func fI32(v int32) fval  { return fval{kind: fkInt, i: int64(v)} }
 func fF(v float64) fval  { return fval{kind: fkFloat, f: v} }
 func fStr(s string) fval { return fval{kind: fkStr, s: s} }
-func fBool(v int32) fval { return fval{kind: fkInt, i: int64(v)} }
 func fOptInt(v int32, ok bool) fval {
 	if !ok {
 		return fNull()
@@ -14612,7 +14377,7 @@ func main() {
 	qv := map[string]bool{}
 	for _, k := range []string{"list", "metrics", "report", "quiet", "no-tests",
 		"include-generated", "include-vendored", "version", "deps", "force",
-		"install-deps", "schema"} {
+		"install-deps", "schema", "summary", "parse-errors", "selfcheck"} {
 		if boolFlags[k] {
 			qv[k] = true
 		}
@@ -14630,23 +14395,8 @@ func main() {
 		modPat = v
 	}
 	csvN, jsonN := -1, -1
-	csvSet, jsonSet := false, false
-	if v, ok := flags["csv"]; ok {
-		csvSet = true
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			invalidArg("--csv", v)
-		}
-		csvN = n
-	}
-	if v, ok := flags["json"]; ok {
-		jsonSet = true
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			invalidArg("--json", v)
-		}
-		jsonN = n
-	}
+	_, csvSet := flags["csv"]
+	_, jsonSet := flags["json"]
 	dumpPath := flags["dump"]
 	savePath := flags["save"]
 	saveAST := flags["save-ast"]
@@ -14675,22 +14425,40 @@ func main() {
 		cat = metricsCat
 	}
 	if qv["list"] {
+		nameW := 0
+		for _, q := range cat {
+			nameW = max(nameW, len(q.name))
+		}
 		for i, q := range cat {
-			fmt.Printf("%2d. %-26s %s\n", i+1, q.name, q.title)
+			fmt.Printf("%3d. %-*s %s\n", i+1, nameW, q.name, q.title)
+		}
+		if qv["metrics"] {
+			fmt.Printf("\n%d metrics. Without --metrics, --list shows the %d defect queries.\n",
+				len(cat), len(queries))
+		} else {
+			fmt.Printf("\n%d defect queries. --metrics --list shows the %d structural metrics.\n",
+				len(cat), len(metricsCat))
 		}
 		return
+	}
+	if csvSet {
+		csvN = pickQuery(cat, flags["csv"], qv["metrics"])
+	}
+	if jsonSet {
+		jsonN = pickQuery(cat, flags["json"], qv["metrics"])
 	}
 
 	dir := "."
 	if len(positional) > 0 {
 		dir = positional[0]
 	}
+	// A selector that names nothing is an error, not a silent no-op: dropping
+	// it used to fall through to "run every query", which reads as the answer
+	// to a question that was never asked.
 	var sel []int
 	if len(positional) > 1 {
 		for _, p := range positional[1:] {
-			if n, err := strconv.Atoi(p); err == nil {
-				sel = append(sel, n)
-			}
+			sel = append(sel, pickQuery(cat, p, qv["metrics"]))
 		}
 	}
 	if loadASTPath == "" {
@@ -14761,11 +14529,7 @@ func main() {
 		if n2 < 0 {
 			n2 = jsonN
 		}
-
-		if n2 < 1 || n2 > len(cat) {
-			fmt.Fprintf(os.Stderr, "no query %d\n", n2)
-			os.Exit(2)
-		}
+		warnCoverage(g)
 		cols, rows := cat[n2-1].run(g, p)
 		if csvN >= 0 {
 			w := csv.NewWriter(os.Stdout)
@@ -14799,15 +14563,41 @@ func main() {
 			limStr = itoa(lim)
 		}
 		if loadASTPath != "" {
-			fmt.Printf("codegraph-c: %d files loaded from AST in %.1fs module=%s limit=%s\n",
+			fmt.Fprintf(os.Stderr, "codegraph-c: %d files loaded from AST in %.1fs module=%s limit=%s\n",
 				n, took.Seconds(), modPat, limStr)
 		} else {
-			fmt.Printf("codegraph-c: %d files parsed into memory in %.1fs module=%s limit=%s\n",
+			fmt.Fprintf(os.Stderr, "codegraph-c: %d files parsed into memory in %.1fs module=%s limit=%s\n",
 				n, took.Seconds(), modPat, limStr)
 		}
 	}
+	warnCoverage(g)
+	alone := false
 	if qv["report"] {
 		report(g)
+		alone = true
+	}
+	if qv["parse-errors"] {
+		printParseErrors(g, lim, loadASTPath != "")
+		alone = true
+	}
+	if qv["selfcheck"] {
+		sw := bufio.NewWriter(os.Stdout)
+		bad := selfCheck(g, sw)
+		sw.Flush()
+		if bad > 0 {
+			saveGraph(g, savePath, qv["force"])
+			os.Exit(1)
+		}
+		alone = true
+	}
+	if qv["summary"] {
+		printSummary(g, cat, sel, p, qv["metrics"])
+	}
+	// --report, --parse-errors and --summary are answers in themselves: asked
+	// for without a selector they do not also print every query.
+	if qv["summary"] || (alone && len(sel) == 0) {
+		saveGraph(g, savePath, qv["force"])
+		return
 	}
 	if len(sel) == 0 {
 		for i := 1; i <= len(cat); i++ {
@@ -14816,9 +14606,6 @@ func main() {
 	}
 	w := bufio.NewWriterSize(os.Stdout, 1<<16)
 	for _, k := range sel {
-		if k < 1 || k > len(cat) {
-			continue
-		}
 		q := cat[k-1]
 		fmt.Fprintf(w, "\n%s\n", strings.Repeat("=", 78))
 		fmt.Fprintf(w, "Q%d. %s -- %s\n", k, q.name, q.title)
@@ -14832,6 +14619,475 @@ func main() {
 	}
 	w.Flush()
 	saveGraph(g, savePath, qv["force"])
+}
+
+// pickQuery resolves a selector -- a 1-based number or a query name -- against
+// the active catalogue, and exits with the near misses when it names nothing.
+func pickQuery(cat []qentry, sel string, metrics bool) int {
+	which := "query"
+	other := metricsCat
+	if metrics {
+		which = "metric"
+		other = queries
+	}
+	if n, err := strconv.Atoi(sel); err == nil {
+		if n >= 1 && n <= len(cat) {
+			return n
+		}
+		fmt.Fprintf(os.Stderr, "codegraph_c: no %s %d (there are %d; see --list)\n",
+			which, n, len(cat))
+		os.Exit(2)
+	}
+	for i, q := range cat {
+		if q.name == sel {
+			return i + 1
+		}
+	}
+	var near []string
+	for _, q := range cat {
+		if strings.Contains(q.name, sel) {
+			near = append(near, q.name)
+		}
+	}
+	if len(near) == 1 {
+		for i, q := range cat {
+			if q.name == near[0] {
+				return i + 1
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "codegraph_c: no %s named %q (see --list)\n", which, sel)
+	if len(near) > 0 {
+		fmt.Fprintf(os.Stderr, "  did you mean: %s\n", joinComma(near))
+	}
+	for _, q := range other {
+		if q.name == sel {
+			if metrics {
+				fmt.Fprintf(os.Stderr, "  %q is a defect query: drop --metrics\n", sel)
+			} else {
+				fmt.Fprintf(os.Stderr, "  %q is a metric: add --metrics\n", sel)
+			}
+		}
+	}
+	os.Exit(2)
+	return 0
+}
+
+// warnCoverage says on stderr, even under --quiet, when more than 1% of the
+// files did not parse cleanly. Every ranking is computed from what parsed.
+func warnCoverage(g *Graph) {
+	parsed, bad, errs := 0, 0, 0
+	for i := range g.Files {
+		f := &g.Files[i]
+		if f.Parsed != 1 {
+			continue
+		}
+		parsed++
+		if f.NParseErrors > 0 {
+			bad++
+			errs += int(f.NParseErrors)
+		}
+	}
+	if parsed > 0 && bad*100 > parsed {
+		fmt.Fprintf(os.Stderr, "codegraph_c: %d of %d files have parse diagnostics (%d in all); "+
+			"functions near them may be missing or merged. --parse-errors lists them.\n",
+			bad, parsed, errs)
+	}
+}
+
+func printParseErrors(g *Graph, lim int, fromAST bool) {
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	fmt.Fprintf(w, "\n%s\nPARSE ERRORS\n%s\n", strings.Repeat("=", 78), strings.Repeat("-", 78))
+	total := 0
+	for i := range g.Files {
+		total += int(g.Files[i].NParseErrors)
+	}
+	nErrDir := 0
+	for _, m := range g.ParseMsgs {
+		if strings.HasPrefix(m.msg, "#error") {
+			nErrDir++
+		}
+	}
+	if total == 0 && nErrDir == 0 {
+		fmt.Fprintln(w, " none: every file parsed without a diagnostic")
+		return
+	}
+	if fromAST {
+		fmt.Fprintf(w, " %d diagnostics were counted when this state was saved; the messages\n"+
+			" are not stored in it. Re-run against the source tree to list them.\n", total)
+		return
+	}
+	kinds := map[string]int{}
+	for _, m := range g.ParseMsgs {
+		kinds[parseMsgKind(m.msg)]++
+	}
+	var kr [][]fval
+	for k, v := range kinds {
+		kr = append(kr, []fval{fInt(v), fStr(k)})
+	}
+	orderBy(kr, dI(0), cmpS(1))
+	fmt.Fprintf(w, " %d diagnostics. One unreadable construct is counted once per token it\n"+
+		" derails, so the FIRST message in a file is the cause and the rest are\n"+
+		" usually its echo.\n", total)
+	if nErrDir > 0 {
+		fmt.Fprintf(w, " Plus %d `#error` directive(s) reached. Those are not parse failures: the\n"+
+			" code refused a configuration this run could not determine (a generated\n"+
+			" config.h, a compiler it does not recognise), and what was read on the\n"+
+			" way there is intact. They are not in the count above.\n", nErrDir)
+	}
+	fmt.Fprintln(w)
+	render(w, kr, []string{"n", "kind"})
+	fmt.Fprintln(w)
+	msgs := append([]parseMsg(nil), g.ParseMsgs...)
+	sort.SliceStable(msgs, func(i, j int) bool {
+		if msgs[i].fileID != msgs[j].fileID {
+			return g.Files[msgs[i].fileID-1].Path() < g.Files[msgs[j].fileID-1].Path()
+		}
+		return msgs[i].line < msgs[j].line
+	})
+	var rows [][]fval
+	lastFile, lastLine := int32(0), int32(-1)
+	for _, m := range msgs {
+		if m.fileID == lastFile && m.line == lastLine {
+			continue
+		}
+		lastFile, lastLine = m.fileID, m.line
+		rows = append(rows, []fval{fStr(g.Files[m.fileID-1].Path() + ":" +
+			strconv.Itoa(int(m.line))), fStr(jtrunc(m.msg, 90))})
+	}
+	if lim >= 0 && len(rows) > lim {
+		rows = rows[:lim]
+	}
+	render(w, rows, []string{"at", "first diagnostic on this line"})
+}
+
+// parseMsgKind strips the quoted token out of a diagnostic so that messages
+// differing only in what they tripped over group together.
+func parseMsgKind(m string) string {
+	if i := strings.Index(m, " near '"); i >= 0 {
+		if j := strings.LastIndexByte(m, '\''); j > i+6 {
+			return m[:i+6] + "..." + m[j+1:]
+		}
+	}
+	if i := strings.Index(m, " token '"); i >= 0 {
+		if j := strings.LastIndexByte(m, '\''); j > i+7 {
+			return m[:i+7] + "..." + m[j+1:]
+		}
+	}
+	if strings.HasPrefix(m, "#error") {
+		return "#error reached"
+	}
+	return m
+}
+
+// printSummary runs every selected query and prints one line each: the name,
+// how many rows it found and the top row. It is the index to a report that is
+// otherwise twenty thousand lines long.
+func printSummary(g *Graph, cat []qentry, sel []int, p params, metrics bool) {
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	if len(sel) == 0 {
+		for i := 1; i <= len(cat); i++ {
+			sel = append(sel, i)
+		}
+	}
+	all := p
+	all.lim = -1
+	var rows [][]fval
+	hit := 0
+	for _, k := range sel {
+		q := cat[k-1]
+		cols, rs := q.run(g, all)
+		top := ""
+		if len(rs) > 0 {
+			hit++
+			top = summaryTop(cols, rs[0])
+		}
+		rows = append(rows, []fval{fInt(k), fStr(q.name), fInt(len(rs)), fStr(top)})
+	}
+	what := "QUERIES"
+	if metrics {
+		what = "METRICS"
+	}
+	fmt.Fprintf(w, "\n%s\nSUMMARY OF %s  module=%s\n%s\n", strings.Repeat("=", 78),
+		what, p.mod, strings.Repeat("-", 78))
+	fmt.Fprintf(w, " %d of %d returned rows. `rows` is how many the query found, not how\n"+
+		" many are defects: read a query's MISLEADS note before acting on it.\n\n",
+		hit, len(sel))
+	render(w, rows, []string{"#", "name", "rows", "first row"})
+}
+
+// summaryTop is the first row's identifying cell and where it is.
+func summaryTop(cols []string, r []fval) string {
+	name, at := "", ""
+	for i, c := range cols {
+		if i >= len(r) || r[i].kind != fkStr {
+			continue
+		}
+		switch {
+		case c == "at" || c == "first_at":
+			if at == "" {
+				at = r[i].s
+			}
+		case name == "":
+			name = r[i].s
+		}
+	}
+	if at != "" && name != "" {
+		return jtrunc(name, 44) + "  " + at
+	}
+	return jtrunc(name+at, 70)
+}
+
+// selfCheck tests the graph against things its numbers must obey whatever
+// the code under analysis looks like. A parser or walker bug rarely crashes:
+// it produces a count that is plausible on its own and impossible beside
+// another count. Each rule below pairs two numbers that were computed by
+// different code, so a fault in either shows up as a violation.
+//
+// It prints one row per rule and returns the number of rules violated.
+func selfCheck(g *Graph, w *bufio.Writer) int {
+	type rule struct {
+		name    string
+		checked int
+		bad     int
+		first   string
+	}
+	var rules []*rule
+	add := func(name string) *rule {
+		r := &rule{name: name}
+		rules = append(rules, r)
+		return r
+	}
+	fail := func(r *rule, ok bool, where func() string) {
+		r.checked++
+		if !ok {
+			r.bad++
+			if r.first == "" {
+				r.first = where()
+			}
+		}
+	}
+	isFn := func(s *Symbol) bool { return s != nil && s.Kind() == "function" }
+	at := func(s *Symbol) func() string {
+		return func() string { return s.Name() + "  " + g.at(s) }
+	}
+
+	rLoopDepth := add("a function with loops has loop depth >= 1 and <= its loop count")
+	rInLoop := add("nothing is counted `in a loop` in a function that has no loop")
+	rRet := add("the five return shapes add up to the return count")
+	rCyclo := add("cyclomatic complexity is at least 1 + the number of loops")
+	rCmp := add("null checks and signed/size compares are subsets of all compares")
+	rLocals := add("n_locals equals the function's rows in locals")
+	rParams := add("n_params equals the function's rows in params")
+	rLine := add("every symbol starts on a line its file has")
+
+	nLoc := map[int32]int32{}
+	for _, l := range g.Locals {
+		nLoc[l.SymbolID]++
+	}
+	nPar := map[int32]int32{}
+	for _, p := range g.Params {
+		nPar[p.SymbolID]++
+	}
+	for _, s := range g.syms() {
+		f := g.fileOf(s.ID)
+		fail(rLine, f != nil && s.LineStart >= 1 && (f.Lines == 0 || s.LineStart <= f.Lines+1), at(s))
+		if !isFn(s) {
+			continue
+		}
+		r := g.rv(s)
+		fail(rLoopDepth, (s.NLoops == 0 && s.MaxLoopDepth == 0) ||
+			(s.NLoops > 0 && s.MaxLoopDepth >= 1 && s.MaxLoopDepth <= s.NLoops), at(s))
+		inLoop := s.CallInLoop + s.AllocInLoop + s.IOInLoop + s.LockInLoop +
+			s.BranchInLoop + r.SwitchInLoop + r.LibmInLoop + r.DivInLoop + r.StrlenInLoop
+		fail(rInLoop, s.NLoops > 0 || inLoop == 0, at(s))
+		fail(rRet, r.RetNull+r.RetNeg+r.RetZero+r.RetVal+r.RetVoid == s.NReturns, at(s))
+		fail(rCyclo, s.Cyclomatic >= 1+s.NLoops, at(s))
+		fail(rCmp, s.NNullCheck <= s.NCmp && r.NSignCmp <= s.NCmp, at(s))
+		fail(rLocals, s.NLocals == nLoc[s.ID], at(s))
+		fail(rParams, s.NParams == nPar[s.ID], at(s))
+	}
+
+	rEdgeEnds := add("both ends of every call edge are functions that exist")
+	rEdgeFlags := add("an edge's is_self/same_file/same_module agree with its two ends")
+	rFan := add("fan_in and fan_out equal the distinct callers/callees in edges")
+	rSites := add("an edge has >= 1 call and no more distinct call lines than calls")
+	fin, fout := map[int32]int32{}, map[int32]int32{}
+	sites := map[[2]int32]int32{}
+	for _, c := range g.Callsites {
+		sites[[2]int32{c.CallerID, c.CalleeID}]++
+	}
+	for i := range g.Edges {
+		ed := &g.Edges[i]
+		a, b := g.sym(ed.CallerID), g.sym(ed.CalleeID)
+		where := func() string {
+			an, bn := "?", "?"
+			if a != nil {
+				an = a.Name()
+			}
+			if b != nil {
+				bn = b.Name()
+			}
+			return an + " -> " + bn
+		}
+		fail(rEdgeEnds, isFn(a) && isFn(b), where)
+		if a == nil || b == nil {
+			continue
+		}
+		fail(rEdgeFlags, (ed.IsSelf == 1) == (a.ID == b.ID) &&
+			(ed.SameFile == 1) == (a.FileID == b.FileID) &&
+			(ed.SameModule == 1) == (a.ModuleID == b.ModuleID), where)
+		fail(rSites, ed.NCalls >= 1 && sites[[2]int32{a.ID, b.ID}] <= ed.NCalls, where)
+		if ed.IsSelf == 0 {
+			fout[a.ID]++
+			fin[b.ID]++
+		}
+	}
+	for _, s := range g.syms() {
+		if isFn(s) {
+			fail(rFan, s.FanIn == fin[s.ID] && s.FanOut == fout[s.ID], at(s))
+		}
+	}
+	rReach := add("transitive callers are at least as many as direct callers")
+	for _, r := range g.Reach {
+		if s := g.sym(r.SymbolID); isFn(s) {
+			fail(rReach, r.NTransitive >= s.FanIn, at(s))
+		}
+	}
+
+	rFileLines := add("code + comment + blank lines do not exceed a file's line count")
+	rFileFns := add("a file's n_functions equals its function symbols")
+	fileFns := map[int32]int32{}
+	for _, s := range g.syms() {
+		if isFn(s) {
+			fileFns[s.FileID]++
+		}
+	}
+	for i := range g.Files {
+		f := &g.Files[i]
+		where := func() string { return f.Path() }
+		fail(rFileLines, f.Sloc+f.CommentLines+f.BlankLines <= f.Lines+1 && f.Sloc >= 0, where)
+		fail(rFileFns, f.NFunctions == fileFns[f.ID], where)
+	}
+
+	rSize := add("struct: pad < size, size % align == 0, lines64 == ceil(size/64)")
+	rLayFit := add("every laid-out member lies inside its struct")
+	rLayOrder := add("struct members do not overlap; union members all start at 0")
+	rLayPad := add("member sizes + member padding + tail padding == struct size")
+	rPacked := add("packed size == member bytes rounded up to the alignment")
+	size := map[int32]*StructSize{}
+	for i := range g.SSize {
+		size[g.SSize[i].SymbolID] = &g.SSize[i]
+	}
+	packed := g.shapeCounts("packed_size")
+	type acc struct {
+		end, pad, sum int32
+		ok, overlap   bool
+	}
+	lay := map[int32]*acc{}
+	for i := range g.Layout {
+		l := &g.Layout[i]
+		if l.Depth != 0 || l.InUnion != 0 || l.ByteOff < 0 {
+			continue
+		}
+		ss, s := size[l.SymbolID], g.sym(l.SymbolID)
+		if ss == nil || s == nil || ss.Exact != 1 {
+			continue
+		}
+		fail(rLayFit, l.ByteOff+l.ByteSize <= ss.TotalSize, at(s))
+		a := lay[l.SymbolID]
+		if a == nil {
+			a = &acc{ok: true}
+			lay[l.SymbolID] = a
+		}
+		if s.Kind() == "union" {
+			if l.ByteOff != 0 {
+				a.overlap = true
+			}
+			continue
+		}
+		if l.ByteOff < a.end {
+			a.overlap = true
+		}
+		a.end = l.ByteOff + l.ByteSize
+		a.pad += l.PadBefore
+		a.sum += l.ByteSize
+	}
+	for i := range g.SSize {
+		ss := &g.SSize[i]
+		s := g.sym(ss.SymbolID)
+		if s == nil || ss.Exact != 1 {
+			continue
+		}
+		fail(rSize, ss.TotalPad >= 0 && (ss.TotalSize == 0 || ss.TotalPad < ss.TotalSize) &&
+			ss.MaxAlign >= 1 && ss.TotalSize%ss.MaxAlign == 0 &&
+			ss.NLines64 == (ss.TotalSize+63)/64, at(s))
+		a := lay[ss.SymbolID]
+		if a == nil {
+			continue
+		}
+		fail(rLayOrder, !a.overlap, at(s))
+		if s.Kind() == "struct" {
+			fail(rLayPad, a.pad+ss.TailPad == ss.TotalPad && a.sum+ss.TotalPad == ss.TotalSize, at(s))
+			// Widest-alignment-first leaves no interior hole, so the packed
+			// size is exactly the member bytes rounded up to the alignment --
+			// and it must be reported whenever that beats the declared size.
+			want := a.sum
+			if r := want % ss.MaxAlign; r != 0 {
+				want += ss.MaxAlign - r
+			}
+			pk, has := packed[ss.SymbolID]
+			if !has {
+				pk = ss.TotalSize
+			}
+			fail(rPacked, pk == want, at(s))
+		}
+	}
+
+	rHaz := add("every hazard row counts >= 1 occurrence in a symbol that exists")
+	for _, h := range g.Hazards {
+		hh := h
+		fail(rHaz, hh.N >= 1 && g.sym(hh.SymbolID) != nil, func() string {
+			return hh.Pattern() + " on symbol " + strconv.Itoa(int(hh.SymbolID))
+		})
+	}
+	rFrame := add("a function's largest local is no larger than its whole frame")
+	frame, big := g.shapeCounts("frame_bytes"), g.shapeCounts("frame_max_local")
+	for id, b := range big {
+		if s := g.sym(id); s != nil {
+			fail(rFrame, b <= frame[id], at(s))
+		}
+	}
+	rDisc := add("a result is not ignored at more call sites than there are calls")
+	_, rows := qQ25(g, params{mod: "%", lim: -1})
+	for _, r := range rows {
+		rr := r
+		fail(rDisc, rr[1].i <= rr[2].i, func() string { return rr[0].s })
+	}
+
+	fmt.Fprintf(w, "\n%s\nSELF-CHECK\n%s\n", strings.Repeat("=", 78), strings.Repeat("-", 78))
+	fmt.Fprintln(w, " Each rule ties two numbers computed by different code. A violation is a")
+	fmt.Fprintln(w, " bug in this tool, never a property of the code it read.")
+	fmt.Fprintln(w)
+	var out [][]fval
+	nBad := 0
+	for _, r := range rules {
+		verdict := "ok"
+		if r.checked == 0 {
+			verdict = "n/a"
+		}
+		if r.bad > 0 {
+			verdict = "VIOLATED"
+			nBad++
+		}
+		out = append(out, []fval{fStr(verdict), fInt(r.bad), fInt(r.checked),
+			fStr(r.name), fStr(r.first)})
+	}
+	render(w, out, []string{"verdict", "bad", "checked", "rule", "first violation"})
+	fmt.Fprintf(w, "\n %d of %d rules violated\n", nBad, len(rules))
+	return nBad
 }
 
 func symlinkReal(link string) string {
@@ -15233,7 +15489,7 @@ func knownFlag(n string) bool {
 		return true
 	case "list", "metrics", "report", "quiet", "no-tests", "include-generated",
 		"include-vendored", "version", "deps", "force", "install-deps",
-		"schema", "help", "h":
+		"schema", "help", "h", "summary", "parse-errors", "selfcheck":
 		return true
 	}
 	return false
@@ -15277,15 +15533,57 @@ func isNegNumber(a string) bool {
 }
 
 func usage() {
-	fmt.Printf(`usage: codegraph_c [-h] [--module MODULE] [--limit LIMIT] [--list]
-                      [--json N] [--save PATH] [--save-ast PATH] [--load-ast PATH]
-                      [--force] [--deps]
-                      [--install-deps] [--include-generated]
-                      [--include-vendored] [--no-tests] [--quiet] [--version]
-                      [root] [which ...]
+	fmt.Printf(`usage: codegraph_c [options] [root] [which ...]
 
-Parse a c tree into an in-memory graph and query it in one shot. Target: %s
-`, target)
+Parse a C tree into an in-memory graph and query it in one shot.
+Target: %s
+
+  root            directory to analyse (default: .)
+  which           queries to run, by number or by name (default: all of them)
+
+what to print
+  --list          list the %d defect queries and exit
+  --metrics       switch to the %d structural metrics (combine with --list,
+                  --summary, --json, --csv or a selector)
+  --summary       one line per query: rows found and the top row. Start here.
+  --report        overview: size, call graph, how much of it to trust, the
+                  biggest modules and the heaviest functions
+  --parse-errors  what the parser could not read, and where
+  --selfcheck     test the graph against invariants its own numbers must obey
+                  (loop depth vs loop count, fan-in vs the edge table, member
+                  offsets vs struct size ...). Exits 1 if any is violated: that
+                  is a bug in this tool, not in the code it read.
+  --schema        print the tables and columns of the graph and exit
+
+narrowing
+  --module PAT    only rows whose module matches PAT (%% is a wildcard)
+  --limit N       at most N rows per query (default: all)
+  --no-tests      leave test files out of the graph
+  --include-generated, --include-vendored
+                  keep files that are skipped by default
+
+machine output
+  --json Q        one query as a JSON array (Q is a number or a name)
+  --csv Q         one query as CSV
+  --dump PATH     write every table as text
+  --save PATH     same as --dump; refuses to overwrite without --force
+  --save-ast PATH write the parsed state; --load-ast PATH reads it back and
+                  skips parsing
+
+other
+  --quiet         no progress on stderr
+  --force         allow --save / --save-ast to overwrite
+  --deps, --install-deps, --version, -h
+
+Progress and warnings go to stderr; results go to stdout.
+
+examples
+  codegraph_c src --summary
+  codegraph_c src --report
+  codegraph_c src dead-code untrusted-frontier --limit 20
+  codegraph_c src --metrics risk-ranked --limit 25 --module 'src%%'
+  codegraph_c src --json lock-order-inversion
+`, target, len(queries), len(metricsCat))
 }
 
 func fieldStrings(r []fval) []string {
@@ -17163,6 +17461,11 @@ var (
 	PComma   = mustPunct(",")
 	PHash    = mustPunct("#")
 	PHashAt  = mustPunct("##")
+	PEqEq    = mustPunct("==")
+	PNotEq   = mustPunct("!=")
+	PGe      = mustPunct(">=")
+	PSlashEq = mustPunct("/=")
+	PModEq   = mustPunct("%=")
 )
 
 func mustPunct(s string) uint8 {
@@ -17330,6 +17633,18 @@ func newLexer(src []byte, fileID uint32, errs *[]lexErr) *lexer {
 		}
 	}
 	return &lexer{src: src, lineStar: lineStar, fileID: fileID, errs: errs}
+}
+
+// onDirectiveLine reports whether the current line's first character is `#`.
+// Only consulted on the error path.
+func (lx *lexer) onDirectiveLine() bool {
+	i := int(lx.pos) - 1
+	for i >= 0 && lx.src[i] != '\n' {
+		i--
+	}
+	for i++; i < len(lx.src) && (lx.src[i] == ' ' || lx.src[i] == '\t'); i++ {
+	}
+	return i < len(lx.src) && lx.src[i] == '#'
 }
 
 func (lx *lexer) errf(off int32, msg string) {
@@ -17556,7 +17871,11 @@ func (lx *lexer) next() Tok {
 			}
 		}
 		if bestLen == 0 {
-			lx.errf(lx.pos, "stray byte in source")
+			// `#error mail bugs@example.org` and `#pragma` text are not C:
+			// any character may appear on a directive line
+			if !lx.onDirectiveLine() {
+				lx.errf(lx.pos, "stray byte in source")
+			}
 			lx.pos++
 			return lx.next()
 		}
@@ -17603,24 +17922,6 @@ func (lx *lexer) updateIncludeCtx(t Tok) {
 		case "__has_include", "__has_include_next", "__has_embed":
 			lx.includeCtx = true
 		}
-	}
-}
-
-func (lx *lexer) skipComment() {
-
-	if lx.at(lx.pos+1) == '/' {
-		for lx.pos < int32(len(lx.src)) && lx.src[lx.pos] != '\n' {
-			lx.pos++
-		}
-		return
-	}
-	lx.pos += 2
-	for lx.pos < int32(len(lx.src)) {
-		if lx.src[lx.pos] == '*' && lx.at(lx.pos+1) == '/' {
-			lx.pos += 2
-			return
-		}
-		lx.pos++
 	}
 }
 
@@ -17725,6 +18026,7 @@ type ppMacro struct {
 	Line       int32
 	FileID     uint32
 	Uses       int32
+	Multi      bool
 }
 
 type includeEdge struct {
@@ -17745,7 +18047,29 @@ type cfgRow struct {
 	fileID    uint32
 	directive string
 	expr      string
-	line      int32
+	// The condition's tokens, for a header whose tokens are shared and
+	// outlive the parse: its text is only wanted by the one unit that ends up
+	// deriving that header, so every other includer skips building it.
+	toks []Tok
+	line int32
+}
+
+func (c *cfgRow) text() string {
+	if c.toks != nil {
+		return tokLineText(c.toks)
+	}
+	return c.expr
+}
+
+// cfg records one conditional directive of src.
+func (pp *preprocessor) cfg(src *fileTokSrc, dir string, rest []Tok, line int32) {
+	row := cfgRow{fileID: src.id, directive: dir, line: line}
+	if src.lf != nil {
+		row.toks = rest
+	} else {
+		row.expr = tokLineText(rest)
+	}
+	pp.cfgs = append(pp.cfgs, row)
 }
 
 type fileTokSrc struct {
@@ -17753,6 +18077,9 @@ type fileTokSrc struct {
 	id     uint32
 	raw    []byte
 	toks   []Tok
+	lf     *lexedFile
+	own    bool
+	lineAt int
 	eofTok Tok
 	pos    int
 	once   bool
@@ -17784,10 +18111,117 @@ type preprocessor struct {
 
 	lineDelta int64
 	fileName  string
+	rootName  string
 
-	depth   int
-	stopped bool
-	nExpand int
+	depth    int
+	stopped  bool
+	nExpand  int
+	reg      *ppRegion
+	expDepth int
+	subDepth int
+}
+
+// ppRegion is everything one translation unit's preprocessing allocates and
+// nothing outlives: the macro table, the macro records in it, the hide-set
+// cells, the scratch stacks of the expander. A parse worker owns one for the
+// whole run and resets it between units, so after the first few units the
+// preprocessor allocates almost nothing -- on PostgreSQL every unit used to
+// build a ten-thousand-entry macro table from an empty map and throw it away.
+//
+// It is a typed region, not an untyped one: these records hold strings and
+// slices that live on the ordinary heap, and memory the collector cannot see
+// into would let it free them. Slabs of ppMacro and hideSet keep the pointers
+// visible and still turn a million small allocations into a few hundred.
+//
+// A region may only be reused once the unit's rows have been derived. When
+// trees are being kept (--save-ast) each unit gets a region of its own.
+type ppRegion struct {
+	macros   map[string]*ppMacro
+	fileByID map[uint32]*fileTokSrc
+	onceSet  map[string]bool
+	onStack  map[string]bool
+
+	allMacros []*ppMacro
+	files     []*fileTokSrc
+	includes  []includeEdge
+	pragmas   []pragmaRow
+	cfgs      []cfgRow
+	cond      []condState
+
+	subBufs  [][]Tok
+	expBufs  [][]Tok
+	workBufs [][]expTok
+	argToks  [][]expTok
+	argHdrs  [][][]expTok
+	argEnds  []int
+
+	macroSlabs [][]ppMacro
+	macroSlab  int
+	macroNext  int
+	hideSlabs  [][]hideSet
+	hideSlab   int
+	hideNext   int
+
+	last *preprocessor
+}
+
+const (
+	macroSlabLen = 1024
+	hideSlabLen  = 4096
+)
+
+func newPPRegion() *ppRegion {
+	return &ppRegion{
+		macros:   map[string]*ppMacro{},
+		fileByID: map[uint32]*fileTokSrc{},
+		onceSet:  map[string]bool{},
+		onStack:  map[string]bool{},
+	}
+}
+
+// reset takes back what the previous unit's preprocessor grew and empties it.
+func (r *ppRegion) reset() {
+	if pp := r.last; pp != nil {
+		r.allMacros, r.files = pp.allMacros[:0], pp.files[:0]
+		r.includes, r.pragmas = pp.includes[:0], pp.pragmas[:0]
+		r.cfgs, r.cond = pp.cfgs[:0], pp.cond[:0]
+		r.last = nil
+	}
+	clear(r.macros)
+	clear(r.fileByID)
+	clear(r.onceSet)
+	clear(r.onStack)
+	r.macroSlab, r.macroNext = 0, 0
+	r.hideSlab, r.hideNext = 0, 0
+}
+
+// newMacro returns a zeroed record from the slab.
+func (r *ppRegion) newMacro() *ppMacro {
+	if r.macroNext == macroSlabLen {
+		r.macroSlab++
+		r.macroNext = 0
+	}
+	if r.macroSlab == len(r.macroSlabs) {
+		r.macroSlabs = append(r.macroSlabs, make([]ppMacro, macroSlabLen))
+	}
+	m := &r.macroSlabs[r.macroSlab][r.macroNext]
+	r.macroNext++
+	*m = ppMacro{}
+	return m
+}
+
+func (r *ppRegion) newHide(name string, parent *hideSet) *hideSet {
+	if r.hideNext == hideSlabLen {
+		r.hideSlab++
+		r.hideNext = 0
+	}
+	if r.hideSlab == len(r.hideSlabs) {
+		r.hideSlabs = append(r.hideSlabs, make([]hideSet, hideSlabLen))
+	}
+	h := &r.hideSlabs[r.hideSlab][r.hideNext]
+	r.hideNext++
+	h.name, h.parent = name, parent
+	return h
 }
 
 type condState struct {
@@ -17797,20 +18231,52 @@ type condState struct {
 	seenElse     bool
 }
 
-func newPP(root string, incDirs []string, errs *[]lexErr) *preprocessor {
-	pp := &preprocessor{
-		macros:   map[string]*ppMacro{},
-		incDirs:  incDirs,
-		root:     root,
-		errs:     errs,
-		fileByID: map[uint32]*fileTokSrc{},
-		onceSet:  map[string]bool{},
-		onStack:  map[string]bool{},
+// predefMacros is the predefined set, lexed once; each unit copies the
+// records into its own slab because a macro counts its uses.
+var predefMacros []ppMacro
+
+func newPP(root string, incDirs []string, errs *[]lexErr, reg *ppRegion) *preprocessor {
+	if reg == nil {
+		reg = newPPRegion()
+	} else {
+		reg.reset()
 	}
+	pp := &preprocessor{
+		macros:    reg.macros,
+		incDirs:   incDirs,
+		root:      root,
+		errs:      errs,
+		fileByID:  reg.fileByID,
+		onceSet:   reg.onceSet,
+		onStack:   reg.onStack,
+		allMacros: reg.allMacros,
+		files:     reg.files,
+		includes:  reg.includes,
+		pragmas:   reg.pragmas,
+		cfgs:      reg.cfgs,
+		cond:      reg.cond,
+		reg:       reg,
+	}
+	reg.last = pp
+	for i := range predefMacros {
+		m := reg.newMacro()
+		*m = predefMacros[i]
+		pp.macros[m.Name] = m
+	}
+	return pp
+}
+
+func init() {
 
 	for _, d := range [][2]string{
 		{"__STDC__", "1"}, {"__STDC_VERSION__", "202311L"},
 		{"__STDC_HOSTED__", "1"}, {"__c23parser", "1"},
+		// What clang reports. Real C selects its implementation on this: with
+		// it absent PostgreSQL reached 1,925 #error directives ("could not
+		// find an implementation of pg_atomic_uint32") and redis compiled
+		// likely() to nothing. Measured on three trees: 76 #errors left, and
+		// not one new parse diagnostic from the GNU branches it opens.
+		{"__GNUC__", "4"}, {"__GNUC_MINOR__", "2"}, {"__GNUC_PATCHLEVEL__", "1"},
 		{"__CHAR_BIT__", "8"}, {"__SIZEOF_LONG__", "8"}, {"__SIZEOF_PTRDIFF_T__", "8"},
 		{"__SIZE_TYPE__", "unsigned long"}, {"__PTRDIFF_TYPE__", "long"},
 		{"LITTLE_ENDIAN", "1234"}, {"BIG_ENDIAN", "4321"},
@@ -17826,10 +18292,9 @@ func newPP(root string, incDirs []string, errs *[]lexErr) *preprocessor {
 		{"__has_c_attribute", "0"}, {"__has_embed", "0"},
 	} {
 
-		pp.macros[d[0]] = &ppMacro{Name: d[0], Body: ppPredefBody(d[1]),
-			Raw: d[1]}
+		predefMacros = append(predefMacros, ppMacro{Name: d[0],
+			Body: ppPredefBody(d[1]), Raw: d[1]})
 	}
-	return pp
 }
 
 func ppPredefBody(text string) []Tok {
@@ -17846,6 +18311,11 @@ func ppPredefBody(text string) []Tok {
 }
 
 func (pp *preprocessor) errf(line int32, msg string) {
+	// every preprocessor diagnostic is charged to the translation unit's root
+	// file, so one raised inside a header has to say which header
+	if pp.rootName != "" && pp.fileName != "" && pp.fileName != pp.rootName {
+		msg += " (in " + pp.fileName + ":" + strconv.Itoa(int(line)) + ")"
+	}
 	if pp.errs != nil && len(*pp.errs) < 4096 {
 		*pp.errs = append(*pp.errs, lexErr{off: 0, msg: msg, line: line})
 	}
@@ -17854,21 +18324,58 @@ func (pp *preprocessor) errf(line int32, msg string) {
 var ppSrcMu sync.RWMutex
 var ppSrcCache = map[string][]byte{}
 
-const tokBufMax = 131072
+// A unit that includes one large project header expands to a few hundred
+// thousand tokens. With the cap below that, its buffer was never returned to
+// the pool and every such unit regrew one from nothing: 500 MB of copying on
+// redis, in spans large enough to contend on the heap lock.
+const tokBufMax = 1 << 20
 
-var tokBufPool = sync.Pool{}
+// The preprocessor's output buffers are kept on an explicit free list for the
+// length of the parse, one per worker at most. They used to sit in a
+// sync.Pool, which the collector empties on every cycle: with a cycle every
+// few milliseconds each unit allocated and zeroed a fresh multi-megabyte
+// buffer, and the heap grew and shrank underneath them (an eighth of the
+// run's CPU was madvise).
+var (
+	tokFreeMu sync.Mutex
+	tokFree   [][]Tok
+)
+
+const tokFreeMax = 32
 
 func getTokBuf() []Tok {
-	if v := tokBufPool.Get(); v != nil {
-		return v.([]Tok)[:0]
+	tokFreeMu.Lock()
+	var b []Tok
+	if n := len(tokFree); n > 0 {
+		b = tokFree[n-1]
+		tokFree[n-1] = nil
+		tokFree = tokFree[:n-1]
 	}
-	return nil
+	tokFreeMu.Unlock()
+	return b[:0]
 }
 
 func putTokBuf(b []Tok) {
-	if c := cap(b); c >= 1024 && c <= tokBufMax {
-		tokBufPool.Put(b[:0])
+	if c := cap(b); c < 1024 || c > tokBufMax {
+		return
 	}
+	// Stale tokens are left in place: what their strings point at -- file
+	// text and interned names -- outlives the parse anyway, and zeroing a
+	// multi-megabyte buffer per unit is the cost this list exists to avoid.
+	tokFreeMu.Lock()
+	if len(tokFree) < tokFreeMax {
+		tokFree = append(tokFree, b[:0])
+	}
+	tokFreeMu.Unlock()
+}
+
+func dropTokBufs() {
+	tokFreeMu.Lock()
+	tokFree = nil
+	tokFreeMu.Unlock()
+	faFreeMu.Lock()
+	faFree = nil
+	faFreeMu.Unlock()
 }
 
 func ppCachedRead(abs string) ([]byte, bool) {
@@ -17878,34 +18385,105 @@ func ppCachedRead(abs string) ([]byte, bool) {
 	return data, ok
 }
 
-func (pp *preprocessor) loadFile(abs string) (*fileTokSrc, bool) {
+// A header is lexed once and its tokens shared by every translation unit that
+// includes it. Lexing it again per includer was 2.4 GB of a 3.6 GB allocation
+// total on redis -- server.h alone is read by two hundred files -- and the
+// churn, not the work, was what the run spent its time on.
+//
+// The shared slice is read-only. The one per-unit field a token carries is its
+// file id, so shared tokens hold 0 and process() stamps the id on the copies
+// it emits; nothing else reads it before then.
+type lexedFile struct {
+	data []byte
+	toks []Tok
+	errs []lexErr
+	// #define directives already parsed, by the index of the line's first
+	// token. A definition depends on nothing but its own tokens, so the
+	// second unit to include the header copies the 100-byte record instead
+	// of re-reading the parameter list and copying the body.
+	macros sync.Map
+}
+
+var (
+	lexCache     sync.Map
+	lexCacheToks atomic.Int64
+)
+
+// lexCacheMaxToks bounds what the cache may hold (about 48 bytes a token).
+// Past it, headers are lexed per use exactly as before.
+const lexCacheMaxToks = 8 << 20
+
+func lexWhole(data []byte, fileID uint32, errs *[]lexErr, toks []Tok) []Tok {
+	lex := newLexer(data, fileID, errs)
+	if want := len(data)/5 + 16; cap(toks) < want {
+		toks = make([]Tok, 0, want)
+	}
+	for {
+		t := lex.next()
+		toks = append(toks, t)
+		if t.Kind == TEOF {
+			return toks
+		}
+	}
+}
+
+func (pp *preprocessor) loadFile(abs string, shared bool) (*fileTokSrc, bool) {
 	if pp.nfiles >= maxFilesPerRun {
 		return nil, false
 	}
-	data, ok := ppCachedRead(abs)
-	if !ok {
-		fi, err := os.Stat(abs)
-		if err != nil || fi.IsDir() || fi.Size() > ppMaxFileBytes {
-			return nil, false
+	var lf *lexedFile
+	if shared {
+		if v, ok := lexCache.Load(abs); ok {
+			lf = v.(*lexedFile)
 		}
-		data, err = os.ReadFile(abs)
-		if err != nil {
-			return nil, false
+	}
+	if lf == nil {
+		data, ok := ppCachedRead(abs)
+		if !ok {
+			fi, err := os.Stat(abs)
+			if err != nil || fi.IsDir() || fi.Size() > ppMaxFileBytes {
+				return nil, false
+			}
+			data, err = os.ReadFile(abs)
+			if err != nil {
+				return nil, false
+			}
+		}
+		if shared && lexCacheToks.Load() < lexCacheMaxToks {
+			lf = &lexedFile{data: data}
+			lf.toks = lexWhole(data, 0, &lf.errs, nil)
+			if prev, loaded := lexCache.LoadOrStore(abs, lf); loaded {
+				lf = prev.(*lexedFile)
+			} else {
+				lexCacheToks.Add(int64(len(lf.toks)))
+			}
+		} else {
+			pp.nfiles++
+			pp.genFileID++
+			id := pp.genFileID
+			src := &fileTokSrc{path: abs, id: id, raw: data}
+			// a file lexed for this unit alone: its tokens die with the unit,
+			// so the buffer comes from, and goes back to, the free list
+			src.toks = lexWhole(data, id, pp.errs, getTokBuf())
+			src.own = true
+			src.eofTok = src.toks[len(src.toks)-1]
+			pp.files = append(pp.files, src)
+			pp.fileByID[id] = src
+			return src, true
 		}
 	}
 	pp.nfiles++
-	lex := newLexer(data, pp.genFileID+1, pp.errs)
-	_ = data
 	pp.genFileID++
 	id := pp.genFileID
-	src := &fileTokSrc{path: abs, id: id, raw: data}
-	src.toks = make([]Tok, 0, len(data)/7+16)
-	for {
-		t := lex.next()
-		src.toks = append(src.toks, t)
-		if t.Kind == TEOF {
-			src.eofTok = t
-			break
+	src := &fileTokSrc{path: abs, id: id, raw: lf.data, toks: lf.toks, lf: lf}
+	src.eofTok = lf.toks[len(lf.toks)-1]
+	src.eofTok.File = tokFileID(id)
+	if pp.errs != nil {
+		for _, e := range lf.errs {
+			if len(*pp.errs) < 4096 {
+				e.msg += " (in " + pp.relFileName(abs) + ":" + strconv.Itoa(int(e.line)) + ")"
+				*pp.errs = append(*pp.errs, e)
+			}
 		}
 	}
 	pp.files = append(pp.files, src)
@@ -17924,13 +18502,24 @@ func (pp *preprocessor) relFileName(abs string) string {
 	if r, err := filepath.Rel(base, abs); err == nil && !strings.HasPrefix(r, "..") {
 		return filepath.ToSlash(r)
 	}
-	return abs
+	// a header elsewhere in the tree: relative to the tree, never absolute --
+	// an absolute path in a message makes the output depend on where the
+	// checkout happens to live
+	if ppTreeRoot != "" {
+		if r, err := filepath.Rel(ppTreeRoot, abs); err == nil && !strings.HasPrefix(r, "..") {
+			return filepath.ToSlash(r)
+		}
+	}
+	return filepath.Base(abs)
 }
+
+var ppTreeRoot string
 
 func (pp *preprocessor) run(abs string) []Tok {
 	pp.out = getTokBuf()
 	pp.fileName = pp.relFileName(abs)
-	if src, ok := pp.loadFile(abs); ok {
+	pp.rootName = pp.fileName
+	if src, ok := pp.loadFile(abs, false); ok {
 		pp.process(src, 1)
 	}
 
@@ -17954,10 +18543,14 @@ func (pp *preprocessor) process(src *fileTokSrc, depth int) {
 	defer func() {
 		src.active = false
 		pp.onStack[src.path] = false
+		if src.own {
+			putTokBuf(src.toks)
+		}
 		src.toks = nil
 		pp.fileName = savedName
 	}()
 
+	fidTok := tokFileID(src.id)
 	for src.pos < len(src.toks) {
 		t := src.toks[src.pos]
 		if t.Kind == TEOF {
@@ -17979,6 +18572,7 @@ func (pp *preprocessor) process(src *fileTokSrc, depth int) {
 			continue
 		}
 		if line[0].Kind == TPunct && line[0].Punct == PHash {
+			src.lineAt = lineStart
 			pp.directive(src, line, line[0].Line, depth)
 			if pp.stopped {
 				return
@@ -17989,11 +18583,85 @@ func (pp *preprocessor) process(src *fileTokSrc, depth int) {
 			continue
 		}
 		if pp.lineMayExpand(line) {
+			// A function-like macro invocation may run over several lines.
+			// Expansion is per line, so one left open at the end of a line
+			// was never expanded at all: `serverLog(LL_WARNING,\n "...")`
+			// stayed a call to the macro's name and the function behind it
+			// lost the edge. Pull lines in until the invocation closes.
+			if pp.openInvocation(line) {
+				joined := append(make([]Tok, 0, len(line)*3), line...)
+				for n := 0; n < 4000 && src.pos < len(src.toks); n++ {
+					nt := src.toks[src.pos]
+					if nt.Kind == TEOF || (nt.Kind == TPunct && nt.Punct == PHash) {
+						break
+					}
+					e := src.pos
+					for e < len(src.toks) && src.toks[e].Kind != TNewline &&
+						src.toks[e].Kind != TEOF {
+						e++
+					}
+					joined = append(joined, src.toks[src.pos:e]...)
+					src.pos = e
+					if e < len(src.toks) && src.toks[e].Kind == TNewline {
+						src.pos++
+					}
+					if !pp.openInvocation(joined) {
+						break
+					}
+				}
+				line = joined
+			}
+			n0 := len(pp.out)
 			pp.out = append(pp.out, pp.expand(line)...)
+			for k := n0; k < len(pp.out); k++ {
+				pp.out[k].File = fidTok
+			}
 		} else {
+			n0 := len(pp.out)
 			pp.out = append(pp.out, line...)
+			for k := n0; k < len(pp.out); k++ {
+				pp.out[k].File = fidTok
+			}
 		}
 	}
+}
+
+// openInvocation reports whether toks ends inside the argument list of a
+// function-like macro: the name was seen, its `(` opened, and the matching
+// `)` has not arrived.
+func (pp *preprocessor) openInvocation(toks []Tok) bool {
+	depth := 0
+	in := false
+	for i := range toks {
+		t := &toks[i]
+		if !in {
+			if t.Kind != TIdent || i+1 >= len(toks) {
+				continue
+			}
+			nx := &toks[i+1]
+			if nx.Kind != TPunct || nx.Punct != PLparen {
+				continue
+			}
+			if m, ok := pp.macros[t.Text]; ok && m.IsFn {
+				in = true
+				depth = 0
+			}
+			continue
+		}
+		if t.Kind != TPunct {
+			continue
+		}
+		switch t.Punct {
+		case PLparen:
+			depth++
+		case PRparen:
+			depth--
+			if depth == 0 {
+				in = false
+			}
+		}
+	}
+	return in
 }
 
 func (pp *preprocessor) directive(src *fileTokSrc, line []Tok, dirLine int32, depth int) {
@@ -18019,13 +18687,12 @@ func (pp *preprocessor) directive(src *fileTokSrc, line []Tok, dirLine int32, de
 	case "include", "include_next":
 		pp.doInclude(src, rest, dirLine, depth)
 	case "if":
-		expr := tokLineText(rest)
 		val := int64(0)
 		active := pp.condActive()
 		if active {
 			val = pp.evalCond(src, rest, dirLine)
 		}
-		pp.cfgs = append(pp.cfgs, cfgRow{src.id, "if", expr, dirLine})
+		pp.cfg(src, "if", rest, dirLine)
 		on := active && val != 0
 		pp.cond = append(pp.cond, condState{parentActive: active,
 			takenYet: on, activeNow: on})
@@ -18041,18 +18708,17 @@ func (pp *preprocessor) directive(src *fileTokSrc, line []Tok, dirLine int32, de
 				val = !def
 			}
 		}
-		pp.cfgs = append(pp.cfgs, cfgRow{src.id, dir, tokLineText(rest), dirLine})
+		pp.cfg(src, dir, rest, dirLine)
 		on := pp.condActive() && val
 		pp.cond = append(pp.cond, condState{parentActive: pp.condActive(),
 			takenYet: on, activeNow: on})
 	case "elif":
-		expr := tokLineText(rest)
 		if len(pp.cond) == 0 {
 			pp.errf(dirLine, "#elif without #if")
 			return
 		}
 		st := &pp.cond[len(pp.cond)-1]
-		pp.cfgs = append(pp.cfgs, cfgRow{src.id, "elif", expr, dirLine})
+		pp.cfg(src, "elif", rest, dirLine)
 		if st.seenElse {
 			pp.errf(dirLine, "#elif after #else")
 			return
@@ -18068,7 +18734,7 @@ func (pp *preprocessor) directive(src *fileTokSrc, line []Tok, dirLine int32, de
 			return
 		}
 		st := &pp.cond[len(pp.cond)-1]
-		pp.cfgs = append(pp.cfgs, cfgRow{src.id, dir, tokLineText(rest), dirLine})
+		pp.cfg(src, dir, rest, dirLine)
 		if st.seenElse {
 			return
 		}
@@ -18090,12 +18756,12 @@ func (pp *preprocessor) directive(src *fileTokSrc, line []Tok, dirLine int32, de
 			return
 		}
 		st := &pp.cond[len(pp.cond)-1]
-		pp.cfgs = append(pp.cfgs, cfgRow{src.id, "else", "", dirLine})
+		pp.cfgs = append(pp.cfgs, cfgRow{fileID: src.id, directive: "else", line: dirLine})
 		st.seenElse = true
 		st.activeNow = st.parentActive && !st.takenYet
 		st.takenYet = st.takenYet || st.activeNow
 	case "endif":
-		pp.cfgs = append(pp.cfgs, cfgRow{src.id, "endif", "", dirLine})
+		pp.cfgs = append(pp.cfgs, cfgRow{fileID: src.id, directive: "endif", line: dirLine})
 		if len(pp.cond) == 0 {
 			pp.errf(dirLine, "#endif without #if")
 			return
@@ -18144,15 +18810,6 @@ func (pp *preprocessor) condActive() bool {
 	return true
 }
 
-func (pp *preprocessor) condActiveOuter() bool {
-	for i := 0; i < len(pp.cond)-1; i++ {
-		if !pp.cond[i].activeNow {
-			return false
-		}
-	}
-	return true
-}
-
 func (pp *preprocessor) doDefine(src *fileTokSrc, line []Tok) {
 
 	if len(line) < 3 || line[2].Kind != TIdent {
@@ -18160,7 +18817,20 @@ func (pp *preprocessor) doDefine(src *fileTokSrc, line []Tok) {
 		return
 	}
 	nmTok := line[2]
-	m := &ppMacro{Name: nmTok.Text, FileID: src.id, Line: nmTok.Line}
+	if src.lf != nil {
+		if t, ok := src.lf.macros.Load(src.lineAt); ok {
+			m := pp.reg.newMacro()
+			*m = *t.(*ppMacro)
+			m.FileID = src.id
+			pp.allMacros = append(pp.allMacros, m)
+			if pp.condActive() {
+				pp.macros[m.Name] = m
+			}
+			return
+		}
+	}
+	m := pp.reg.newMacro()
+	m.Name, m.FileID, m.Line = nmTok.Text, src.id, nmTok.Line
 	i := 3
 	if i < len(line) && line[i].Kind == TPunct && line[i].Punct == PLparen && !line[i].WSBefore {
 
@@ -18217,6 +18887,19 @@ func (pp *preprocessor) doDefine(src *fileTokSrc, line []Tok) {
 		m.Body = append([]Tok(nil), line[i:]...)
 	}
 	m.Raw = tokLineText(line[3:])
+	// Raw has its continuations spliced out, so a trailing backslash can never
+	// be seen there; the definition is multi-line iff its tokens span lines.
+	for _, t := range line[3:] {
+		if t.Kind != TNewline && t.Line > nmTok.Line {
+			m.Multi = true
+			break
+		}
+	}
+	if src.lf != nil {
+		t := new(ppMacro)
+		*t = *m
+		src.lf.macros.Store(src.lineAt, t)
+	}
 	pp.allMacros = append(pp.allMacros, m)
 	if pp.condActive() {
 		pp.macros[m.Name] = m
@@ -18249,7 +18932,11 @@ func (pp *preprocessor) doInclude(src *fileTokSrc, rest []Tok, dirLine int32, de
 		}
 	}
 	if tgt == "" {
-		pp.errf(dirLine, "malformed #include")
+		// `#if defined(X)` / `#include X` / `#endif`: in the arm that is not
+		// taken there is nothing to resolve and nothing wrong
+		if pp.condActive() {
+			pp.errf(dirLine, "malformed #include")
+		}
 		return
 	}
 	resolved := pp.resolveInclude(src, tgt, sys)
@@ -18261,7 +18948,7 @@ func (pp *preprocessor) doInclude(src *fileTokSrc, rest []Tok, dirLine int32, de
 	if pp.onceSet[resolved] || pp.onStack[resolved] {
 		return
 	}
-	nxt, ok := pp.loadFile(resolved)
+	nxt, ok := pp.loadFile(resolved, true)
 	if !ok {
 		return
 	}
@@ -18288,23 +18975,92 @@ var (
 	incCache   = map[incCacheKey]string{}
 
 	statSeen sync.Map
+	dirSeen  sync.Map
 )
 
+// statIsFile answers "is p an existing non-directory" from one listing of its
+// directory instead of one stat per candidate. Include resolution probes every
+// (directory, name) pair it is asked about and most probes miss; a miss costs
+// a syscall, and on redis those were a fifth of the run's CPU. Only a symlink
+// (which may point at a directory) still needs its own stat.
 func statIsFile(p string) bool {
 	if v, ok := statSeen.Load(p); ok {
 		return v.(bool)
 	}
-	fi, err := os.Stat(p)
-	r := err == nil && !fi.IsDir()
+	dir, base := filepath.Split(p)
+	ents := dirEntries(dir)
+	r := false
+	switch {
+	case ents == nil:
+		fi, err := os.Stat(p)
+		r = err == nil && !fi.IsDir()
+	case ents[base] == 1:
+		r = true
+	case ents[base] == 2, ents[base] == 0 && ents["\x00"+strings.ToLower(base)] != 0:
+		fi, err := os.Stat(p)
+		r = err == nil && !fi.IsDir()
+	}
 	statSeen.Store(p, r)
 	return r
 }
 
-func (pp *preprocessor) resolveInclude(src *fileTokSrc, tgt string, sys bool) string {
-	key := incCacheKey{root: pp.root, tgt: tgt, sys: sys}
-	if !sys {
-		key.dir = filepath.Dir(src.path)
+// dirEntries lists dir once: 1 a regular file, 3 a directory, 2 anything else
+// (a symlink, which only a stat can classify). nil means the listing failed
+// for a reason other than the directory not existing.
+//
+// Whether dir exists at all is first asked of its PARENT's listing. Include
+// resolution probes `<includer's dir>/utils/rel.h` for every includer, and on
+// PostgreSQL nearly every one of those `utils` directories does not exist:
+// answering from the parent turned eighteen thousand failed opens into none.
+func dirEntries(dir string) map[string]uint8 {
+	if v, ok := dirSeen.Load(dir); ok {
+		return v.(map[string]uint8)
 	}
+	ents := map[string]uint8{}
+	clean := strings.TrimRight(dir, string(filepath.Separator))
+	if ppTreeRoot != "" && len(clean) > len(ppTreeRoot) && strings.HasPrefix(clean, ppTreeRoot) {
+		parent, name := filepath.Split(clean)
+		if pe := dirEntries(parent); pe != nil && pe[name] != 3 && pe[name] != 2 &&
+			pe["\x00"+strings.ToLower(name)] == 0 {
+			dirSeen.Store(dir, ents)
+			return ents
+		}
+	}
+	{
+		if des, err := os.ReadDir(dir); err == nil {
+			for _, de := range des {
+				switch t := de.Type(); {
+				case t.IsRegular():
+					ents[de.Name()] = 1
+				case t.IsDir():
+					ents[de.Name()] = 3
+				default:
+					ents[de.Name()] = 2
+				}
+				// a case-insensitive filesystem resolves `Foo.h` to `foo.h`;
+				// whether this one does is the filesystem's to say
+				ents["\x00"+strings.ToLower(de.Name())] = 2
+			}
+		} else if !os.IsNotExist(err) {
+			ents = nil
+		}
+		dirSeen.Store(dir, ents)
+	}
+	return ents
+}
+
+func (pp *preprocessor) resolveInclude(src *fileTokSrc, tgt string, sys bool) string {
+	// The last place looked is the directory of the translation unit's root
+	// file -- what `cc -I.` run beside the source gives. pp.root is that FILE;
+	// joining the target onto it made a path that cannot exist, probed once per
+	// (unit, include) because the cache key carried the file too.
+	tuDir := ""
+	if pp.root != "" {
+		tuDir = filepath.Dir(pp.root)
+	}
+	// the includer's directory is part of the key for both forms: the tree
+	// lookup below breaks ties by it
+	key := incCacheKey{root: tuDir, tgt: tgt, sys: sys, dir: filepath.Dir(src.path)}
 	cacheable := len(pp.incDirs) == 0
 	if cacheable {
 		incCacheMu.RLock()
@@ -18321,8 +19077,8 @@ func (pp *preprocessor) resolveInclude(src *fileTokSrc, tgt string, sys bool) st
 	for _, d := range pp.incDirs {
 		cands = append(cands, filepath.Join(d, tgt))
 	}
-	if pp.root != "" {
-		cands = append(cands, filepath.Join(pp.root, tgt))
+	if tuDir != "" && (sys || tuDir != key.dir) {
+		cands = append(cands, filepath.Join(tuDir, tgt))
 	}
 	res := ""
 	for _, c := range cands {
@@ -18335,6 +19091,9 @@ func (pp *preprocessor) resolveInclude(src *fileTokSrc, tgt string, sys bool) st
 			break
 		}
 	}
+	if res == "" && !(sys && isSystemHeader(tgt)) {
+		res = treeLookup(key.dir, tgt)
+	}
 	if cacheable {
 		incCacheMu.Lock()
 		incCache[key] = res
@@ -18342,6 +19101,94 @@ func (pp *preprocessor) resolveInclude(src *fileTokSrc, tgt string, sys bool) st
 	}
 	return res
 }
+
+// treeIdx maps a file's base name to every catalogued file with that name.
+// It stands in for the -I flags nobody passed: a project built with
+// `-I src/include` writes `#include "utils/rel.h"`, which is next to neither
+// the includer nor the unit. Without it PostgreSQL resolved almost none of its
+// own headers -- a third of its call sites were macros left unexpanded and a
+// third of its files failed to parse on type names they had never seen.
+var treeIdx map[string][]string
+
+func buildTreeIdx(paths []string) {
+	m := make(map[string][]string, len(paths))
+	for _, p := range paths {
+		b := filepath.Base(p)
+		m[b] = append(m[b], p)
+	}
+	for _, v := range m {
+		sort.Strings(v)
+	}
+	treeIdx = m
+}
+
+// treeLookup finds the file in the tree whose path ENDS with tgt. With one
+// match that is the answer. With several -- `port.h` exists per platform --
+// it takes the one sharing the most leading directories with the includer,
+// then the shortest path, then the first in order. The choice depends only
+// on the two paths, never on what was resolved before, so a run is
+// reproducible whatever order the files are parsed in.
+func treeLookup(fromDir, tgt string) string {
+	if treeIdx == nil || tgt == "" || strings.Contains(tgt, "..") {
+		return ""
+	}
+	tgt = filepath.Clean(filepath.FromSlash(tgt))
+	suffix := string(filepath.Separator) + tgt
+	best, bestShared := "", -1
+	for _, c := range treeIdx[filepath.Base(tgt)] {
+		if !strings.HasSuffix(c, suffix) {
+			continue
+		}
+		shared := sharedDirs(fromDir, c)
+		if shared > bestShared || (shared == bestShared && len(c) < len(best)) {
+			best, bestShared = c, shared
+		}
+	}
+	return best
+}
+
+// sharedDirs counts the leading path components a and b have in common.
+func sharedDirs(a, b string) int {
+	n := 0
+	for i := 0; i < len(a) && i < len(b) && a[i] == b[i]; i++ {
+		if a[i] == filepath.Separator {
+			n++
+		}
+	}
+	return n
+}
+
+// isSystemHeader: names the C library and the kernel own. A tree that ships a
+// shim for one (PostgreSQL's port/win32/sys/socket.h) does not mean a Unix
+// build of it includes that shim for `<sys/socket.h>`.
+func isSystemHeader(tgt string) bool {
+	for _, p := range [...]string{"sys/", "netinet/", "arpa/", "net/", "linux/",
+		"mach/", "machine/", "bits/", "asm/", "netinet6/", "rpc/"} {
+		if strings.HasPrefix(tgt, p) {
+			return true
+		}
+	}
+	return stdHeaders[tgt]
+}
+
+var stdHeaders = func() map[string]bool {
+	m := map[string]bool{}
+	for _, h := range strings.Fields(`assert.h complex.h ctype.h errno.h fenv.h
+		float.h inttypes.h iso646.h limits.h locale.h math.h setjmp.h signal.h
+		stdalign.h stdarg.h stdatomic.h stdbit.h stdbool.h stdckdint.h stddef.h
+		stdint.h stdio.h stdlib.h stdnoreturn.h string.h tgmath.h threads.h
+		time.h uchar.h wchar.h wctype.h
+		aio.h cpio.h dirent.h dlfcn.h fcntl.h fnmatch.h ftw.h glob.h grp.h
+		iconv.h langinfo.h libgen.h monetary.h mqueue.h ndbm.h netdb.h nl_types.h
+		poll.h pthread.h pwd.h regex.h sched.h search.h semaphore.h spawn.h
+		strings.h stropts.h syslog.h tar.h termios.h trace.h ulimit.h unistd.h
+		utime.h utmpx.h wordexp.h getopt.h alloca.h malloc.h endian.h byteswap.h
+		execinfo.h ifaddrs.h io.h direct.h process.h windows.h winsock2.h
+		ws2tcpip.h crtdbg.h`) {
+		m[h] = true
+	}
+	return m
+}()
 
 func (pp *preprocessor) doLine(src *fileTokSrc, rest []Tok, dirLine int32) {
 	if len(rest) == 0 {
@@ -18384,21 +19231,24 @@ type expTok struct {
 	hide *hideSet
 }
 
+// A hide set is the macros a token must not be expanded by again. It only
+// ever grows by one name per expansion and is shared by every token that
+// expansion produced, so it is a linked list sharing its tail with its
+// parent: one 32-byte cell per expansion, where copying a hash map per
+// expansion was 380 MB on PostgreSQL. Sets are as deep as macros nest --
+// a handful -- so the walk in has() is shorter than a hash.
 type hideSet struct {
-	names map[string]bool
+	name   string
+	parent *hideSet
 }
 
-func (h *hideSet) has(n string) bool { return h != nil && h.names[n] }
-
-func addHide(h *hideSet, name string) *hideSet {
-	nh := &hideSet{names: map[string]bool{}}
-	if h != nil {
-		for k := range h.names {
-			nh.names[k] = true
+func (h *hideSet) has(n string) bool {
+	for ; h != nil; h = h.parent {
+		if h.name == n {
+			return true
 		}
 	}
-	nh.names[name] = true
-	return nh
+	return false
 }
 
 func (pp *preprocessor) lineMayExpand(in []Tok) bool {
@@ -18417,8 +19267,26 @@ func (pp *preprocessor) lineMayExpand(in []Tok) bool {
 	return false
 }
 
+// workBuf returns this nesting depth's pending-token stack, emptied, with room
+// for n. expandWork hands it back when it finishes.
+func (pp *preprocessor) workBuf(n int) []expTok {
+	d := pp.expDepth
+	for d >= len(pp.reg.workBufs) {
+		pp.reg.workBufs = append(pp.reg.workBufs, nil)
+		pp.reg.expBufs = append(pp.reg.expBufs, nil)
+	}
+	w := pp.reg.workBufs[d]
+	if cap(w) < n {
+		w = make([]expTok, 0, n+n/2+16)
+	}
+	return w[:0]
+}
+
+// expand returns the expansion of in. The result lives in a buffer owned by
+// the current nesting depth: it is valid until the next expansion at that
+// depth, so a caller that needs two results at once must copy the first.
 func (pp *preprocessor) expand(in []Tok) []Tok {
-	work := make([]expTok, len(in))
+	work := pp.workBuf(len(in))[:len(in)]
 	for i := range in {
 		work[len(in)-1-i] = expTok{in[i], nil}
 	}
@@ -18426,7 +19294,7 @@ func (pp *preprocessor) expand(in []Tok) []Tok {
 }
 
 func (pp *preprocessor) expandETS(ets []expTok) []Tok {
-	work := make([]expTok, 0, len(ets)+32)
+	work := pp.workBuf(len(ets))
 	for i := len(ets) - 1; i >= 0; i-- {
 		work = append(work, ets[i])
 	}
@@ -18434,7 +19302,18 @@ func (pp *preprocessor) expandETS(ets []expTok) []Tok {
 }
 
 func (pp *preprocessor) expandWork(work []expTok) []Tok {
-	out := make([]Tok, 0, cap(work))
+	d := pp.expDepth
+	pp.expDepth++
+	for d >= len(pp.reg.expBufs) {
+		pp.reg.workBufs = append(pp.reg.workBufs, nil)
+		pp.reg.expBufs = append(pp.reg.expBufs, nil)
+	}
+	out := pp.reg.expBufs[d][:0]
+	defer func() {
+		pp.reg.expBufs[d] = out
+		pp.reg.workBufs[d] = work[:0]
+		pp.expDepth--
+	}()
 	for len(work) > 0 {
 		et := work[len(work)-1]
 		work = work[:len(work)-1]
@@ -18458,7 +19337,7 @@ func (pp *preprocessor) expandWork(work []expTok) []Tok {
 		}
 		if !m.IsFn {
 			m.Uses++
-			nh := addHide(et.hide, m.Name)
+			nh := pp.reg.newHide(m.Name, et.hide)
 			sub := pp.subst(m, nil, nh, t)
 			for k := len(sub) - 1; k >= 0; k-- {
 				work = append(work, expTok{sub[k], nh})
@@ -18481,7 +19360,7 @@ func (pp *preprocessor) expandWork(work []expTok) []Tok {
 		}
 		work = rest
 		m.Uses++
-		nh := addHide(et.hide, m.Name)
+		nh := pp.reg.newHide(m.Name, et.hide)
 		sub := pp.subst(m, args, nh, t)
 		for k := len(sub) - 1; k >= 0; k-- {
 			work = append(work, expTok{sub[k], nh})
@@ -18490,48 +19369,78 @@ func (pp *preprocessor) expandWork(work []expTok) []Tok {
 	return out
 }
 
+// collectArgs splits the tokens after a macro's `(` into its arguments. They
+// are gathered into one buffer per nesting depth and sliced apart at the end;
+// the caller substitutes them before it can collect again at this depth.
 func (pp *preprocessor) collectArgs(work []expTok) ([][]expTok, []expTok, bool) {
-	var args [][]expTok
-	cur := []expTok{}
+	r := pp.reg
+	d := pp.expDepth
+	for d >= len(r.argToks) {
+		r.argToks = append(r.argToks, nil)
+		r.argHdrs = append(r.argHdrs, nil)
+	}
+	buf := r.argToks[d][:0]
+	ends := r.argEnds[:0]
 	depth := 1
 	i := len(work) - 1
-	for i >= 0 {
+	done := false
+	for i >= 0 && !done {
 		et := work[i]
 		t := et.t
 		i--
-		if t.Kind == TEOF {
+		switch {
+		case t.Kind == TEOF:
+			r.argToks[d], r.argEnds = buf, ends
 			return nil, work, false
-		}
-		if t.Kind == TPunct && t.Punct == PLparen {
+		case t.Kind == TPunct && t.Punct == PLparen:
 			depth++
-			cur = append(cur, et)
-			continue
-		}
-		if t.Kind == TPunct && t.Punct == PRparen {
+			buf = append(buf, et)
+		case t.Kind == TPunct && t.Punct == PRparen:
 			depth--
 			if depth == 0 {
-				args = append(args, cur)
-				return args, work[:i+1], true
+				ends = append(ends, len(buf))
+				done = true
+			} else {
+				buf = append(buf, et)
 			}
-			cur = append(cur, et)
-			continue
+		case t.Kind == TPunct && t.Punct == PComma && depth == 1:
+			ends = append(ends, len(buf))
+		case t.Kind == TNewline:
+		default:
+			buf = append(buf, et)
 		}
-		if t.Kind == TPunct && t.Punct == PComma && depth == 1 {
-			args = append(args, cur)
-			cur = []expTok{}
-			continue
-		}
-		if t.Kind == TNewline {
-			continue
-		}
-		cur = append(cur, et)
 	}
-	return nil, work, false
+	r.argToks[d], r.argEnds = buf, ends
+	if !done {
+		return nil, work, false
+	}
+	args := r.argHdrs[d][:0]
+	prev := 0
+	for _, e := range ends {
+		args = append(args, buf[prev:e:e])
+		prev = e
+	}
+	r.argHdrs[d] = args
+	return args, work[:i+1], true
 }
 
 func (pp *preprocessor) subst(m *ppMacro, args [][]expTok, useHide *hideSet, use Tok) []Tok {
 	body := m.Body
-	out := make([]Tok, 0, len(body)+16)
+	// The replacement list is built in a scratch buffer owned by this nesting
+	// depth and handed back still pointing into it: every caller copies the
+	// tokens out before it can call subst at the same depth again, and a
+	// nested expansion runs one level down. Allocating it fresh per expansion
+	// was 1.5 GB on PostgreSQL.
+	d := pp.subDepth
+	pp.subDepth++
+	if d >= len(pp.reg.subBufs) {
+		pp.reg.subBufs = append(pp.reg.subBufs, nil)
+	}
+	out := pp.reg.subBufs[d][:0]
+	defer func() {
+		pp.reg.subBufs[d] = out
+		pp.subDepth--
+	}()
 	vaArgs := [][]expTok(nil)
 	if m.IsVariadic && args != nil && len(args) > len(m.Params) {
 		vaArgs = args[len(m.Params):]
@@ -18593,14 +19502,32 @@ func (pp *preprocessor) subst(m *ppMacro, args [][]expTok, useHide *hideSet, use
 			if bi+1 < len(body) {
 				nt := body[bi+1]
 				right = nil
+				isParam := false
 				if nt.Kind == TIdent {
 					if ai := paramIndex(m, nt.Text); ai >= 0 {
 						right = argToks(args[ai])
+						isParam = true
 					} else if m.IsVariadic && nt.Text == m.VaName {
 						right = joinVA(argTokss(vaArgs), use)
+						isParam = true
+						// GNU `, ## __VA_ARGS__`: the comma survives when
+						// there are arguments and is deleted when there are
+						// none. It is never pasted onto the first argument.
+						if len(out) > 0 && out[len(out)-1].Kind == TPunct &&
+							out[len(out)-1].Punct == PComma {
+							if len(right) == 0 {
+								out = out[:len(out)-1]
+							} else {
+								out = append(out, right...)
+							}
+							bi++
+							continue
+						}
 					}
 				}
-				if right == nil {
+				// an EMPTY argument pastes as nothing; only a token that is
+				// not a parameter at all stands for itself
+				if right == nil && !isParam {
 					right = []Tok{nt}
 				}
 				bi++
@@ -18623,7 +19550,16 @@ func (pp *preprocessor) subst(m *ppMacro, args [][]expTok, useHide *hideSet, use
 				continue
 			}
 			if m.IsVariadic && bt.Text == m.VaName {
-				out = append(out, joinVA(argTokss(vaArgs), use)...)
+				// __VA_ARGS__ is a parameter like any other: its arguments are
+				// macro-expanded BEFORE substitution (C23 6.10.5.2). Passing
+				// them through raw broke every argument-counting macro --
+				// NARG(a, b) handed ARG_N the unexpanded RSEQ_N() as one arg.
+				exp := make([][]Tok, len(vaArgs))
+				for k, va := range vaArgs {
+					// copied: the next argument's expansion reuses the buffer
+					exp[k] = append([]Tok(nil), pp.expandETS(va)...)
+				}
+				out = append(out, joinVA(exp, use)...)
 				continue
 			}
 		}
@@ -18929,11 +19865,6 @@ func (e *ev) cond() int64 {
 	return c
 }
 
-func (e *ev) binops(level int) int64 {
-
-	return 0
-}
-
 func (e *ev) logor() int64 {
 	v := e.logand()
 	for {
@@ -19154,6 +20085,13 @@ func (e *ev) primary() int64 {
 		case "false":
 			return 0
 		}
+		// Still an identifier after expansion, so no header in the tree
+		// defined it. For the <limits.h>/<stdint.h> limits that is because the
+		// system header was not read, not because the value is 0 -- and code
+		// that selects on UINTPTR_MAX otherwise falls through to its #error.
+		if v, ok := condLimits[t.Text]; ok {
+			return v
+		}
 		return 0
 	case TPunct:
 		if t.Punct == PLparen {
@@ -19169,6 +20107,43 @@ func (e *ev) primary() int64 {
 	e.bad = true
 	return 0
 }
+
+// condLimits is the LP64 model already stated in meta.layout_model. Unsigned
+// 64-bit maxima are stored as the bit pattern parseCInt gives the literal, so
+// `UINTPTR_MAX == 0xffffffffffffffff` compares equal.
+var condLimits = func() map[string]int64 {
+	u64, _ := parseCInt("0xffffffffffffffff")
+	const i64 = int64(9223372036854775807)
+	return map[string]int64{
+		"CHAR_BIT": 8, "SCHAR_MAX": 127, "SCHAR_MIN": -128, "UCHAR_MAX": 255,
+		"CHAR_MAX": 127, "CHAR_MIN": -128,
+		"SHRT_MAX": 32767, "SHRT_MIN": -32768, "USHRT_MAX": 65535,
+		"INT_MAX": 2147483647, "INT_MIN": -2147483648, "UINT_MAX": 4294967295,
+		"LONG_MAX": i64, "LONG_MIN": -i64 - 1, "ULONG_MAX": u64,
+		"LLONG_MAX": i64, "LLONG_MIN": -i64 - 1, "ULLONG_MAX": u64,
+		"INT8_MAX": 127, "INT16_MAX": 32767, "INT32_MAX": 2147483647, "INT64_MAX": i64,
+		"INT8_MIN": -128, "INT16_MIN": -32768, "INT32_MIN": -2147483648, "INT64_MIN": -i64 - 1,
+		"UINT8_MAX": 255, "UINT16_MAX": 65535, "UINT32_MAX": 4294967295, "UINT64_MAX": u64,
+		"INTPTR_MAX": i64, "INTPTR_MIN": -i64 - 1, "UINTPTR_MAX": u64,
+		"INTMAX_MAX": i64, "INTMAX_MIN": -i64 - 1, "UINTMAX_MAX": u64,
+		"SIZE_MAX": u64, "SSIZE_MAX": i64, "PTRDIFF_MAX": i64, "PTRDIFF_MIN": -i64 - 1,
+		"__WORDSIZE": 64, "__SIZEOF_POINTER__": 8, "__SIZEOF_INT__": 4,
+		"__SIZEOF_SHORT__": 2, "__SIZEOF_LONG_LONG__": 8, "__SIZEOF_SIZE_T__": 8,
+		"__LP64__": 1, "_LP64": 1,
+		// what AC_CHECK_SIZEOF / AC_CHECK_ALIGNOF write into a generated
+		// config.h, under the same LP64 model; the generated header is never
+		// in a source tree, and code that selects on these ends in #error
+		"SIZEOF_CHAR": 1, "SIZEOF_SHORT": 2, "SIZEOF_INT": 4, "SIZEOF_LONG": 8,
+		"SIZEOF_LONG_LONG": 8, "SIZEOF_LONG_INT": 8, "SIZEOF_LONG_LONG_INT": 8,
+		"SIZEOF_VOID_P": 8, "SIZEOF_VOIDP": 8, "SIZEOF_SIZE_T": 8,
+		"SIZEOF_OFF_T": 8, "SIZEOF_TIME_T": 8, "SIZEOF_PTRDIFF_T": 8,
+		"SIZEOF_INTPTR_T": 8, "SIZEOF_UINTPTR_T": 8, "SIZEOF_FLOAT": 4,
+		"SIZEOF_DOUBLE": 8, "SIZEOF_INT64_T": 8, "SIZEOF_INT32_T": 4,
+		"ALIGNOF_SHORT": 2, "ALIGNOF_INT": 4, "ALIGNOF_LONG": 8,
+		"ALIGNOF_LONG_LONG_INT": 8, "ALIGNOF_DOUBLE": 8, "ALIGNOF_INT64_T": 8,
+		"MAXIMUM_ALIGNOF": 8,
+	}
+}()
 
 func parseCInt(s string) (int64, bool) {
 	s = strings.ReplaceAll(s, "'", "")
@@ -19545,6 +20520,59 @@ type FileAST struct {
 	SrcOff, SrcEnd []uint32
 }
 
+// A unit's tree is dead the moment its rows are derived, and the next unit
+// needs one the same shape. Handing the arrays and the intern map on -- the
+// map keeps its buckets through clear() -- replaces what was, on PostgreSQL,
+// 2.3 GB of allocation in spans big enough to queue on the heap lock.
+var (
+	faFreeMu sync.Mutex
+	faFree   []*FileAST
+)
+
+func getFA() *FileAST {
+	faFreeMu.Lock()
+	var fa *FileAST
+	if n := len(faFree); n > 0 {
+		fa = faFree[n-1]
+		faFree[n-1] = nil
+		faFree = faFree[:n-1]
+	}
+	faFreeMu.Unlock()
+	if fa == nil {
+		return &FileAST{}
+	}
+	return fa
+}
+
+func putFA(fa *FileAST) {
+	if fa == nil {
+		return
+	}
+	// strings held by the old rows stay valid: only the slots are reused
+	clear(fa.Names)
+	fa.Names = fa.Names[:0]
+	clear(fa.nameIx)
+	fa.Nodes = fa.Nodes[:0]
+	fa.Funcs = fa.Funcs[:0]
+	fa.Decls = fa.Decls[:0]
+	fa.Params = fa.Params[:0]
+	clear(fa.Tags)
+	fa.Tags = fa.Tags[:0]
+	fa.Fields = fa.Fields[:0]
+	fa.Enums = fa.Enums[:0]
+	fa.Types = fa.Types[:0]
+	fa.Inits = fa.Inits[:0]
+	fa.Assocs = fa.Assocs[:0]
+	clear(fa.Attrs)
+	fa.Attrs = fa.Attrs[:0]
+	fa.SrcOff, fa.SrcEnd = fa.SrcOff[:0], fa.SrcEnd[:0]
+	faFreeMu.Lock()
+	if len(faFree) < 32 {
+		faFree = append(faFree, fa)
+	}
+	faFreeMu.Unlock()
+}
+
 func (fa *FileAST) intern(s string) uint32 {
 	if fa.nameIx == nil {
 		fa.nameIx = map[string]uint32{}
@@ -19570,11 +20598,6 @@ func (fa *FileAST) addNode(n Node) uint32 {
 	return uint32(len(fa.Nodes)) - 1
 }
 
-func (fa *FileAST) kids(i uint32) (uint32, uint32) {
-	n := &fa.Nodes[i]
-	return n.A, n.B
-}
-
 func (fa *FileAST) span(i uint32) (int32, int32) {
 	return fa.Nodes[i].Off, fa.Nodes[i].End
 }
@@ -19585,10 +20608,20 @@ type parseError struct {
 	msg  string
 }
 
+// A scope's tables are made on first write. Nearly every block declares no
+// typedef, tag or enumerator, and three maps per `{` was a million maps on a
+// large tree.
 type scope struct {
 	typedefs   map[string]bool
 	tags       map[string]bool
 	enumConsts map[string]bool
+}
+
+func (sc *scope) setTypedef(name string, v bool) {
+	if sc.typedefs == nil {
+		sc.typedefs = map[string]bool{}
+	}
+	sc.typedefs[name] = v
 }
 
 type parser struct {
@@ -19598,7 +20631,7 @@ type parser struct {
 	errs    *[]parseError
 	srcs    map[uint32][]byte
 	fileID  uint32
-	scopes  []*scope
+	scopes  []scope
 	nErrors int
 	stop    bool
 
@@ -19635,8 +20668,7 @@ func (p *parser) srcOf(t Tok) []byte {
 }
 
 func (p *parser) pushScope() {
-	p.scopes = append(p.scopes, &scope{typedefs: map[string]bool{},
-		tags: map[string]bool{}, enumConsts: map[string]bool{}})
+	p.scopes = append(p.scopes, scope{})
 }
 
 func (p *parser) popScope() {
@@ -19799,27 +20831,174 @@ var sysTypedefs = map[string]bool{
 }
 
 func (p *parser) isTypedefName(s string) bool {
-	if sysTypedefs[s] {
-		return true
-	}
+	// innermost entry wins: `false` is a parameter or local that hides the
+	// type name for the rest of its scope (see addTypedefGuard)
 	for i := len(p.scopes) - 1; i >= 0; i-- {
-		if p.scopes[i].typedefs[s] {
-			return true
+		if v, ok := p.scopes[i].typedefs[s]; ok {
+			return v
 		}
 	}
-	return false
+	return sysTypedefs[s]
+}
+
+// A type name this run never saw defined -- a typedef from a header outside
+// the tree, or one behind an include path nobody passed -- is an ordinary
+// identifier to the grammar, and `sds s = sdsempty();` then fails as an
+// expression and takes the rest of the function with it. These three helpers
+// recognise the shapes that cannot be anything BUT a use of a type name, and
+// record the name so later uses in the same translation unit parse directly.
+
+// strMacroHere: inside a run of adjacent string literals, an identifier that
+// is not being called. No expression allows a name directly after a string,
+// so it is a string-valued macro (PRId64, a project's FMT_x) that this run
+// could not expand; it joins the literal instead of ending the parse.
+func (p *parser) strMacroHere() bool {
+	t := p.cur()
+	if t.Kind != TIdent || cKeywords[t.Text] {
+		return false
+	}
+	nx := p.peek(1)
+	return !(nx.Kind == TPunct && nx.Punct == PLparen)
+}
+
+func (p *parser) plainIdent(t Tok) bool {
+	return t.Kind == TIdent && !cKeywords[t.Text] && !p.isTypedefName(t.Text)
+}
+
+// skipPtrQuals returns the lookahead index after any `*` and qualifiers
+// starting at j, and how many stars it passed.
+func (p *parser) skipPtrQuals(j int) (int, int) {
+	stars := 0
+	for {
+		x := p.peek(j)
+		if x.Kind == TPunct && x.Punct == PStar {
+			stars++
+			j++
+			continue
+		}
+		if x.Kind == TIdent {
+			switch x.Text {
+			case "const", "volatile", "restrict", "__restrict", "__restrict__":
+				j++
+				continue
+			}
+		}
+		return j, stars
+	}
+}
+
+// inferTypedef: at the start of a statement, `T name =`, `T name;`,
+// `T name,`, `T name[` and the same with stars between. `a * b;` is a legal
+// expression statement and a useless one; no real code is lost reading it as
+// a declaration.
+func (p *parser) inferTypedef() bool {
+	t := p.cur()
+	if !p.plainIdent(t) {
+		return false
+	}
+	j, _ := p.skipPtrQuals(1)
+	nm := p.peek(j)
+	if nm.Kind != TIdent || cKeywords[nm.Text] {
+		return false
+	}
+	nx := p.peek(j + 1)
+	if nx.Kind != TPunct {
+		return false
+	}
+	switch nx.Punct {
+	case PEq, PSemi, PComma, PLbrack:
+	default:
+		return false
+	}
+	p.scopes[0].setTypedef(t.Text, true)
+	return true
+}
+
+// inferCastType: with the cursor on `(`, the shapes `(T *)`, `(T){`,
+// `(T[n]){` and `(T) operand` where the operand starts with a name or a
+// literal. Two primaries cannot be adjacent in an expression, so each of
+// these is a cast or a compound literal. `(T)(x)`, `(T)*p`, `(T)-1` and
+// `(T)&x` stay ambiguous and are left alone.
+func (p *parser) inferCastType() bool {
+	t := p.peek(1)
+	if !p.plainIdent(t) {
+		return false
+	}
+	j, stars := p.skipPtrQuals(2)
+	arr := false
+	if x := p.peek(j); x.Kind == TPunct && x.Punct == PLbrack {
+		k := j + 1
+		for n := 0; n < 6; n++ {
+			y := p.peek(k)
+			if y.Kind == TPunct && y.Punct == PRbrack {
+				break
+			}
+			k++
+		}
+		if y := p.peek(k); y.Kind != TPunct || y.Punct != PRbrack {
+			return false
+		}
+		arr = true
+		j = k + 1
+	}
+	if x := p.peek(j); x.Kind != TPunct || x.Punct != PRparen {
+		return false
+	}
+	nx := p.peek(j + 1)
+	ok := false
+	switch {
+	case nx.Kind == TPunct && nx.Punct == PLbrace:
+		ok = true
+	case arr:
+	case stars > 0:
+		ok = true
+	case nx.Kind == TNumber || nx.Kind == TStr || nx.Kind == TChar:
+		ok = true
+	case nx.Kind == TIdent:
+		ok = !cKeywords[nx.Text] || nx.Text == "sizeof"
+	}
+	if ok {
+		p.scopes[0].setTypedef(t.Text, true)
+	}
+	return ok
+}
+
+// inferSizeofType: `sizeof(T *)` and `sizeof(T[n])`. `sizeof(T)` alone is
+// left as an expression -- it is counted the same either way.
+func (p *parser) inferSizeofType() bool {
+	t := p.peek(1)
+	if !p.plainIdent(t) {
+		return false
+	}
+	j, stars := p.skipPtrQuals(2)
+	if stars == 0 {
+		return false
+	}
+	if x := p.peek(j); x.Kind != TPunct || x.Punct != PRparen {
+		return false
+	}
+	p.scopes[0].setTypedef(t.Text, true)
+	return true
 }
 
 func (p *parser) addTypedef(name string) {
-	p.scopes[len(p.scopes)-1].typedefs[name] = true
+	p.scopes[len(p.scopes)-1].setTypedef(name, true)
 }
 
 func (p *parser) addTag(name string) {
-	p.scopes[len(p.scopes)-1].tags[name] = true
+	sc := &p.scopes[len(p.scopes)-1]
+	if sc.tags == nil {
+		sc.tags = map[string]bool{}
+	}
+	sc.tags[name] = true
 }
 
 func (p *parser) addEnumConst(name string) {
-	p.scopes[len(p.scopes)-1].enumConsts[name] = true
+	sc := &p.scopes[len(p.scopes)-1]
+	if sc.enumConsts == nil {
+		sc.enumConsts = map[string]bool{}
+	}
+	sc.enumConsts[name] = true
 }
 
 type spanMark struct{ pos int }
@@ -19865,6 +21044,10 @@ type tspecs struct {
 }
 
 func (ts *tspecs) baseText() string {
+	// nine declarations in ten carry no qualifier: the base IS the text
+	if !ts.constq && !ts.volatileq && !ts.restrictq && !ts.atomicq {
+		return strings.TrimRight(ts.base, " ")
+	}
 	var b strings.Builder
 	if ts.constq {
 		b.WriteString("const ")
@@ -20584,7 +21767,7 @@ func (p *parser) parseStaticAssert() {
 		p.assignment()
 	}
 	if p.acceptPunct(PComma) {
-		if p.cur().Kind == TStr {
+		for p.cur().Kind == TStr {
 			p.advance()
 		}
 	}
@@ -20790,6 +21973,14 @@ func parenIsParamList(nx Tok) bool {
 func (p *parser) declaratorSuffix(d dcl, abstract bool) dcl {
 	for !p.eof() {
 		t := p.cur()
+		// `int x [[maybe_unused]];` -- a C23 attribute after the declarator,
+		// not the start of an array bound
+		if t.Kind == TPunct && t.Punct == PLbrack {
+			if nx := p.peek(1); nx.Kind == TPunct && nx.Punct == PLbrack {
+				p.parseAttributes()
+				continue
+			}
+		}
 		if t.Kind == TPunct && t.Punct == PLbrack {
 			p.advance()
 			d.isArray = true
@@ -21053,6 +22244,20 @@ func (p *parser) parseExternal() {
 		p.parseExternal()
 		return
 	}
+	// `LUAI_FUNC Proto *luaY_parser (...)` with neither name known: the first
+	// is an attribute macro that expanded to nothing in the real build, the
+	// second is the return type.
+	if p.plainIdent(t) && p.plainIdent(p.peek(1)) {
+		if j, stars := p.skipPtrQuals(2); stars > 0 {
+			nm, after := p.peek(j), p.peek(j+1)
+			if nm.Kind == TIdent && !cKeywords[nm.Text] && after.Kind == TPunct &&
+				after.Punct == PLparen {
+				p.scopes[0].setTypedef(p.peek(1).Text, true)
+				p.advance()
+				t = p.cur()
+			}
+		}
+	}
 	p.parseAttributes()
 	specs := p.parseDeclSpecs()
 	p.parseAttributes()
@@ -21143,6 +22348,8 @@ func (p *parser) parseDeclList(specs tspecs, first dcl, t Tok, topLevel bool) []
 		nd.Kind = kind
 		if kind == 2 && d.hasName {
 			p.addTypedef(d.name)
+		} else if kind == 0 && d.hasName && p.funcDepth > 0 {
+			p.addTypedefGuard(d.name)
 		}
 
 		if p.acceptPunct(PEq) {
@@ -21260,8 +22467,14 @@ func (p *parser) parseFuncDef(specs tspecs, d dcl, t Tok) {
 	p.addNode(fn)
 }
 
+// addTypedefGuard records that an ordinary identifier now hides a type name.
+// `void rotate(list *list) { if (listLength(list) ...` expands to
+// `(list)->len`, which is a cast of nothing unless `list` is known to be the
+// parameter. C makes the same choice: the type is unusable in that scope.
 func (p *parser) addTypedefGuard(name string) {
-
+	if name != "" && len(p.scopes) > 1 && p.isTypedefName(name) {
+		p.scopes[len(p.scopes)-1].setTypedef(name, false)
+	}
 }
 
 func funcSignature(specs tspecs, d dcl) string {
@@ -21413,7 +22626,7 @@ func (p *parser) stmt() uint32 {
 		p.fa.Nodes[mk].B = body
 		p.fa.Nodes[mk].End = p.prevEnd()
 		return mk
-	case p.isDeclStart():
+	case p.isDeclStart() || p.inferTypedef():
 		if mk, ok := p.tryDeclStatement(); ok {
 			return mk
 		}
@@ -21510,31 +22723,39 @@ func (p *parser) switchStmt() uint32 {
 
 func (p *parser) whileStmt() uint32 {
 	t := p.advance()
+	// The loop node is created BEFORE its body, as forStmt does. A block is
+	// walked as the flat run of every node created inside it, so a loop node
+	// that came after its body let the body be visited first, outside any
+	// loop: no loop depth and no *_in_loop count for any while loop.
+	mk := p.addNode(Node{Kind: NWhile, Off: t.Off, Line: t.Line, Col: t.Col})
 	p.expectPunct(PLparen, "after while")
 	c := p.expr()
 	p.expectPunct(PRparen, "after while condition")
 	p.loopDepth++
 	b := p.stmt()
 	p.loopDepth--
-	return p.addNode(Node{Kind: NWhile, A: c, B: b, Off: t.Off, End: p.prevEnd(),
-		Line: t.Line, Col: t.Col})
+	p.fa.Nodes[mk].A = c
+	p.fa.Nodes[mk].B = b
+	p.fa.Nodes[mk].End = p.prevEnd()
+	return mk
 }
 
 func (p *parser) doStmt() uint32 {
 	t := p.advance()
+	mk := p.addNode(Node{Kind: NDo, Off: t.Off, Line: t.Line, Col: t.Col})
 	p.loopDepth++
 	b := p.stmt()
 	p.loopDepth--
+	p.fa.Nodes[mk].A = b
 	if p.acceptIdent("while") {
 		p.expectPunct(PLparen, "after do while")
 		c := p.expr()
 		p.expectPunct(PRparen, "after do while")
 		p.expectPunct(PSemi, "after do-while")
-		return p.addNode(Node{Kind: NDo, A: b, B: c, Off: t.Off, End: p.prevEnd(),
-			Line: t.Line, Col: t.Col})
+		p.fa.Nodes[mk].B = c
 	}
-	return p.addNode(Node{Kind: NDo, A: b, Off: t.Off, End: p.prevEnd(),
-		Line: t.Line, Col: t.Col})
+	p.fa.Nodes[mk].End = p.prevEnd()
+	return mk
 }
 
 func (p *parser) forStmt() uint32 {
@@ -21544,7 +22765,7 @@ func (p *parser) forStmt() uint32 {
 	mk := p.addNode(Node{Kind: NFor, Off: t.Off, Line: t.Line, Col: t.Col})
 	init := uint32(0)
 	if !p.atPunct(PSemi) {
-		if p.isDeclStart() {
+		if p.isDeclStart() || p.inferTypedef() {
 			if n, ok := p.tryDeclStatement(); ok {
 				init = n
 			}
@@ -21727,7 +22948,7 @@ func (p *parser) unary() uint32 {
 			}
 		case PLparen:
 
-			if p.peek(1).Kind != TEOF && p.isTypeStartAt(1) {
+			if p.peek(1).Kind != TEOF && (p.isTypeStartAt(1) || p.inferCastType()) {
 				save := p.pos
 				p.advance()
 				tn := p.parseTypeName()
@@ -21749,7 +22970,7 @@ func (p *parser) unary() uint32 {
 		switch t.Text {
 		case "sizeof":
 			p.advance()
-			if p.atPunct(PLparen) && p.isTypeStartAt(1) {
+			if p.atPunct(PLparen) && (p.isTypeStartAt(1) || p.inferSizeofType()) {
 				save := p.pos
 				p.advance()
 				tn := p.parseTypeName()
@@ -21910,7 +23131,7 @@ func (p *parser) primary() uint32 {
 		line := t.Line
 		col := t.Col
 		p.advance()
-		for p.cur().Kind == TStr {
+		for p.cur().Kind == TStr || p.strMacroHere() {
 			nx := p.advance()
 			txt += " " + nx.Text
 			end = nx.End
@@ -21918,6 +23139,19 @@ func (p *parser) primary() uint32 {
 		return p.addNode(Node{Kind: NStrLit, A: p.fa.intern(txt), Off: t.Off,
 			End: end, Line: line, Col: col})
 	case TIdent:
+		if nx := p.peek(1); nx.Kind == TStr && !cKeywords[t.Text] {
+			// `PRIu64 "..."`: a string macro whose header was not read
+			txt := t.Text
+			end := t.End
+			p.advance()
+			for p.cur().Kind == TStr || p.strMacroHere() {
+				n2 := p.advance()
+				txt += " " + n2.Text
+				end = n2.End
+			}
+			return p.addNode(Node{Kind: NStrLit, A: p.fa.intern(txt), Off: t.Off,
+				End: end, Line: t.Line, Col: t.Col})
+		}
 		switch t.Text {
 		case "true", "false":
 			p.advance()
@@ -21931,6 +23165,43 @@ func (p *parser) primary() uint32 {
 			p.advance()
 			return p.addNode(Node{Kind: NNullPtr, Off: t.Off, End: t.End,
 				Line: t.Line, Col: t.Col})
+		case "offsetof", "__builtin_offsetof":
+			// offsetof(type, member-designator): only reachable spelled this
+			// way when <stddef.h> was not found to expand it
+			if nx := p.peek(1); nx.Kind == TPunct && nx.Punct == PLparen {
+				p.advance()
+				p.advance()
+				if c := p.cur(); p.plainIdent(c) {
+					p.scopes[0].setTypedef(c.Text, true)
+				}
+				tn := p.parseTypeName()
+				depth := 1
+				for !p.eof() && depth > 0 {
+					c := p.cur()
+					if c.Kind == TPunct {
+						switch c.Punct {
+						case PLparen:
+							depth++
+						case PRparen:
+							depth--
+						case PSemi, PLbrace, PRbrace:
+							depth = 0
+							continue
+						}
+					}
+					if depth > 0 {
+						p.advance()
+					}
+				}
+				p.acceptPunct(PRparen)
+				return p.addNode(Node{Kind: NSizeofT, A: p.addTypeD(tn), Off: t.Off,
+					End: p.prevEnd(), Line: t.Line, Col: t.Col})
+			}
+		case "va_arg":
+			if nx := p.peek(1); nx.Kind != TPunct || nx.Punct != PLparen {
+				break
+			}
+			fallthrough
 		case "__builtin_va_arg":
 			p.advance()
 			p.expectPunct(PLparen, "after __builtin_va_arg")
@@ -22066,9 +23337,215 @@ type bodyWalk struct {
 	calls  []callSiteRec
 
 	opSeen, operSeen     map[string]bool
-	visited              map[uint32]bool
 	toctouChk, toctouOpn map[string]bool
 	castIdents           []string
+
+	// names a parameter or local has taken, so a write to one is not
+	// mistaken for a write to the file-scope name it hides
+	shadow map[string]bool
+	// declared type of each parameter and local, for the checks that need to
+	// know what a name IS rather than how it is spelled
+	types    map[string]string
+	nSignCmp int32
+
+	// Names used as VALUES: a function handed to a callback parameter, stored
+	// in a struct field, or listed in a file-scope table. A block's nodes are
+	// visited in creation order -- operands before the call or `&` that owns
+	// them -- so the use is recorded first and its role settled afterwards.
+	refs      []identRef
+	wantRefs  bool
+	fileScope bool
+
+	// Per-node flags for this walk, kept in one dense array shared by every
+	// walk of the translation unit instead of three hash maps per function:
+	// a slot belongs to the current walk iff its upper bits equal ep.
+	mk []uint32
+	ep uint32
+
+	// facts three queries used to approximate from totals
+	frameBytes   int64           // bytes of automatic storage declared, where the type has a known size
+	frameUnsized int32           // automatic locals whose size is not known here (or is a VLA)
+	frameMax     int32           // the largest single local
+	divisors     []string        // plain-name divisors, one per division
+	nDivByVar    int32           // divisions whose divisor is not a literal
+	zeroTested   map[string]bool // names compared with a literal or used as a condition
+	nForever     int32           // loops whose condition is a non-zero constant
+	nForeverNoX  int32           // ... with no break/return/goto/exit inside
+	discards     map[string]int32
+	discardOrd   []string
+}
+
+// noteTested records every plain name in a condition: `if (n)`, `!n`,
+// `n == 0`, `n > 0 && m`.
+func (df *derivedFile) noteTested(w *bodyWalk, idx uint32, depth int) {
+	if idx == 0 || depth > 8 || w.zeroTested == nil {
+		return
+	}
+	nd := &df.ast.Nodes[idx]
+	switch nd.Kind {
+	case NIdent:
+		w.zeroTested[df.ast.name(nd.A)] = true
+	case NParen, NUnary:
+		df.noteTested(w, nd.A, depth+1)
+	case NBinary:
+		df.noteTested(w, nd.A, depth+1)
+		df.noteTested(w, nd.B, depth+1)
+	}
+}
+
+// constTrue: `1`, `(1)`, `true` -- the condition of a loop meant to run forever.
+func (df *derivedFile) constTrue(idx uint32) bool {
+	for hop := 0; idx != 0 && hop < 4; hop++ {
+		nd := &df.ast.Nodes[idx]
+		switch nd.Kind {
+		case NParen:
+			idx = nd.A
+		case NNumLit:
+			v, ok := parseCInt(df.ast.name(nd.A))
+			return ok && v != 0
+		case NBoolLit:
+			return nd.Flags == 1
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// leavesLoop reports whether any node of the statement at idx can end the
+// loop that owns it: break, return, goto, or a call that does not come back.
+// A break belonging to a nested loop or switch counts too, so this errs
+// toward "has an exit" and the query toward silence.
+func (df *derivedFile) leavesLoop(idx uint32) bool {
+	fa := df.ast
+	if idx == 0 {
+		return false
+	}
+	lo, hi := idx, idx+1
+	if nd := &fa.Nodes[idx]; nd.Kind == NCompoundStmt {
+		lo, hi = nd.A, nd.A+nd.B
+	} else {
+		// a single statement: its operands were created just before it
+		lo = idx
+		for lo > 0 && fa.Nodes[lo-1].Off >= nd.Off && fa.Nodes[lo-1].End <= nd.End &&
+			fa.Nodes[lo-1].Kind != NCompoundStmt {
+			lo--
+		}
+	}
+	for i := lo; i < hi && int(i) < len(fa.Nodes); i++ {
+		nd := &fa.Nodes[i]
+		switch nd.Kind {
+		case NBreak, NReturn, NGoto:
+			return true
+		case NCall:
+			if c := &fa.Nodes[nd.A]; c.Kind == NIdent {
+				switch fa.name(c.A) {
+				case "exit", "_exit", "_Exit", "abort", "longjmp", "siglongjmp",
+					"pthread_exit", "quick_exit", "thrd_exit", "__builtin_unreachable",
+					"__builtin_trap":
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// noteDivisor classifies the right operand of `/`, `%`, `/=`, `%=`. A literal
+// or a sizeof cannot be zero by accident and is not counted at all.
+func (df *derivedFile) noteDivisor(w *bodyWalk, idx uint32) {
+	fa := df.ast
+	for hop := 0; idx != 0 && hop < 4; hop++ {
+		nd := &fa.Nodes[idx]
+		switch nd.Kind {
+		case NParen:
+			idx = nd.A
+			continue
+		case NNumLit, NCharLit, NSizeofT, NSizeofE, NAlignofT:
+			return
+		case NIdent:
+			w.nDivByVar++
+			w.divisors = append(w.divisors, fa.name(nd.A))
+			return
+		}
+		break
+	}
+	w.nDivByVar++
+}
+
+func (df *derivedFile) noteLoop(w *bodyWalk, cond, body uint32, forever bool) {
+	if !forever && !df.constTrue(cond) {
+		return
+	}
+	w.nForever++
+	if !df.leavesLoop(body) {
+		w.nForeverNoX++
+	}
+}
+
+type identRef struct {
+	node uint32
+	name string
+	line int32
+}
+
+const (
+	mkVisited = 1
+	mkCallee  = 2
+	mkAmp     = 4
+)
+
+func (w *bodyWalk) has(idx uint32, bit uint32) bool {
+	v := w.mk[idx]
+	return v&^7 == w.ep && v&bit != 0
+}
+
+func (w *bodyWalk) set(idx uint32, bit uint32) {
+	if w.mk[idx]&^7 != w.ep {
+		w.mk[idx] = w.ep
+	}
+	w.mk[idx] |= bit
+}
+
+// newWalk returns a walker bound to the unit's mark array under a fresh epoch.
+func (df *derivedFile) newWalk() *bodyWalk {
+	n := len(df.ast.Nodes)
+	var mk []uint32
+	if df.tu != nil {
+		if len(df.tu.marks) < n {
+			df.tu.marks = make([]uint32, n)
+			df.tu.markEp = 0
+		}
+		df.tu.markEp++
+		mk = df.tu.marks
+		return &bodyWalk{mk: mk, ep: df.tu.markEp << 3,
+			opSeen: map[string]bool{}, operSeen: map[string]bool{}}
+	}
+	if len(df.marks) < n {
+		df.marks = make([]uint32, n)
+		df.markEp = 0
+	}
+	df.markEp++
+	return &bodyWalk{mk: df.marks, ep: df.markEp << 3,
+		opSeen: map[string]bool{}, operSeen: map[string]bool{}}
+}
+
+// takeRefs turns the recorded value-uses into addr_taken rows: `ref` for a
+// bare name, `addr` for one under `&`. A name in callee position is a call,
+// which the call graph already has.
+func (w *bodyWalk) takeRefs() []AddrTakenRow {
+	var out []AddrTakenRow
+	for _, r := range w.refs {
+		if w.has(r.node, mkCallee) {
+			continue
+		}
+		kind := "ref"
+		if w.has(r.node, mkAmp) {
+			kind = "addr"
+		}
+		out = append(out, AddrTakenRow{Name: jtrunc(r.name, 80), Line: r.line, Kind: kind})
+	}
+	return out
 }
 
 type derivedFile struct {
@@ -22111,6 +23588,14 @@ type derivedFile struct {
 	fnNames   []string
 	fnSyms    []int32
 	fnFiles   []int32
+	fnStatic  []bool
+	tuFuncs   map[string]bool
+	tu        *c23tu
+	marks     []uint32
+	markEp    uint32
+	tagSz     map[uint32][3]int32
+	typeSz    map[string][3]int32
+	lastTag   uint32
 	fnModules []int32
 
 	declared  map[string]bool
@@ -22123,6 +23608,9 @@ type derivedFile struct {
 	incSeen map[int32]bool
 	fnSpans [][3]int32
 	srcRaw  []byte
+	perr    []parseMsg
+	offAt   []int32
+	offAdd  []int32
 	blank   []byte
 	nlRaw   []int32
 	srcID   uint32
@@ -22133,11 +23621,27 @@ type derivedFile struct {
 	glSet   map[string]bool
 }
 
+// globalSet is every file-scope object name this translation unit can write:
+// the file's own globals (added as they are derived, so the set is never
+// stale) plus each `extern T name;` an included header declared. Without the
+// second half `server.stat_x++` -- the dominant shape in a tree with one
+// central state struct -- is invisible in every file but the defining one.
 func (df *derivedFile) globalSet() map[string]bool {
 	if df.glSet == nil {
-		m := make(map[string]bool, len(df.globals)*2)
+		m := make(map[string]bool, len(df.globals)*2+16)
 		for i := range df.globals {
 			m[df.globals[i].Name] = true
+		}
+		fa := df.ast
+		for ni := range fa.Nodes {
+			n := &fa.Nodes[ni]
+			if n.Kind != NDecl || n.File == 0 || n.File == df.srcID {
+				continue
+			}
+			d := &fa.Decls[n.A-1]
+			if d.Kind == 0 && d.NameIdx != 0 && d.Storage&FExtern != 0 {
+				m[fa.name(d.NameIdx)] = true
+			}
 		}
 		df.glSet = m
 	}
@@ -22157,7 +23661,100 @@ func (df *derivedFile) internSym(s *SymbolRow) int32 {
 	return int32(len(df.symbols))
 }
 
+// Token offsets index the buffer the LEXER read, which is the file with its BOM
+// dropped, every backslash-newline spliced out and every CR folded away. srcRaw
+// is the file as it sits on disk, so an offset is only valid there after the
+// bytes removed before it are added back. Without this every text heuristic in
+// a file was shifted two bytes per continuation line above it: a lock argument
+// `&the_big_mutex` came back as `mutex_lock`.
+func (df *derivedFile) buildOffMap() {
+	raw := df.srcRaw
+	base := int32(len(raw) - len(stripBOM(raw)))
+	src := raw[base:]
+	need := false
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		if c == '\r' || (c == '\\' && i+1 < len(src) && (src[i+1] == '\n' || src[i+1] == '\r')) {
+			need = true
+			break
+		}
+	}
+	if !need {
+		if base != 0 {
+			df.offAt, df.offAdd = []int32{0}, []int32{base}
+		}
+		return
+	}
+	// the same walk spliceSource does, keeping only where the gap changes
+	last := int32(-1 << 30)
+	k, oo := int32(0), int32(0)
+	emit := func() {
+		if d := oo - k + base; d != last {
+			df.offAt = append(df.offAt, k)
+			df.offAdd = append(df.offAdd, d)
+			last = d
+		}
+		k++
+	}
+	n := len(src)
+	for i := 0; i < n; {
+		c := src[i]
+		if c == '\\' && i+1 < n {
+			if src[i+1] == '\n' {
+				oo += 2
+				i += 2
+				continue
+			}
+			if src[i+1] == '\r' {
+				adv := 2
+				if i+2 < n && src[i+2] == '\n' {
+					adv = 3
+				}
+				oo += int32(adv)
+				i += adv
+				continue
+			}
+		}
+		emit()
+		oo++
+		i++
+		if c == '\r' && i < n && src[i] == '\n' {
+			oo++
+			i++
+		}
+	}
+}
+
+// rawOff maps one lexer offset to its srcRaw offset.
+func (df *derivedFile) rawOff(off int32) int32 {
+	at := df.offAt
+	if len(at) == 0 || off < at[0] {
+		return off
+	}
+	lo, hi := 0, len(at)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if at[mid] <= off {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return off + df.offAdd[lo-1]
+}
+
+// rawRange maps a half-open lexer span. The end is mapped through its last
+// byte so a continuation directly after the span is not pulled into it.
+func (df *derivedFile) rawRange(off, end int32) (int32, int32) {
+	if end <= off {
+		r := df.rawOff(off)
+		return r, r
+	}
+	return df.rawOff(off), df.rawOff(end-1) + 1
+}
+
 func (df *derivedFile) rawSpan(off, end int32, cap int) string {
+	off, end = df.rawRange(off, end)
 	if off < 0 || end < off || int(end) > len(df.srcRaw) {
 		return ""
 	}
@@ -22176,7 +23773,7 @@ func (df *derivedFile) derive() {
 		case NStructSpec, NUnionSpec, NEnumSpec:
 			td := &fa.Tags[n.A-1]
 			if td.Defined {
-				df.deriveTag(td)
+				df.deriveTag(td, n.A)
 			}
 		case NDecl:
 			d := &fa.Decls[n.A-1]
@@ -22209,14 +23806,21 @@ func (df *derivedFile) derive() {
 		if d.Init == 0 || df.insideFunc(n.Off) {
 			continue
 		}
-		w := &bodyWalk{opSeen: map[string]bool{}, operSeen: map[string]bool{},
-			visited: map[uint32]bool{}}
+		w := df.newWalk()
+		w.wantRefs, w.fileScope = true, true
 		df.walkStmt(w, d.Init, 1, 0)
 		for i := range w.lits {
 			l := w.lits[i]
 			l.FileID = int32(df.srcID)
 			l.ID = int32(len(df.lits) + 1)
 			df.lits = append(df.lits, l)
+		}
+		// every name in a file-scope initializer; postBuild keeps the ones
+		// that turn out to be functions -- the dispatch-table entries
+		for _, a := range w.takeRefs() {
+			a.FileID = int32(df.srcID)
+			a.ID = int32(len(df.addrs) + 1)
+			df.addrs = append(df.addrs, a)
 		}
 	}
 
@@ -22236,7 +23840,7 @@ func (df *derivedFile) derive() {
 		if c.fileID != df.srcID || c.directive == "endif" {
 			continue
 		}
-		expr := jtrunc(strings.TrimSpace(c.expr), 160)
+		expr := jtrunc(strings.TrimSpace(c.text()), 160)
 		isCfg := b2i(strings.Contains(expr, "CONFIG_") ||
 			strings.Contains(expr, "HAVE_") || strings.Contains(expr, "USE_"))
 		df.cfgs = append(df.cfgs, ConfigBlockRow{FileID: int32(df.srcID),
@@ -22264,7 +23868,9 @@ func (df *derivedFile) funcSpans() [][3]int32 {
 		spans := make([][3]int32, 0, 16)
 		for ni := range df.ast.Nodes {
 			n := &df.ast.Nodes[ni]
-			if n.Kind == NFuncDef {
+			// Offsets are per file: a span from an included header's inline
+			// function would swallow this file's own file-scope declarations.
+			if n.Kind == NFuncDef && (n.File == 0 || n.File == df.srcID) {
 				spans = append(spans, [3]int32{n.Off, n.End, int32(ni)})
 			}
 		}
@@ -22305,7 +23911,16 @@ func (df *derivedFile) deriveAttrs() {
 	}
 }
 
-func (df *derivedFile) deriveTag(td *TagD) {
+// aggBase reduces a member's type text to what names its aggregate:
+// `const struct foo` -> `struct foo`, `volatile union` -> `union`.
+func aggBase(t string) string {
+	for _, w := range [...]string{"const", "volatile", "_Atomic", "register"} {
+		t = replaceWord(t, w, " ")
+	}
+	return trimSpace(squeeze(t, ""))
+}
+
+func (df *derivedFile) deriveTag(td *TagD, tagIdx uint32) {
 	fa := df.ast
 	name := fa.name(td.NameIdx)
 	if name == "" {
@@ -22322,7 +23937,89 @@ func (df *derivedFile) deriveTag(td *TagD) {
 		isUnion := kind == "union"
 		var flds []fld
 		ord := int32(0)
+		// Child0..NChild is every node created inside the braces, so it also
+		// holds the members of any struct or union DEFINED inline here.
+		//   - behind an ANONYMOUS member (`struct { int x; };`) they are
+		//     members of this type too (C11 6.7.2.1): they stay listed, at
+		//     depth 1+, and are not laid out a second time -- the unnamed
+		//     marker row after them carries the inner type's offset and size
+		//   - behind a NAMED member (`union { ... } u;`) they belong to the
+		//     inner type only and are not listed here at all
+		// Before this, both kinds were laid out at consecutive offsets beside
+		// the member that contains them, so every such struct had the wrong
+		// size and the wrong padding.
+		var nestN []int32 // how many inline definitions enclose node ci
+		var hide []bool   // one of them is a named member
+		var inUni []bool  // the innermost one is a union
+		lastAnon := uint32(0)
+		anonAt := map[uint32]uint32{}
+		type span struct {
+			lo, hi, at uint32
+			union      bool
+		}
+		var spans []span
 		for ci := uint32(0); ci < td.NChild; ci++ {
+			sn := &fa.Nodes[td.Child0+ci]
+			if sn.Kind != NStructSpec && sn.Kind != NUnionSpec {
+				continue
+			}
+			if sn.A == 0 || sn.A == tagIdx {
+				continue
+			}
+			it := &fa.Tags[sn.A-1]
+			if !it.Defined || it.Child0 < td.Child0 || it.Child0+it.NChild > td.Child0+td.NChild {
+				continue
+			}
+			spans = append(spans, span{it.Child0 - td.Child0,
+				it.Child0 - td.Child0 + it.NChild, ci, sn.Kind == NUnionSpec})
+			if it.NameIdx == 0 {
+				anonAt[ci] = sn.A
+			}
+		}
+		if len(spans) > 0 {
+			nestN = make([]int32, td.NChild)
+			hide = make([]bool, td.NChild)
+			inUni = make([]bool, td.NChild)
+			for _, sp := range spans {
+				for k := sp.lo; k < sp.hi; k++ {
+					nestN[k]++
+				}
+			}
+			// spans arrive innermost-first (a spec node follows its members),
+			// so the first one to claim a node is its innermost
+			seen := make([]bool, td.NChild)
+			for _, sp := range spans {
+				for k := sp.lo; k < sp.hi; k++ {
+					if !seen[k] {
+						seen[k] = true
+						inUni[k] = sp.union
+					}
+				}
+				// the member declared with this inner type is the next field
+				// at the spec's own level; unnamed means anonymous
+				named := true
+				for k := sp.at + 1; k < td.NChild; k++ {
+					fn := &fa.Nodes[td.Child0+k]
+					if fn.Kind != NField || nestN[k] != nestN[sp.at] {
+						continue
+					}
+					named = fa.Fields[fn.A-1].NameIdx != 0
+					break
+				}
+				if named {
+					for k := sp.lo; k < sp.hi; k++ {
+						hide[k] = true
+					}
+				}
+			}
+		}
+		for ci := uint32(0); ci < td.NChild; ci++ {
+			if a, ok := anonAt[ci]; ok && (nestN == nil || nestN[ci] == 0) {
+				lastAnon = a
+			}
+			if hide != nil && hide[ci] {
+				continue
+			}
 			fn := &fa.Nodes[td.Child0+ci]
 			if fn.Kind != NField {
 				continue
@@ -22335,9 +24032,28 @@ func (df *derivedFile) deriveTag(td *TagD) {
 				Line: fdp.Line, IsConst: b2i(fdp.IsConst), IsMutable: b2i(!fdp.IsConst),
 				IsNullable: b2i(fdp.Ptr > 0), IsCollection: b2i(fdp.ArrayLen != 0),
 				TypeDepth: fdp.Ptr})
-			flds = append(flds, fld{ordinal: ord, ftype: fa.name(fdp.TypeIdx),
+			f := fld{ordinal: ord, ftype: fa.name(fdp.TypeIdx),
 				fname: fname, ptr: fdp.Ptr, alen: fdp.ArrayLen,
-				isFnptr: b2i(fdp.IsFnptr), depth: 0, inUnion: 0, line: fdp.Line})
+				isFnptr: b2i(fdp.IsFnptr), depth: 0, inUnion: 0, line: fdp.Line}
+			if nestN != nil && nestN[ci] > 0 {
+				f.depth = nestN[ci]
+				f.inUnion = b2i(inUni[ci])
+			}
+			if fdp.Ptr == 0 && !fdp.IsFnptr && f.depth == 0 {
+				switch base := aggBase(f.ftype); {
+				case base == "struct" || base == "union":
+					if v, ok := df.tagSz[lastAnon]; ok {
+						f.kn, f.ksz, f.kal, f.kex = true, v[0], v[1], v[2]
+					}
+				case base == "enum" || strings.HasPrefix(base, "enum "):
+					f.kn, f.ksz, f.kal, f.kex = true, 4, 4, 1
+				default:
+					if v, ok := df.typeSz[base]; ok {
+						f.kn, f.ksz, f.kal, f.kex = true, v[0], v[1], v[2]
+					}
+				}
+			}
+			flds = append(flds, f)
 			ord++
 		}
 		lay, tot, tail, ex, mal := layoutStruct(flds, isUnion)
@@ -22359,6 +24075,21 @@ func (df *derivedFile) deriveTag(td *TagD) {
 		df.ssize = append(df.ssize, StructSizeRow{SymbolID: localsym,
 			TotalSize: tot, TailPad: tail, TotalPad: tpad, MaxAlign: mal,
 			Exact: ex, NLines64: lines64})
+		if df.tagSz == nil {
+			df.tagSz = map[uint32][3]int32{}
+			df.typeSz = map[string][3]int32{}
+		}
+		df.tagSz[tagIdx] = [3]int32{tot, mal, ex}
+		df.lastTag = tagIdx
+		if !isUnion && ex == 1 {
+			if best := packedSize(flds); best > 0 && best < tot {
+				df.hazards = append(df.hazards, HazardRow{SymbolID: localsym,
+					Pattern: "packed_size", Category: "shape", N: best})
+			}
+		}
+		if td.NameIdx != 0 {
+			df.typeSz[kind+" "+fa.name(td.NameIdx)] = [3]int32{tot, mal, ex}
+		}
 	case "enum":
 		ord := int32(0)
 		for ci := uint32(0); ci < td.NChild; ci++ {
@@ -22385,6 +24116,22 @@ func (df *derivedFile) deriveTypedef(d *DeclNode, n *Node) {
 		return
 	}
 	ty := df.ast.name(d.TypeIdx)
+	// `typedef struct foo foo_t;` and `typedef struct {...} foo_t;` give the
+	// struct's size a second name, which is the one members are declared with
+	if d.Ptr == 0 && d.ArrayLen == 0 && df.typeSz != nil {
+		switch base := aggBase(ty); {
+		case base == "struct" || base == "union":
+			if v, ok := df.tagSz[df.lastTag]; ok {
+				df.typeSz[name] = v
+			}
+		case base == "enum" || strings.HasPrefix(base, "enum "):
+			df.typeSz[name] = [3]int32{4, 4, 1}
+		default:
+			if v, ok := df.typeSz[base]; ok {
+				df.typeSz[name] = v
+			}
+		}
+	}
 	df.symbols = append(df.symbols, SymbolRow{FileID: int32(df.srcID),
 		Name: name, QualName: name, Kind: "typedef", LineStart: n.Line,
 		ReturnType: jtrunc(ty, 120), HasReturnType: true, IsPublic: 1,
@@ -22416,6 +24163,9 @@ func (df *derivedFile) deriveGlobal(d *DeclNode, n *Node) {
 		IsArray:    b2i(d.ArrayLen != 0), PtrDepth: d.Ptr,
 		HasInit: b2i(d.Init != 0)}
 	df.globals = append(df.globals, g)
+	if df.glSet != nil {
+		df.glSet[name] = true
+	}
 }
 
 func (df *derivedFile) deriveMacro(m *ppMacro) {
@@ -22439,7 +24189,7 @@ func (df *derivedFile) deriveMacro(m *ppMacro) {
 	df.macros = append(df.macros, MacroRow{SymbolID: sid,
 		IsFunctionlike: b2i(m.IsFn), NParams: nParams, Body: body,
 		HasBody: true, BodyLen: ml,
-		IsMultiline: b2i(strings.HasSuffix(strings.TrimRight(m.Raw, " \t\r\n"), "\\")),
+		IsMultiline: b2i(m.Multi),
 		NUses:       m.Uses})
 }
 
@@ -22505,9 +24255,18 @@ func (df *derivedFile) deriveFunction(fd *FuncDef, n *Node) {
 	sym.IsTest = df.isTestF
 	sym.IsGenerated = df.isGenF
 
-	w := &bodyWalk{opSeen: map[string]bool{}, operSeen: map[string]bool{},
-		visited: map[uint32]bool{}, toctouChk: map[string]bool{},
-		toctouOpn: map[string]bool{}}
+	w := df.newWalk()
+	w.wantRefs = true
+	w.toctouChk, w.toctouOpn = map[string]bool{}, map[string]bool{}
+	w.shadow, w.types = map[string]bool{}, map[string]string{}
+	w.zeroTested, w.discards = map[string]bool{}, map[string]int32{}
+	for pi := uint32(0); pi < fd.NParams; pi++ {
+		pd := &fa.Params[fa.Nodes[fd.Param0+pi].A-1]
+		if nm := fa.name(pd.NameIdx); nm != "" {
+			w.shadow[nm] = true
+			w.types[nm] = fa.name(pd.TypeIdx)
+		}
+	}
 	if fd.Body != 0 {
 		df.walkStmt(w, fd.Body, 1, 0)
 	}
@@ -22534,7 +24293,6 @@ func (df *derivedFile) deriveFunction(fd *FuncDef, n *Node) {
 	sym.MaxLoopDepth = w.maxLoopDepth
 	sym.NStaticAssert = w.nStaticAssert
 	sym.NVolatile = w.hasVolatile
-	sym.NRestrict = w.hasRestrict
 	sym.NIntrinsic = w.nIntrinsic
 	sym.NAtomic = w.nAtomic
 	sym.NLikely = w.nLikely
@@ -22544,7 +24302,8 @@ func (df *derivedFile) deriveFunction(fd *FuncDef, n *Node) {
 	sym.NVla = w.nVla
 	sym.NOperators = w.nOperators
 	sym.NOperands = w.nOperands
-	sym.NTokens = w.nTokens
+	sym.NTokens = w.nOperators + w.nOperands
+	sym.NGlobalWrite = w.nGlobalWrite
 	sym.NDistinctOperators = w.nDistOps
 	sym.NDistinctOperands = w.nDistOper
 	sym.NAssign = w.nAssign
@@ -22575,8 +24334,10 @@ func (df *derivedFile) deriveFunction(fd *FuncDef, n *Node) {
 	r.RetVoid = w.retVoid
 
 	if fd.Body != 0 {
-		b0, b1 := fa.Nodes[fd.Body].Off, fa.Nodes[fd.Body].End
-		sym.Sloc = countSlocSpan(df.srcRaw, b0, b1)
+		b0, b1 := df.rawRange(fa.Nodes[fd.Body].Off, fa.Nodes[fd.Body].End)
+		if b0 >= 0 && int(b1) <= len(df.srcRaw) && b1 >= b0 {
+			sym.Sloc, sym.NCommentLines, _ = classifyLines(df.srcRaw[b0:b1])
+		}
 	}
 
 	nDyn := int32(0)
@@ -22590,7 +24351,12 @@ func (df *derivedFile) deriveFunction(fd *FuncDef, n *Node) {
 	sym.NFnptrCalls = nDyn
 	sym.NCallsites = sym.NCalls
 
+	// internSym stores a COPY. The slot is reserved here because params, locals
+	// and call heuristics need the id, and the finished row is written back at
+	// the end of this function -- everything assigned to sym below this line
+	// was silently discarded before that write-back existed.
 	sid := df.internSym(sym)
+	sym.ID = sid
 	df.funcSymByNode[df.lastFuncNode] = sid
 
 	np := int32(0)
@@ -22622,7 +24388,7 @@ func (df *derivedFile) deriveFunction(fd *FuncDef, n *Node) {
 		}
 		df.params = append(df.params, pa)
 		if pd.Ptr > 0 {
-			df.symbols[sid-1].NPtrParams++
+			sym.NPtrParams++
 		}
 		np++
 	}
@@ -22656,6 +24422,15 @@ func (df *derivedFile) deriveFunction(fd *FuncDef, n *Node) {
 		w.addrs[i].ID = int32(len(df.addrs) + 1)
 		w.addrs[i].Kind = "addr"
 		df.addrs = append(df.addrs, w.addrs[i])
+	}
+	// a function named as a value: `signal(SIGINT, onInt)`, `c->read = rd;`
+	for _, a := range w.takeRefs() {
+		a.SymbolID = sid
+		a.HasSym = true
+		a.FileID = int32(df.srcID)
+		a.ID = int32(len(df.addrs) + 1)
+		a.Kind = "fn" + a.Kind
+		df.addrs = append(df.addrs, a)
 	}
 
 	extra := df.applyCallHeuristics(sid, w)
@@ -22693,35 +24468,17 @@ func (df *derivedFile) deriveFunction(fd *FuncDef, n *Node) {
 		df.pendNames = append(df.pendNames, nm)
 		df.pendLines = append(df.pendLines, byName[nm])
 		df.pendSym = append(df.pendSym, sid)
-		df.pendFile = append(df.pendFile, int32(df.srcID))
+		df.pendFile = append(df.pendFile, df.globalFileID)
 		df.pendModule = append(df.pendModule, df.modID)
 	}
 	df.fnNames = append(df.fnNames, name)
 	df.fnSyms = append(df.fnSyms, sid)
-	df.fnFiles = append(df.fnFiles, int32(df.srcID))
+	// the GLOBAL file id: srcID is 1 for the root of every translation unit,
+	// so comparing it across files made every .c "the same file"
+	df.fnFiles = append(df.fnFiles, df.globalFileID)
+	df.fnStatic = append(df.fnStatic, fd.Storage&FStatic != 0)
 	df.fnModules = append(df.fnModules, df.modID)
-}
-
-func countSlocSpan(src []byte, off, end int32) int32 {
-	if off < 0 || int(end) > len(src) || end < off {
-		return 0
-	}
-	n := int32(0)
-	seg := src[off:end]
-	start := 0
-	for i := 0; i <= len(seg); i++ {
-		if i == len(seg) || seg[i] == '\n' {
-			line := seg[start:i]
-			for _, c := range line {
-				if c != ' ' && c != '\t' && c != '\r' {
-					n++
-					break
-				}
-			}
-			start = i + 1
-		}
-	}
-	return n
+	df.symbols[sid-1] = *sym
 }
 
 func (df *derivedFile) textHeuristics(sym *SymbolRow, w *bodyWalk, fd *FuncDef, n *Node) {
@@ -22729,7 +24486,7 @@ func (df *derivedFile) textHeuristics(sym *SymbolRow, w *bodyWalk, fd *FuncDef, 
 		return
 	}
 	fa := df.ast
-	b0, b1 := fa.Nodes[fd.Body].Off, fa.Nodes[fd.Body].End
+	b0, b1 := df.rawRange(fa.Nodes[fd.Body].Off, fa.Nodes[fd.Body].End)
 	if b0 < 0 || b1 > int32(len(df.srcRaw)) || b1 < b0 {
 		return
 	}
@@ -22740,13 +24497,22 @@ func (df *derivedFile) textHeuristics(sym *SymbolRow, w *bodyWalk, fd *FuncDef, 
 	}
 	r := &sym.SymbolRare
 
-	sym.NCommentLines = countCommentLines(rawBody)
 	if df.nlRaw != nil {
 		if doc, _ := leadingComment(df.srcRaw, df.nlRaw, int(n.Line)); doc {
 			sym.HasDoc = 1
 		}
 	}
 	sym.NBodyBytes = int32(runeLen(rawBody))
+	if h0 := df.rawOff(n.Off); h0 >= 0 && h0 <= b0 {
+		def := df.srcRaw[h0:b1]
+		if df.blank != nil && b1 <= int32(len(df.blank)) {
+			def = df.blank[h0:b1]
+		}
+		if hasStr(def, "restrict") {
+			sym.NRestrict = int32(countWord(def, "restrict") +
+				countWord(def, "__restrict") + countWord(def, "__restrict__"))
+		}
+	}
 
 	if hasStr(blankBody, "8_t") || hasStr(blankBody, "16_t") || hasStr(blankBody, "32_t") {
 		r.NNarrowCast = int32(countNarrowCasts(blankBody))
@@ -22762,13 +24528,7 @@ func (df *derivedFile) textHeuristics(sym *SymbolRow, w *bodyWalk, fd *FuncDef, 
 			known[nm] = true
 		}
 	}
-	nSignCmp := int32(0)
-	scanSignCmps(blankBody, func(h signCmpHit) {
-		if known[h.name] {
-			nSignCmp++
-		}
-	})
-	r.NSignCmp = nSignCmp
+	r.NSignCmp = w.nSignCmp
 	if hasStr(blankBody, "rand") {
 		r.NWeakRandom = int32(countWeakRandom(blankBody))
 	}
@@ -22902,6 +24662,26 @@ func (df *derivedFile) textHeuristics(sym *SymbolRow, w *bodyWalk, fd *FuncDef, 
 	emitHz("fixed_buffer", "memory", countFixedBuffer(blankBody))
 	emitHz("vla", "memory", countVLAPat(blankBody))
 	emitHz("signed_cmp", "integer", countSignedCmp(blankBody))
+
+	// Tree-derived facts with no column of their own. They ride in the hazards
+	// table under categories nothing sums into a score: `shape` for what the
+	// body does, `discard` for each callee whose result this body drops.
+	unguarded := 0
+	for _, d := range w.divisors {
+		if !w.zeroTested[d] {
+			unguarded++
+		}
+	}
+	emitHz("frame_bytes", "shape", int(min(w.frameBytes, 1<<30)))
+	emitHz("frame_unsized", "shape", int(w.frameUnsized))
+	emitHz("frame_max_local", "shape", int(w.frameMax))
+	emitHz("div_by_var", "shape", int(w.nDivByVar))
+	emitHz("div_unguarded", "shape", unguarded)
+	emitHz("loop_forever", "shape", int(w.nForever))
+	emitHz("loop_forever_noexit", "shape", int(w.nForeverNoX))
+	for _, nm := range w.discardOrd {
+		emitHz(jtrunc(nm, 80), "discard", int(w.discards[nm]))
+	}
 }
 
 type callSiteRec struct {
@@ -22912,6 +24692,7 @@ type callSiteRec struct {
 	node    uint32
 	argsOff int32
 	argsEnd int32
+	argsTxt string
 }
 
 func (w *bodyWalk) noteOp(s string) {
@@ -22936,10 +24717,10 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 		return
 	}
 
-	if w.visited[idx] {
+	if w.has(idx, mkVisited) {
 		return
 	}
-	w.visited[idx] = true
+	w.set(idx, mkVisited)
 	n := &fa.Nodes[idx]
 	if scopeDepth > w.maxNesting {
 		w.maxNesting = scopeDepth
@@ -22975,6 +24756,33 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 				InLoop:     b2i(loopDepth > 0),
 				ScopeDepth: b2i8(scopeDepth)}
 			w.locals = append(w.locals, lr)
+			if w.shadow != nil && d.Storage&FExtern == 0 {
+				w.shadow[lr.Name] = true
+			}
+			if w.types != nil {
+				if d.ArrayLen != 0 {
+					w.types[lr.Name] = typ + "[]"
+				} else {
+					w.types[lr.Name] = typ
+				}
+			}
+			if strings.Contains(typ, "volatile") {
+				w.hasVolatile++
+			}
+			if d.Storage&(FStatic|FExtern|FThreadLoc) == 0 {
+				f := fld{ftype: typ, ptr: d.Ptr, alen: d.ArrayLen}
+				if d.Ptr == 0 && df.typeSz != nil {
+					if v, ok := df.typeSz[aggBase(typ)]; ok {
+						f.kn, f.ksz, f.kal, f.kex = true, v[0], v[1], v[2]
+					}
+				}
+				if sz, _, ex := f.size(); ex == 1 && sz > 0 {
+					w.frameBytes += int64(sz)
+					w.frameMax = max(w.frameMax, sz)
+				} else {
+					w.frameUnsized++
+				}
+			}
 			if d.Ptr > 0 {
 				w.nPtrLocals++
 			}
@@ -22988,6 +24796,18 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 
 	case NExprStmt:
 		if n.A != 0 {
+			// a call whose whole statement is the call: its result is dropped
+			if c := &fa.Nodes[n.A]; c.Kind == NCall && w.discards != nil {
+				if cal := &fa.Nodes[c.A]; cal.Kind == NIdent {
+					nm := fa.name(cal.A)
+					if df.tuFunc(nm) {
+						if w.discards[nm] == 0 {
+							w.discardOrd = append(w.discardOrd, nm)
+						}
+						w.discards[nm]++
+					}
+				}
+			}
 			walkExpr(n.A)
 		}
 
@@ -23003,6 +24823,7 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 			w.cognitive++
 		}
 		w.noteOper("if")
+		df.noteTested(w, n.A, 0)
 		walkExpr(n.A)
 		df.walkStmt(w, n.B, scopeDepth, loopDepth)
 		if n.C != 0 {
@@ -23046,12 +24867,22 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 			w.cognitive++
 		}
 		w.noteOper("while")
+		df.noteTested(w, n.A, 0)
+		df.noteLoop(w, n.A, n.B, false)
 		walkExpr(n.A)
 		df.walkStmt(w, n.B, scopeDepth, loopDepth+1)
 
 	case NDo:
 		w.nLoops++
+		w.cyclomatic++
+		if scopeDepth-1 > 1 {
+			w.cognitive += scopeDepth - 1
+		} else {
+			w.cognitive++
+		}
 		w.noteOper("do")
+		df.noteTested(w, n.B, 0)
+		df.noteLoop(w, n.B, n.A, false)
 		df.walkStmt(w, n.A, scopeDepth, loopDepth+1)
 		walkExpr(n.B)
 
@@ -23064,6 +24895,8 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 			w.cognitive++
 		}
 		w.noteOper("for")
+		df.noteTested(w, n.B, 0)
+		df.noteLoop(w, n.B, n.D, n.B == 0)
 		if n.A != 0 {
 			df.walkStmt(w, n.A, scopeDepth, loopDepth)
 		}
@@ -23117,6 +24950,9 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 		if n.Flags == uint16(PSlash) && loopDepth > 0 {
 			w.divInLoop++
 		}
+		if n.Flags == uint16(PSlash) || n.Flags == uint16(PMod) {
+			df.noteDivisor(w, n.B)
+		}
 		switch n.Flags {
 		case uint16(PAmp), uint16(PPipe), uint16(PCaret), uint16(PLsh), uint16(PRsh):
 			w.nBitop++
@@ -23127,15 +24963,22 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 			w.nLogical++
 		case uint16(PPlus), uint16(PMinus), uint16(PStar), uint16(PSlash), uint16(PMod):
 			w.nArith++
-		case uint16(mustPunct("==")), uint16(mustPunct("!=")), uint16(PLt), uint16(PGt), uint16(PLe), uint16(mustPunct(">=")):
+		case uint16(PEqEq), uint16(PNotEq), uint16(PLt), uint16(PGt), uint16(PLe), uint16(PGe):
 			w.nCmp++
 		case uint16(PLsh), uint16(PRsh):
 			w.nShift++
 		}
 
-		if n.Flags == uint16(mustPunct("==")) || n.Flags == uint16(mustPunct("!=")) {
+		if n.Flags == uint16(PEqEq) || n.Flags == uint16(PNotEq) {
 			if df.isNullLit(n.A) || df.isNullLit(n.B) {
 				w.nNullCheck++
+			}
+		}
+		switch n.Flags {
+		case uint16(PLt), uint16(PGt), uint16(PLe), uint16(PGe):
+			if (df.signedOperand(w, n.A) && df.sizeOperand(w, n.B, 0)) ||
+				(df.sizeOperand(w, n.A, 0) && df.signedOperand(w, n.B)) {
+				w.nSignCmp++
 			}
 		}
 		walkExpr(n.A)
@@ -23154,16 +24997,20 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 		case uint16(PAmpEq), uint16(PPipeEq), uint16(PCaretEq), uint16(PLshEq), uint16(PRshEq):
 			w.nBitop++
 		}
-		if lhs := fa.Nodes[n.A]; lhs.Kind == NIdent {
-			if df.isGlobalName(fa.name(lhs.A)) {
-				w.nGlobalWrite++
-				w.noteOper(fa.name(lhs.A))
-			}
+		if n.Flags == uint16(PSlashEq) && loopDepth > 0 {
+			w.divInLoop++
+		}
+		if n.Flags == uint16(PSlashEq) || n.Flags == uint16(PModEq) {
+			df.noteDivisor(w, n.B)
+		}
+		if df.writesGlobal(w, n.A) {
+			w.nGlobalWrite++
 		}
 		walkExpr(n.A)
 		walkExpr(n.B)
 
 	case NCond:
+		df.noteTested(w, n.A, 0)
 		w.nTernary++
 		w.cyclomatic++
 		w.noteOp("?")
@@ -23179,10 +25026,14 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 		case uint16(PInc), uint16(PDec):
 			w.nIncdec++
 			w.noteOp(punctTable[n.Flags])
+			if df.writesGlobal(w, n.A) {
+				w.nGlobalWrite++
+			}
 		case uint16(PAmp):
 			w.noteOp("&")
 			if o := fa.Nodes[n.A]; o.Kind == NIdent {
 				w.nAddrof++
+				w.set(n.A, mkAmp)
 				na := fa.name(o.A)
 				if na != "" && !df.isFunctionName(na) {
 					w.addrs = append(w.addrs, AddrTakenRow{Name: jtrunc(na, 80),
@@ -23201,6 +25052,9 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 	case NPostfix:
 		w.nIncdec++
 		w.noteOp(punctTable[n.Flags&0xFF])
+		if df.writesGlobal(w, n.A) {
+			w.nGlobalWrite++
+		}
 		walkExpr(n.A)
 
 	case NCall:
@@ -23209,24 +25063,45 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 		fnptr := false
 		if callee.Kind == NIdent {
 			name = fa.name(callee.A)
+			w.set(n.A, mkCallee)
 		} else {
 			fnptr = true
 		}
 		argsOff, argsEnd := int32(0), int32(0)
+		argsTxt := ""
 		if n.B > 0 {
 			first := &fa.Nodes[n.C]
 			last := &fa.Nodes[n.C+n.B-1]
 			argsOff, argsEnd = first.Off, last.End
+			if first.Off <= callee.Off {
+				// Every token of a macro expansion carries the INVOCATION's
+				// offsets, so this call's argument span is the macro's name.
+				// Render the arguments from the tree instead.
+				var sb strings.Builder
+				for i := uint32(0); i < n.B; i++ {
+					if i > 0 {
+						sb.WriteString(", ")
+					}
+					df.exprText(&sb, n.C+i, 0)
+				}
+				argsTxt = sb.String()
+			} else if e := n.End - 1; e > argsEnd {
+				// written out in this file: the closing paren bounds the list
+				// even when the last argument is itself a macro invocation
+				if r := df.rawOff(e); r >= 0 && int(r) < len(df.srcRaw) && df.srcRaw[r] == ')' {
+					argsEnd = e
+				}
+			}
 		}
 		w.calls = append(w.calls, callSiteRec{name: name, fnptr: fnptr,
 			isCall: true, node: idx, argsOff: argsOff, argsEnd: argsEnd,
-			line: int32(n.Line)})
+			argsTxt: argsTxt, line: int32(n.Line)})
 		if loopDepth > 0 {
 			w.callInLoop++
-			switch name {
-			case "malloc", "calloc", "realloc", "strdup", "strndup",
-				"aligned_alloc", "reallocarray":
+			if allocatesName(name) {
 				w.allocInLoop++
+			}
+			switch name {
 			case "sqrt", "exp", "log", "log2", "log10", "pow", "sin", "cos",
 				"tan", "atan", "atan2", "tgamma", "lgamma", "erf", "fmod",
 				"cbrt", "hypot", "floor", "ceil", "round":
@@ -23260,10 +25135,11 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 			w.nIntrinsic++
 		}
 		if strings.HasPrefix(name, "__atomic_") || strings.HasPrefix(name, "__sync_") ||
-			strings.HasPrefix(name, "__c11_atomic_") {
+			strings.HasPrefix(name, "__c11_atomic_") || strings.HasPrefix(name, "atomic_") {
 			w.nAtomic++
 		}
-		if name == "__builtin_expect" {
+		if name == "__builtin_expect" || name == "__builtin_expect_with_probability" ||
+			name == "likely" || name == "unlikely" {
 			w.nLikely++
 		}
 		if strings.HasPrefix(name, "__builtin_") {
@@ -23317,6 +25193,9 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 			w.nErrno++
 		}
 		w.noteOper(nm)
+		if w.wantRefs && (w.fileScope || (!w.shadow[nm] && df.tuFunc(nm))) {
+			w.refs = append(w.refs, identRef{node: idx, name: nm, line: n.Line})
+		}
 
 	case NNumLit:
 		tok := fa.name(n.A)
@@ -23395,6 +25274,101 @@ func (df *derivedFile) walkStmt(w *bodyWalk, idx uint32, scopeDepth int32, loopD
 
 func b2i8(v int32) int32 { return v }
 
+// exprText renders an expression from the tree. It exists for the one case a
+// source span cannot serve: text that came out of a macro expansion.
+func (df *derivedFile) exprText(sb *strings.Builder, idx uint32, depth int) {
+	fa := df.ast
+	if idx == 0 || int(idx) >= len(fa.Nodes) || depth > 24 || sb.Len() > 400 {
+		return
+	}
+	n := &fa.Nodes[idx]
+	sub := func(i uint32) { df.exprText(sb, i, depth+1) }
+	typ := func(i uint32) {
+		if i == 0 || int(i) > len(fa.Types) {
+			return
+		}
+		td := &fa.Types[i-1]
+		sb.WriteString(squeeze(fa.name(td.TextIdx), ""))
+	}
+	switch n.Kind {
+	case NIdent, NNumLit, NCharLit, NStrLit, NBoolLit:
+		sb.WriteString(fa.name(n.A))
+	case NNullPtr:
+		sb.WriteString("nullptr")
+	case NParen:
+		sb.WriteByte('(')
+		sub(n.A)
+		sb.WriteByte(')')
+	case NBinary, NAssign:
+		sub(n.A)
+		sb.WriteByte(' ')
+		sb.WriteString(punctTable[n.Flags&0xFF])
+		sb.WriteByte(' ')
+		sub(n.B)
+	case NComma:
+		sub(n.A)
+		sb.WriteString(", ")
+		sub(n.B)
+	case NUnary:
+		sb.WriteString(punctTable[n.Flags&0xFF])
+		sub(n.A)
+	case NPostfix:
+		sub(n.A)
+		sb.WriteString(punctTable[n.Flags&0xFF])
+	case NCond:
+		sub(n.A)
+		sb.WriteString(" ? ")
+		sub(n.B)
+		sb.WriteString(" : ")
+		sub(n.C)
+	case NMember:
+		sub(n.B)
+		if n.Flags&1 != 0 {
+			sb.WriteString("->")
+		} else {
+			sb.WriteByte('.')
+		}
+		sb.WriteString(fa.name(n.A))
+	case NIndex:
+		sub(n.A)
+		sb.WriteByte('[')
+		sub(n.B)
+		sb.WriteByte(']')
+	case NCall:
+		sub(n.A)
+		sb.WriteByte('(')
+		for i := uint32(0); i < n.B; i++ {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sub(n.C + i)
+		}
+		sb.WriteByte(')')
+	case NCast:
+		sb.WriteByte('(')
+		typ(n.A)
+		sb.WriteByte(')')
+		sub(n.B)
+	case NSizeofT:
+		sb.WriteString("sizeof(")
+		typ(n.A)
+		sb.WriteByte(')')
+	case NAlignofT:
+		sb.WriteString("alignof(")
+		typ(n.A)
+		sb.WriteByte(')')
+	case NSizeofE:
+		sb.WriteString("sizeof ")
+		sub(n.A)
+	case NCompoundLit:
+		sb.WriteByte('(')
+		typ(n.A)
+		sb.WriteString("){...}")
+	default:
+		sb.WriteString("...")
+	}
+}
+
 func (df *derivedFile) isNullLit(idx uint32) bool {
 	if idx == 0 {
 		return false
@@ -23410,11 +25384,119 @@ func (df *derivedFile) isNullLit(idx uint32) bool {
 	return false
 }
 
-func (df *derivedFile) isGlobalName(name string) bool {
-	if len(df.globals) == 0 {
+// signedIntType reports whether a declared type is a signed integer OBJECT:
+// no pointer, no array, not unsigned, not plain char.
+func signedIntType(t string) bool {
+	if t == "" || strings.ContainsAny(t, "*[(") {
 		return false
 	}
+	seen := false
+	for _, f := range strings.Fields(t) {
+		switch f {
+		case "const", "volatile", "register", "static", "auto", "signed":
+			if f == "signed" {
+				seen = true
+			}
+		case "int", "long", "short", "ssize_t", "ptrdiff_t", "off_t", "intptr_t",
+			"intmax_t", "int8_t", "int16_t", "int32_t", "int64_t", "__int64":
+			seen = true
+		default:
+			return false
+		}
+	}
+	return seen
+}
+
+// unsignedSizeType reports whether a declared type is an unsigned integer
+// object of at least int rank -- the types a signed operand is converted TO.
+func unsignedSizeType(t string) bool {
+	if t == "" || strings.ContainsAny(t, "*[(") {
+		return false
+	}
+	wide := false
+	for _, f := range strings.Fields(t) {
+		switch f {
+		case "const", "volatile", "register", "static", "auto", "int", "long":
+		case "unsigned", "size_t", "uintptr_t", "uintmax_t", "uint32_t",
+			"uint64_t", "u_int", "u_long", "uint", "ulong", "rsize_t":
+			wide = true
+		default:
+			// unsigned char/short promote to int: the compare stays signed
+			return false
+		}
+	}
+	return wide
+}
+
+func (df *derivedFile) signedOperand(w *bodyWalk, idx uint32) bool {
+	if idx == 0 || w.types == nil {
+		return false
+	}
+	nd := &df.ast.Nodes[idx]
+	switch nd.Kind {
+	case NParen:
+		return df.signedOperand(w, nd.A)
+	case NIdent:
+		return signedIntType(w.types[df.ast.name(nd.A)])
+	}
+	return false
+}
+
+// sizeOperand: sizeof, strlen and friends, a name declared with an unsigned
+// size type, or arithmetic on one of those.
+func (df *derivedFile) sizeOperand(w *bodyWalk, idx uint32, depth int) bool {
+	if idx == 0 || depth > 6 || w.types == nil {
+		return false
+	}
+	fa := df.ast
+	nd := &fa.Nodes[idx]
+	switch nd.Kind {
+	case NSizeofT, NSizeofE:
+		return true
+	case NParen:
+		return df.sizeOperand(w, nd.A, depth+1)
+	case NIdent:
+		return unsignedSizeType(w.types[fa.name(nd.A)])
+	case NCall:
+		if c := &fa.Nodes[nd.A]; c.Kind == NIdent {
+			switch fa.name(c.A) {
+			case "strlen", "strnlen", "wcslen", "strspn", "strcspn", "fread", "fwrite":
+				return true
+			}
+		}
+	case NBinary:
+		switch nd.Flags {
+		case uint16(PPlus), uint16(PMinus), uint16(PStar), uint16(PSlash):
+			return df.sizeOperand(w, nd.A, depth+1) || df.sizeOperand(w, nd.B, depth+1)
+		}
+	}
+	return false
+}
+
+func (df *derivedFile) isGlobalName(name string) bool {
 	return df.globalSet()[name]
+}
+
+// writesGlobal reports whether the lvalue at idx is rooted at a file-scope
+// name: `g = v`, `g.f = v`, `g[i] = v`, `g->f = v`. A write through `*p` is
+// not counted -- that is the pointee, which may or may not be shared.
+func (df *derivedFile) writesGlobal(w *bodyWalk, idx uint32) bool {
+	fa := df.ast
+	for hop := 0; idx != 0 && hop < 32; hop++ {
+		nd := &fa.Nodes[idx]
+		switch nd.Kind {
+		case NIdent:
+			nm := fa.name(nd.A)
+			return nm != "" && !w.shadow[nm] && df.isGlobalName(nm)
+		case NMember:
+			idx = nd.B
+		case NIndex, NParen:
+			idx = nd.A
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 func (df *derivedFile) retShape(idx uint32) int {
@@ -23436,9 +25518,9 @@ func (df *derivedFile) retShape(idx uint32) int {
 			c := df.ast.Nodes[nd.A]
 			if c.Kind == NNumLit {
 				tx := df.ast.name(c.A)
-				if len(tx) > 1 {
+				if len(tx) > 0 {
 					digits := true
-					for i := 1; i < len(tx); i++ {
+					for i := 0; i < len(tx); i++ {
 						if tx[i] < '0' || tx[i] > '9' {
 							digits = false
 							break
@@ -23458,6 +25540,33 @@ func (df *derivedFile) retShape(idx uint32) int {
 		return 0
 	}
 	return 0
+}
+
+// tuFunc reports whether name is a function this translation unit defines or
+// declares anywhere, headers included.
+func (df *derivedFile) tuFunc(name string) bool {
+	if df.tuFuncs == nil {
+		// one set per translation unit, shared by every file derived from it
+		if df.tu != nil && df.tu.funcSet != nil {
+			df.tuFuncs = df.tu.funcSet
+			return df.tuFuncs[name]
+		}
+		fa := df.ast
+		m := make(map[string]bool, len(fa.Funcs)*2+16)
+		for i := range fa.Funcs {
+			m[fa.name(fa.Funcs[i].NameIdx)] = true
+		}
+		for i := range fa.Decls {
+			if d := &fa.Decls[i]; d.Kind == 1 && d.NameIdx != 0 {
+				m[fa.name(d.NameIdx)] = true
+			}
+		}
+		df.tuFuncs = m
+		if df.tu != nil {
+			df.tu.funcSet = m
+		}
+	}
+	return df.tuFuncs[name]
 }
 
 func (df *derivedFile) isFunctionName(name string) bool {
@@ -23514,7 +25623,12 @@ func (df *derivedFile) applyCallHeuristics(sid int32, w *bodyWalk) (extra symExt
 		if !c.isCall {
 			continue
 		}
-		argText := df.rawSpan(c.argsOff, c.argsEnd, 200)
+		argText := c.argsTxt
+		if argText == "" {
+			argText = df.rawSpan(c.argsOff, c.argsEnd, 200)
+		} else {
+			argText = jtrunc(argText, 200)
+		}
 		args := splitTop(argText)
 		name := c.name
 
@@ -23545,7 +25659,9 @@ func (df *derivedFile) applyCallHeuristics(sid int32, w *bodyWalk) (extra symExt
 			if libcAllocNames[name] {
 				extra.nAlloc++
 			}
-			if !c.fnptr {
+			// A release is not an allocation site. Recording `zfree(p)` here
+			// made 7 in 10 "allocation sites" frees, each with no sizeof.
+			if !c.fnptr && !isFreeName(name) {
 				sz := jtrunc(squeeze(argText, ""), 150)
 				df.allocs = append(df.allocs, AllocSiteRow{ID: int32(len(df.allocs) + 1),
 					SymbolID: sid, FileID: int32(df.srcID), Fn: name,
@@ -23560,15 +25676,24 @@ func (df *derivedFile) applyCallHeuristics(sid int32, w *bodyWalk) (extra symExt
 			extra.nFree++
 		}
 
-		if isLockShaped(name) {
-			if lockAcquireName(name) {
+		if _, acq, rel := lockShape(name); acq || rel {
+			if (name == "flock" || name == "lockf") &&
+				(strings.Contains(argText, "LOCK_UN") || strings.Contains(argText, "F_ULOCK")) {
+				acq, rel = false, true
+			}
+			if acq {
 				extra.nLockAcq++
 			}
-			if lockReleaseName(name) {
+			if rel {
 				extra.nLockRel++
 			}
+			// The lock is the FIRST argument in every API this matches
+			// (pthread_mutex_timedlock(&m, &ts), spin_lock_irqsave(&l, f));
+			// taking the last recorded the flags, the timeout or NULL.
 			if len(args) > 0 {
-				if nm, ok := firstIdent(args[len(args)-1]); ok {
+				// the whole lvalue, not its first identifier: `&q->lock` and
+				// `&q->stats_lock` are two locks, and both began with `q`
+				if nm := lockArgName(args[0]); nm != "" {
 					df.locks = append(df.locks, LockRowR{ID: int32(len(df.locks) + 1),
 						SymbolID: sid, FileID: int32(df.srcID), Name: jtrunc(nm, 80),
 						Line: c.line})
@@ -23735,20 +25860,18 @@ func sizeofOperand(s string) (string, bool) {
 	return rest, true
 }
 
-func lockAcquireName(name string) bool {
-	low := strings.ToLower(name)
-	if !strings.Contains(low, "lock") {
-		if low == "sem_wait" || low == "sem_trywait" || low == "pthread_mutex_trylock" {
-			return true
-		}
-		return false
+func lockArgName(arg string) string {
+	a := strings.TrimSpace(arg)
+	for len(a) > 0 && (a[0] == '&' || a[0] == '(' || a[0] == ' ') {
+		a = a[1:]
 	}
-	return !strings.Contains(low, "unlock")
-}
-
-func lockReleaseName(name string) bool {
-	low := strings.ToLower(name)
-	return strings.Contains(low, "unlock")
+	for len(a) > 0 && (a[len(a)-1] == ')' || a[len(a)-1] == ' ') && strings.Count(a, "(") < strings.Count(a, ")") {
+		a = a[:len(a)-1]
+	}
+	if _, ok := firstIdent(a); !ok {
+		return ""
+	}
+	return strings.ReplaceAll(a, " ", "")
 }
 
 func isEventOp(fn string) bool {
@@ -23756,6 +25879,19 @@ func isEventOp(fn string) bool {
 		return true
 	}
 	return eventWaitFn[fn] || eventCreateFn[fn] || fn == "kqueue" || fn == "EV_SET"
+}
+
+func isFreeName(name string) bool {
+	if name == "free" {
+		return true
+	}
+	return len(name) > 4 && strings.EqualFold(name[len(name)-4:], "free")
+}
+
+// allocatesName is isAllocName without the release half: the libc allocators
+// and anything a project named after one (zmalloc, xcalloc, sdsdup ...).
+func allocatesName(name string) bool {
+	return isAllocName(name) && !isFreeName(name)
 }
 
 func isAllocName(name string) bool {
@@ -23900,6 +26036,9 @@ type c23tu struct {
 	ferrs     []int32
 	fmissing  []int32
 	redundant bool
+	funcSet   map[string]bool
+	marks     []uint32
+	markEp    uint32
 }
 
 type c23run struct {
@@ -23939,13 +26078,20 @@ func (e *extractor) runC23(abs string, g *Graph, parseIDs []int32, quiet bool, s
 	sem := newByteWindow(parseByteBudget)
 	for k := 0; k < workers; k++ {
 		wg.Go(func() {
+			// one region per worker, reset per unit -- unless trees are kept,
+			// when a unit's preprocessor state has to outlive the next unit
+			var reg *ppRegion
+			if !cr.keepTrees {
+				reg = newPPRegion()
+			}
 			for i := range jobs {
 				sz := fileCharge(int64(cr.g.Files[parseIDs[i]-1].Bytes))
 				sem.take(sz)
-				tu := cr.parseTU(int32(i), parseIDs[i])
+				tu := cr.parseTU(int32(i), parseIDs[i], reg)
 				if tu != nil {
 					cr.deriveTU(tu)
 					if !cr.keepTrees {
+						putFA(tu.fa)
 						tu.fa = nil
 					}
 					tu.pp = nil
@@ -23992,7 +26138,7 @@ func (e *extractor) runC23(abs string, g *Graph, parseIDs []int32, quiet bool, s
 	return outs
 }
 
-func (cr *c23run) parseTU(pos int32, fid int32) (tu *c23tu) {
+func (cr *c23run) parseTU(pos int32, fid int32, reg *ppRegion) (tu *c23tu) {
 	tu = &c23tu{root: fid}
 	claiming := true
 	defer func() {
@@ -24030,12 +26176,17 @@ func (cr *c23run) parseTU(pos int32, fid int32) (tu *c23tu) {
 		atomic.AddInt32(&cr.turn, 1)
 		return nil
 	}
-	tu.fa = &FileAST{}
-	tu.pp = newPP(abs, nil, &tu.lexErrs)
+	tu.fa = getFA()
+	tu.pp = newPP(abs, nil, &tu.lexErrs, reg)
 	toks := tu.pp.run(abs)
 	srcs := map[uint32][]byte{}
 	for id, fsrc := range tu.pp.fileByID {
 		srcs[id] = fsrc.raw
+	}
+	// one node per 2-3 tokens is typical; sizing up front replaces a dozen
+	// regrow-and-copy steps with one allocation
+	if want := len(toks)/2 + 64; cap(tu.fa.Nodes) < want {
+		tu.fa.Nodes = make([]Node, 0, want)
 	}
 	p := newParser(tu.fa, toks, srcs, 0, &tu.perrs)
 	p.parseTU()
@@ -24068,7 +26219,9 @@ func (cr *c23run) deriveTU(tu *c23tu) {
 		for _, df := range tu.files {
 			df.ast = nil
 			df.pp = nil
+			df.tu, df.tuFuncs, df.glSet = nil, nil, nil
 		}
+		tu.marks, tu.funcSet = nil, nil
 	}
 }
 
@@ -24103,18 +26256,34 @@ func (cr *c23run) deriveOne(tu *c23tu, fid int32) (df *derivedFile, nerrs int32,
 	df = newDerivedFile(tu.fa, tu.pp, raw, srcID)
 	df.blank = blank
 	df.nlRaw = nRaw
+	df.tu = tu
+	df.buildOffMap()
 	df.file = FileRow{ID: fid, Path: f.Path(), ModuleID: f.ModuleID}
 	df.globalFileID = fid
 	df.isTestF = f.IsTest
 	df.isGenF = f.IsGenerated
 	df.modID = f.ModuleID
 	nErrs := 0
+	keep := func(line int32, msg string) {
+		if len(df.perr) < 200 {
+			df.perr = append(df.perr, parseMsg{fileID: fid, line: line, msg: msg})
+		}
+	}
 	if srcID == 1 {
-		nErrs += len(tu.lexErrs)
+		for i := range tu.lexErrs {
+			// An #error is the code declining a configuration, not text the
+			// parser failed to read: nothing near it is missing or merged. It
+			// is listed, and kept out of the count that warns about that.
+			if !strings.HasPrefix(tu.lexErrs[i].msg, "#error") {
+				nErrs++
+			}
+			keep(tu.lexErrs[i].line, tu.lexErrs[i].msg)
+		}
 	}
 	for i := range tu.perrs {
 		if tu.perrs[i].file == srcID {
 			nErrs++
+			keep(tu.perrs[i].line, tu.perrs[i].msg)
 		}
 	}
 	df.file.NParseErrors = int32(nErrs)
@@ -24126,7 +26295,7 @@ func (cr *c23run) deriveOne(tu *c23tu, fid int32) (df *derivedFile, nerrs int32,
 }
 
 func (e *extractor) fileOutFrom(cr *c23run, df *derivedFile) *fileOut {
-	fo := &fileOut{symA: newSymBlockN(len(df.symbols))}
+	fo := &fileOut{symA: newSymBlockN(len(df.symbols)), perr: df.perr}
 	block := fo.symA
 	incCtx := map[int32]string{}
 	sysCtx := map[int32]bool{}
@@ -24344,7 +26513,7 @@ func (e *extractor) fileOutFrom(cr *c23run, df *derivedFile) *fileOut {
 	}
 	for k, nm := range df.fnNames {
 		fo.funcs = append(fo.funcs, fnSite{name: nm, sid: df.fnSyms[k],
-			fid: df.fnFiles[k], mid: df.fnModules[k]})
+			fid: df.fnFiles[k], mid: df.fnModules[k], static: df.fnStatic[k]})
 	}
 	return fo
 }
