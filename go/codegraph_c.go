@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"crypto/sha1"
 	"encoding/csv"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"io/fs"
 	"maps"
 	"math"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -25,6 +27,7 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -1048,6 +1051,13 @@ type Graph struct {
 	EvOps          []EventOp
 	APIUses        []APIUse
 	apiByID        map[int32][]int32
+	apiByFn        map[string][]int32
+	hazIx          *hazIndex
+	symIx          *symIndex
+	edgeOut        *edgeCSRc
+	edgeIn         *edgeCSRc
+	atCache        []string
+	symMark        []bool
 	symsCache      []*Symbol
 	symsCacheOrder string
 	byNameCache    []*Symbol
@@ -1065,8 +1075,8 @@ type Graph struct {
 
 	dumpW *bufio.Writer
 
-	astBlob []byte
-	trees   []cgTree
+	astBlob   []byte
+	nameOrder []*Symbol
 
 	EdgesN, MacroN, ExternN, DeclN, UnresN int32
 	CallsTotal                             int32
@@ -1453,46 +1463,6 @@ func fileCharge(n int64) int64 {
 		return minFileSlot
 	}
 	return n
-}
-
-type byteWindow struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	budget int64
-	free   int64
-}
-
-func newByteWindow(budget int64) *byteWindow {
-	if budget < minFileSlot {
-		budget = minFileSlot
-	}
-	w := &byteWindow{budget: budget, free: budget}
-	w.cond = sync.NewCond(&w.mu)
-	return w
-}
-
-func (w *byteWindow) take(n int64) {
-	if n > w.budget {
-		n = w.budget
-	}
-	w.mu.Lock()
-
-	for w.free < n {
-		w.cond.Wait()
-	}
-	w.free -= n
-	w.mu.Unlock()
-}
-
-func (w *byteWindow) give(n int64) {
-	if n > w.budget {
-		n = w.budget
-	}
-	w.mu.Lock()
-	w.free += n
-
-	w.cond.Broadcast()
-	w.mu.Unlock()
 }
 
 var defaultParseWorkers = runtime.GOMAXPROCS(0)
@@ -4310,6 +4280,7 @@ type walker struct {
 	realRoot string
 	res      discoverResult
 	opts     runOpts
+	cands    []fileCand
 }
 
 type runOpts struct {
@@ -4317,13 +4288,13 @@ type runOpts struct {
 	includeGenerated bool
 	includeVendored  bool
 	quiet            bool
-	keepAST          bool
 }
 
 func discover(root string, g *Graph, opts runOpts) []int32 {
 	w := &walker{g: g, root: root, modID: map[string]int32{},
 		realRoot: realpath(root), opts: opts}
 	w.walk(root, false)
+	w.admit()
 	for i := range w.res.files {
 		f := &w.res.files[i]
 		if f.Parsed == 1 {
@@ -4384,6 +4355,9 @@ func (w *walker) walk(dir string, viaLink bool) {
 
 var source [][]byte
 
+// consider runs the checks that decide whether a file is read at all. They
+// are serial and in walk order, because that order is the file id. The read
+// itself, and everything computed from the bytes, is left to measure().
 func (w *walker) consider(full, fn string, viaLink bool) {
 	ext := filepath.Ext(fn)
 	if !cExts[ext] {
@@ -4406,71 +4380,115 @@ func (w *walker) consider(full, fn string, viaLink bool) {
 			}
 		}
 	}
-	var data []byte
-	tooBig := false
-	if st.Size() > maxFileBytes {
-		w.g.FilesSkippedBig++
-		tooBig = true
-	} else {
-		data, err = os.ReadFile(full)
+	w.cands = append(w.cands, fileCand{full: full, fn: fn, ext: ext,
+		tooBig: st.Size() > maxFileBytes})
+}
+
+type fileCand struct {
+	full, fn, ext string
+	tooBig        bool
+
+	denied, longLine bool
+	data             []byte
+	nLines, maxLine  int
+	codeL, cmtL      int32
+	sum              string
+}
+
+// measure reads one candidate and computes what depends only on its bytes.
+// It touches nothing shared, so candidates are measured in parallel.
+func (c *fileCand) measure() {
+	if !c.tooBig {
+		data, err := os.ReadFile(c.full)
 		if err != nil {
-			w.g.FilesSkippedDenied++
+			c.denied = true
 			return
 		}
+		c.data = data
 		if hasLongLine(data) {
-			w.g.FilesSkippedBig++
-			tooBig = true
+			c.longLine = true
 		}
 	}
-	rel := filepath.ToSlash(mustRel(w.root, full))
-	nLines, _, _, _, maxLine := fileLineStatsBytes(data)
-	codeL, cmtL, _ := classifyLines(data)
-	sloc, cmt := int(codeL), int(cmtL)
-	blank := max(nLines-sloc-cmt, 0)
-	head := data
-	if len(head) > 2000 {
-		head = head[:2000]
+	c.nLines, _, _, _, c.maxLine = fileLineStatsBytes(c.data)
+	c.codeL, c.cmtL, _ = classifyLines(c.data)
+	if len(c.data) > 0 {
+		h := sha1.Sum(c.data)
+		c.sum = hex.EncodeToString(h[:])
 	}
-	test := b2i(matchPathSeg(rel, "test", "tests", "test-d", "spec", "specs",
-		"__tests__", "__snapshots__", "testing", "e2e", "integration-tests",
-		"integration_tests", "testdata", "test_data", "test-data", "fixture",
-		"fixtures") || cTestName(fn))
-	gen := b2i(isGenerated(fn, string(head)))
-	vend := b2i(matchVendorPath(rel))
-	mid := w.module(rel)
-	parse := b2i(!tooBig && len(data) != 0 &&
-		(w.opts.includeTests || test == 0) &&
-		(w.opts.includeGenerated || gen == 0) &&
-		(w.opts.includeVendored || vend == 0))
+}
 
-	sum := ""
-	if len(data) > 0 {
-		h := sha1.Sum(data)
-		sum = hex.EncodeToString(h[:])
+// admit turns the measured candidates into file rows, in walk order.
+func (w *walker) admit() {
+	var wg sync.WaitGroup
+	var next atomic.Int64
+	for k := 0; k < min(defaultParseWorkers, len(w.cands)); k++ {
+		wg.Go(func() {
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(w.cands) {
+					return
+				}
+				w.cands[i].measure()
+			}
+		})
 	}
-	id := int32(len(w.res.files) + 1)
-	source = append(source, data)
-	w.res.files = append(w.res.files, File{})
-	fl := &w.res.files[len(w.res.files)-1]
-	cgZeroRow(unsafe.Pointer(fl), unsafe.Sizeof(*fl))
-	fl.ID = id
-	fl.path = cgPut(rel)
-	fl.dir = cgPut(pathDir(rel))
-	fl.basename = cgPut(fn)
-	fl.ext = cgPut(ext)
-	fl.lang = cgPut("c")
-	fl.ModuleID = mid
-	fl.Bytes = int32(len(data))
-	fl.Lines = int32(nLines)
-	fl.Sloc = int32(sloc)
-	fl.BlankLines = int32(blank)
-	fl.CommentLines = int32(cmt)
-	fl.MaxLineLen = int32(maxLine)
-	fl.sha1 = cgPut(sum)
-	fl.Parsed = parse
-	fl.IsTest = test
-	fl.IsGenerated = gen
-	fl.IsVendored = vend
+	wg.Wait()
+	for i := range w.cands {
+		c := &w.cands[i]
+		if c.denied {
+			w.g.FilesSkippedDenied++
+			continue
+		}
+		tooBig := c.tooBig || c.longLine
+		if tooBig {
+			w.g.FilesSkippedBig++
+		}
+		data, fn := c.data, c.fn
+		rel := filepath.ToSlash(mustRel(w.root, c.full))
+		sloc, cmt := int(c.codeL), int(c.cmtL)
+		blank := max(c.nLines-sloc-cmt, 0)
+		head := data
+		if len(head) > 2000 {
+			head = head[:2000]
+		}
+		test := b2i(matchPathSeg(rel, "test", "tests", "test-d", "spec", "specs",
+			"__tests__", "__snapshots__", "testing", "e2e", "integration-tests",
+			"integration_tests", "testdata", "test_data", "test-data", "fixture",
+			"fixtures") || cTestName(fn))
+		gen := b2i(isGenerated(fn, string(head)))
+		vend := b2i(matchVendorPath(rel))
+		mid := w.module(rel)
+		parse := b2i(!tooBig && len(data) != 0 &&
+			(w.opts.includeTests || test == 0) &&
+			(w.opts.includeGenerated || gen == 0) &&
+			(w.opts.includeVendored || vend == 0))
+
+		id := int32(len(w.res.files) + 1)
+		source = append(source, data)
+		w.res.files = append(w.res.files, File{})
+		fl := &w.res.files[len(w.res.files)-1]
+		cgZeroRow(unsafe.Pointer(fl), unsafe.Sizeof(*fl))
+		fl.ID = id
+		fl.path = cgPut(rel)
+		fl.dir = cgPut(pathDir(rel))
+		fl.basename = cgPut(fn)
+		fl.ext = cgPut(c.ext)
+		fl.lang = cgPut("c")
+		fl.ModuleID = mid
+		fl.Bytes = int32(len(data))
+		fl.Lines = int32(c.nLines)
+		fl.Sloc = int32(sloc)
+		fl.BlankLines = int32(blank)
+		fl.CommentLines = int32(cmt)
+		fl.MaxLineLen = int32(c.maxLine)
+		fl.sha1 = cgPut(c.sum)
+		fl.Parsed = parse
+		fl.IsTest = test
+		fl.IsGenerated = gen
+		fl.IsVendored = vend
+		c.data = nil
+	}
+	w.cands = nil
 }
 
 func mustRel(base, p string) string {
@@ -5837,7 +5855,8 @@ type extractor struct {
 	fnByNameS                             map[string][]bool
 	incAdj                                map[int32][]int32
 	pickMore                              []int
-	ambigN                                int32
+	ambigN, declPickN                     int32
+	declFiles                             map[string][]int32
 	incReach                              map[int32]map[int32]bool
 	macroSID                              map[string]int32
 	declared                              map[string]bool
@@ -6584,7 +6603,7 @@ func build(g *Graph, root string, opts runOpts, quiet bool) int {
 	e := newExtractor(g)
 	t1 := time.Now()
 	step := max(len(parseIDs)/4, 1)
-	outs := e.runC23(abs, g, parseIDs, quiet, step, opts.keepAST)
+	outs := e.runC23(abs, g, parseIDs, quiet, step)
 	lexCache.Clear()
 	lexCacheToks.Store(0)
 	dropTokBufs()
@@ -6716,7 +6735,8 @@ func (e *extractor) includes(from, to int32) bool {
 //  2. a static definition in a file the caller #includes (a header's
 //     `static inline`, or a .c pulled in as a backend)
 //  3. the one definition with external linkage -- or, of several, the one in
-//     the caller's own module
+//     the caller's own module, or the one written against the prototype the
+//     caller sees (pickByDecl)
 //
 // A static function in some OTHER translation unit is never a candidate: the
 // caller cannot name it. Taking the first definition regardless, as this used
@@ -6768,9 +6788,52 @@ func (e *extractor) pickCallee(name string, fid, mid int32) int {
 		return extMod
 	}
 	if extN > 1 {
+		if x := e.pickByDecl(name, fid, files, stat); x >= 0 {
+			e.declPickN++
+			return x
+		}
 		e.ambigN++
 	}
 	return -1
+}
+
+// pickByDecl settles a name with several external definitions the way the
+// compiler ties a call to one: through the prototype. The caller sees the
+// prototype in some header; a definition written against that same header is
+// the one the call was compiled for. PostgreSQL defines pfree twice, for the
+// backend under utils/palloc.h and for frontends under common/fe_memutils.h,
+// and no caller includes both.
+//
+// It answers only when exactly one definition shares a prototype with the
+// caller. Two #if-selected implementations behind one header (cryptohash.c,
+// cryptohash_openssl.c) both do, and stay unresolved -- which is the truth.
+func (e *extractor) pickByDecl(name string, fid int32, files []int32, stat []bool) int {
+	if e.declFiles == nil {
+		e.declFiles = map[string][]int32{}
+		for i := range e.g.Decls {
+			d := &e.g.Decls[i]
+			nm := d.Name()
+			if fs := e.declFiles[nm]; len(fs) == 0 || fs[len(fs)-1] != d.FileID {
+				e.declFiles[nm] = append(fs, d.FileID)
+			}
+		}
+	}
+	pick := -1
+	for _, d := range e.declFiles[name] {
+		if d != fid && !e.includes(fid, d) {
+			continue
+		}
+		for x, f := range files {
+			if stat[x] || (f != d && !e.includes(f, d)) {
+				continue
+			}
+			if pick >= 0 && pick != x {
+				return -1
+			}
+			pick = x
+		}
+	}
+	return pick
 }
 
 func (e *extractor) resolveCalls() {
@@ -6935,7 +6998,8 @@ func (e *extractor) resolveCalls() {
 		pct = 100 * (total - e.unresN) / total
 	}
 	den := max(total, 1)
-	g.Meta["calls_resolved"] = itoa(int(e.edgeN)) + " in-tree / " +
+	g.Meta["calls_resolved"] = itoa(int(e.edgeN)) + " in-tree (" +
+		itoa(int(e.declPickN)) + " callers matched to one of several definitions by a shared prototype) / " +
 		itoa(int(e.macroN)) + " via macro / " + itoa(int(e.externN)) +
 		" external (" + itoa(int(e.declN)) +
 		" of them declared-here-defined-elsewhere) / " +
@@ -7311,7 +7375,11 @@ func (e *extractor) materialize() {
 			s.NConcurrency = m["concurrency"]
 			s.NReentrancy = m["reentrancy"]
 		}
-		g.rw(i).NFree = freeN[s.ID]
+		// rw gives the symbol a rare row if it has none; writing a zero
+		// through it gave one to every typedef and struct in the tree
+		if n := freeN[s.ID]; n != g.rv(s).NFree {
+			g.rw(i).NFree = n
+		}
 		s.NAlloc = allocN[s.ID]
 	}
 
@@ -8376,9 +8444,9 @@ func qQ1(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NIO), fI32(s.NMemory),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NIO), fI32(s.NMemory),
 			fI32(s.NInteger), fI32(s.NAlloc), fI32(s.Cyclomatic), fI32(s.FanIn),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dSum(2, 3), dI(1))
 	return cols, limit(rows, p)
@@ -8387,8 +8455,8 @@ func qQ1(g *Graph, p params) ([]string, [][]fval) {
 func qQ2(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "frame_bytes", "levels_per_mb", "unsized", "cyclo",
 		"nest", "fan_in", "sloc", "at"}
-	frame := g.shapeCounts("frame_bytes")
-	uns := g.shapeCounts("frame_unsized")
+	frame := g.shapeDense("frame_bytes")
+	uns := g.shapeDense("frame_unsized")
 	var rows [][]fval
 	for _, s := range g.syms() {
 		if s.IsRecursive != 1 || s.Kind() != "function" {
@@ -8400,9 +8468,9 @@ func qQ2(g *Graph, p params) ([]string, [][]fval) {
 		// 48 bytes of return address, saved registers and spill per level is
 		// a floor for a non-leaf function on either LP64 ABI
 		per := frame[s.ID] + 48
-		rows = append(rows, []fval{fStr(s.Name()), fI32(frame[s.ID]),
-			fI32((1 << 20) / per), fI32(uns[s.ID]), fI32(s.Cyclomatic),
-			fI32(s.MaxNesting), fI32(s.FanIn), fI32(s.Sloc), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(frame[s.ID]),
+			fI32((1<<20)/per), fI32(uns[s.ID]), fI32(s.Cyclomatic),
+			fI32(s.MaxNesting), fI32(s.FanIn), fI32(s.Sloc), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(4), cmpS(0))
 	return cols, limit(rows, p)
@@ -8419,9 +8487,9 @@ func qQ3(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NAlloc), fI32(g.rv(s).NFree),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NAlloc), fI32(g.rv(s).NFree),
 			fI32(s.FanIn), fI32(s.NReturns), fI32(s.NGotos), fI32(s.NLabels),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(3))
 	return cols, limit(rows, p)
@@ -8472,8 +8540,8 @@ func qQ4(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(f.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(f.Path()), fI32(a.libc), fI32(a.project),
-			fInt(len(a.pats)), fStr(groupConcat(a.pats))})
+		rows = append(rows, mkrow(fStr(f.Path()), fI32(a.libc), fI32(a.project),
+			fInt(len(a.pats)), fStr(groupConcat(a.pats))))
 	}
 	orderBy(rows, dSum(1, 2))
 	return cols, limit(rows, p)
@@ -8486,9 +8554,9 @@ func qQ5(g *Graph, p params) ([]string, [][]fval) {
 		if s.AllocInLoop <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.AllocInLoop),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.AllocInLoop),
 			fI32(s.MaxLoopDepth), fI32(g.rv(s).NFree), fI32(s.CallInLoop),
-			fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2))
 	return cols, limit(rows, p)
@@ -8505,9 +8573,9 @@ func qQ6(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NAlloc), fI32(g.rv(s).NFree),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NAlloc), fI32(g.rv(s).NFree),
 			fI32(s.NLoops), fI32(s.NBranches), fI32(s.Sloc), fI32(s.FanIn),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dWeighted([][3]int32{{3, 3}, {1, 4}, {2, 1}}), cmpI(5), cmpS(0))
 	return cols, limit(rows, p)
@@ -8516,10 +8584,10 @@ func qQ6(g *Graph, p params) ([]string, [][]fval) {
 func qQ7(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name_", "type_", "ptr", "arr", "stat", "init", "module",
 		"at", "mod_conc_fns"}
-	modConc := map[int32]int32{}
+	modConc := g.perMod()
 	for i := range g.Symbols {
 		if g.Symbols[i].NConcurrency > 0 {
-			modConc[g.Symbols[i].ModuleID]++
+			modConc.add(g.Symbols[i].ModuleID, 1)
 		}
 	}
 	var rows [][]fval
@@ -8538,11 +8606,11 @@ func qQ7(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(gl.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(gl.Name()), fStr(gl.Type()), fI32(gl.PtrDepth),
+		rows = append(rows, mkrow(fStr(gl.Name()), fStr(gl.Type()), fI32(gl.PtrDepth),
 			fI32(gl.IsArray), fI32(gl.IsStatic), fI32(gl.HasInit),
 			fStr(g.modName(gl.ModuleID)),
-			fStr(f.Path() + ":" + strconv.Itoa(int(gl.Line))),
-			fI32(modConc[gl.ModuleID])})
+			fStr(f.Path()+":"+strconv.Itoa(int(gl.Line))),
+			fI32(modConc.at(gl.ModuleID))))
 	}
 	orderBy(rows, dI(8), dI(2), cmpS(0))
 	return cols, limit(rows, p)
@@ -8555,9 +8623,9 @@ func qQ8(g *Graph, p params) ([]string, [][]fval) {
 		if g.rv(s).SwitchInLoop <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).SwitchInLoop),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).SwitchInLoop),
 			fI32(s.MaxLoopDepth), fI32(s.CallInLoop), fI32(s.NCases),
-			fI32(s.Sloc), fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.Sloc), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(3))
 	return cols, limit(rows, p)
@@ -8570,8 +8638,8 @@ func qQ9(g *Graph, p params) ([]string, [][]fval) {
 		if g.rv(s).StrlenInLoop <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).StrlenInLoop),
-			fI32(s.MaxLoopDepth), fI32(s.NLoops), fI32(s.FanIn), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).StrlenInLoop),
+			fI32(s.MaxLoopDepth), fI32(s.NLoops), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(2), dI(1))
 	return cols, limit(rows, p)
@@ -8597,9 +8665,9 @@ func qQ10(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).RetNull), fI32(g.rv(s).RetNeg),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).RetNull), fI32(g.rv(s).RetNeg),
 			fI32(g.rv(s).RetZero), fI32(g.rv(s).RetVal), fI32(g.rv(s).RetVoid),
-			fOptStr(s.ReturnType(), s.HasReturnType), fI32(s.FanIn), fStr(g.at(s))})
+			fOptStr(s.ReturnType(), s.HasReturnType), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(7), cmpS(0))
 	return cols, limit(rows, p)
@@ -8632,8 +8700,8 @@ func qQ11(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(s.Kind()), fI32(s.Sloc),
-			fI32(s.Cyclomatic), fI32(g.rv(s).NExternalCalls), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(s.Kind()), fI32(s.Sloc),
+			fI32(s.Cyclomatic), fI32(g.rv(s).NExternalCalls), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(2))
 	return cols, limit(rows, p)
@@ -8643,10 +8711,8 @@ func qQ12(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "module", "n_patterns", "patterns", "reentrancy_calls",
 		"concurrency_calls", "atomics", "fan_in", "cyclo", "at"}
 	bySym := map[int32][]string{}
-	for _, h := range g.Hazards {
-		if h.Category() != "reentrancy" {
-			continue
-		}
+	for _, i := range g.hazCats("reentrancy") {
+		h := &g.Hazards[i]
 		if !containsStr(bySym[h.SymbolID], h.Pattern()) {
 			bySym[h.SymbolID] = append(bySym[h.SymbolID], h.Pattern())
 		}
@@ -8664,10 +8730,10 @@ func qQ12(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(g.modName(s.ModuleID)),
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(g.modName(s.ModuleID)),
 			fInt(len(pats)), fStr(groupConcat(pats)), fI32(s.NReentrancy),
 			fI32(s.NConcurrency), fI32(s.NAtomic), fI32(s.FanIn),
-			fI32(s.Cyclomatic), fStr(g.at(s))})
+			fI32(s.Cyclomatic), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(5), dI(2), dI(7))
 	return cols, limit(rows, p)
@@ -8701,10 +8767,10 @@ func qQ13(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(g.modName(s.ModuleID)),
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(g.modName(s.ModuleID)),
 			fInt(len(bySym[s.ID])), fStr(groupConcat(bySym[s.ID])),
 			fI32(total[s.ID]), fI32(s.NIO), fI32(s.NStdio), fI32(s.NMemory),
-			fI32(g.rv(s).RetVal), fI32(s.FanIn), fStr(g.at(s))})
+			fI32(g.rv(s).RetVal), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(4), dI(5), dI(9))
 	return cols, limit(rows, p)
@@ -8721,8 +8787,9 @@ var sigUnsafe = []string{"malloc", "calloc", "realloc", "free", "printf",
 func hazardsBy(g *Graph, cat string, pats []string) (map[int32][]string, map[int32]int32) {
 	list := map[int32][]string{}
 	total := map[int32]int32{}
-	for _, h := range g.Hazards {
-		if (cat != "" && h.Category() != cat) || !containsStr(pats, h.Pattern()) {
+	for _, i := range g.hazRows(pats) {
+		h := &g.Hazards[i]
+		if cat != "" && h.Category() != cat {
 			continue
 		}
 		if !containsStr(list[h.SymbolID], h.Pattern()) {
@@ -8749,9 +8816,9 @@ func qQ14(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fInt(len(list[s.ID])),
+		rows = append(rows, mkrow(fStr(s.Name()), fInt(len(list[s.ID])),
 			fStr(groupConcat(list[s.ID])), fI32(total[s.ID]), fI32(s.NMemory),
-			fI32(s.NIO), fI32(s.FanIn), fI32(s.Cyclomatic), fStr(g.at(s))})
+			fI32(s.NIO), fI32(s.FanIn), fI32(s.Cyclomatic), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(3), dI(6))
 	return cols, limit(rows, p)
@@ -8776,9 +8843,9 @@ func qQ15(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fInt(len(list[s.ID])),
+		rows = append(rows, mkrow(fStr(s.Name()), fInt(len(list[s.ID])),
 			fStr(groupConcat(list[s.ID])), fI32(total[s.ID]), fI32(s.NIO),
-			fI32(s.NStdio), fI32(s.FanIn), fI32(s.Cyclomatic), fStr(g.at(s))})
+			fI32(s.NStdio), fI32(s.FanIn), fI32(s.Cyclomatic), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(3), dI(6))
 	return cols, limit(rows, p)
@@ -8799,9 +8866,9 @@ func qQ16(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NAlloc), fI32(g.rv(s).NFree),
-			fI32(s.NAlloc - g.rv(s).NFree), fI32(s.NMemory), fI32(s.FanIn),
-			fI32(s.Cyclomatic), fI32(s.NReturns), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NAlloc), fI32(g.rv(s).NFree),
+			fI32(s.NAlloc-g.rv(s).NFree), fI32(s.NMemory), fI32(s.FanIn),
+			fI32(s.Cyclomatic), fI32(s.NReturns), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5))
 	return cols, limit(rows, p)
@@ -8822,9 +8889,9 @@ func qQ17(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NAlloc), fI32(g.rv(s).NFree),
-			fI32(g.rv(s).NFree - s.NAlloc), fI32(s.NReturns), fI32(s.Cyclomatic),
-			fI32(s.FanIn), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NAlloc), fI32(g.rv(s).NFree),
+			fI32(g.rv(s).NFree-s.NAlloc), fI32(s.NReturns), fI32(s.Cyclomatic),
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(3), dI(6))
 	return cols, limit(rows, p)
@@ -8845,9 +8912,9 @@ func qQ18(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NMemory),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NMemory),
 			fI32(s.NNullCheck), fI32(s.NAlloc), fI32(s.Cyclomatic),
-			fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5))
 	return cols, limit(rows, p)
@@ -8868,30 +8935,325 @@ func qQ19(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NArith), fI32(s.NInteger),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NArith), fI32(s.NInteger),
 			fI32(s.NCmp), fI32(s.NLoops), fI32(s.Cyclomatic), fI32(s.FanIn),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(6))
 	return cols, limit(rows, p)
 }
 
 // shapeCounts collects one `shape` hazard pattern per symbol.
+// The result is shared between callers and must not be written to.
 func (g *Graph) shapeCounts(pat string) map[int32]int32 {
+	ix := g.hz()
+	if m, ok := ix.shape[pat]; ok {
+		return m
+	}
 	m := map[int32]int32{}
-	for _, h := range g.Hazards {
-		if h.Category() == "shape" && h.Pattern() == pat {
+	for _, i := range ix.byPat[pat] {
+		if h := &g.Hazards[i]; h.Category() == "shape" {
 			m[h.SymbolID] += h.N
 		}
 	}
+	ix.shape[pat] = m
 	return m
+}
+
+// hazIndex is the hazards table by pattern and by category, each list in
+// table order. Some thirty queries want a handful of patterns out of a
+// hundred thousand rows; each used to compare every row's strings to find
+// them, a millisecond a time on PostgreSQL.
+type hazIndex struct {
+	n     int
+	byPat map[string][]int32
+	byCat map[string][]int32
+	shape map[string]map[int32]int32
+	dense map[string][]int32
+
+	ign, who map[string]int32
+}
+
+func (g *Graph) hz() *hazIndex {
+	if g.hazIx != nil && g.hazIx.n == len(g.Hazards) {
+		return g.hazIx
+	}
+	ix := &hazIndex{n: len(g.Hazards), byPat: map[string][]int32{},
+		byCat: map[string][]int32{}, shape: map[string]map[int32]int32{},
+		dense: map[string][]int32{}}
+	for i := range g.Hazards {
+		h := &g.Hazards[i]
+		ix.byPat[h.Pattern()] = append(ix.byPat[h.Pattern()], int32(i))
+		ix.byCat[h.Category()] = append(ix.byCat[h.Category()], int32(i))
+	}
+	g.hazIx = ix
+	return ix
+}
+
+// shapeDense is shapeCounts as an array indexed by symbol id.
+func (g *Graph) shapeDense(pat string) []int32 {
+	ix := g.hz()
+	if d, ok := ix.dense[pat]; ok {
+		return d
+	}
+	d := make([]int32, len(g.Symbols)+1)
+	for id, n := range g.shapeCounts(pat) {
+		if uint32(id) < uint32(len(d)) {
+			d[id] = n
+		}
+	}
+	ix.dense[pat] = d
+	return d
+}
+
+// edgeCSR is the call edges grouped by one end, as edge-table indices in
+// table order: the edges of symbol id are idx[start[id]:start[id+1]].
+type edgeCSR struct {
+	start, idx []int32
+}
+
+func (c *edgeCSR) of(id int32) []int32 {
+	if id < 0 || int(id)+1 >= len(c.start) {
+		return nil
+	}
+	return c.idx[c.start[id]:c.start[id+1]]
+}
+
+func (g *Graph) edgeCSR(byCallee bool) *edgeCSR {
+	slot := &g.edgeOut
+	if byCallee {
+		slot = &g.edgeIn
+	}
+	if *slot != nil && (*slot).n == len(g.Edges) {
+		return &(*slot).edgeCSR
+	}
+	n := len(g.Symbols) + 1
+	end := func(e *Edge) int32 {
+		id := e.CallerID
+		if byCallee {
+			id = e.CalleeID
+		}
+		if id < 0 || int(id) >= n {
+			return -1
+		}
+		return id
+	}
+	c := &edgeCSRc{n: len(g.Edges)}
+	c.start = make([]int32, n+1)
+	for i := range g.Edges {
+		if id := end(&g.Edges[i]); id >= 0 {
+			c.start[id+1]++
+		}
+	}
+	for i := 1; i <= n; i++ {
+		c.start[i] += c.start[i-1]
+	}
+	c.idx = make([]int32, c.start[n])
+	fill := slices.Clone(c.start[:n])
+	for i := range g.Edges {
+		if id := end(&g.Edges[i]); id >= 0 {
+			c.idx[fill[id]] = int32(i)
+			fill[id]++
+		}
+	}
+	*slot = c
+	return &c.edgeCSR
+}
+
+type edgeCSRc struct {
+	edgeCSR
+	n int
+}
+
+// symIndex holds what several queries used to rebuild for themselves: tables
+// keyed by a NAME (declarations, address-taken references) joined to the
+// symbols carrying that name, as arrays indexed by symbol id. A query then
+// reads a slot where it used to hash the symbol's name -- for every symbol.
+type symIndex struct {
+	nSym, nDecl, nAddr, nMacro int
+
+	nameN  []int32 // symbols sharing this symbol's name
+	fnDefs []int32 // function symbols sharing it
+	rank   []int32 // position in syms()
+
+	declN, declHdr []int32 // declaration rows with this name; those in a .h
+
+	addrAny    []bool  // some address-taken row has this name
+	addrInFile []bool  // ... in this symbol's own file
+	bodyN      []int32 // rows inside a function body with this name
+	bodyInFile []int32 // ... in this symbol's own file
+	refs       map[string][]addrRef
+
+	macro []*Macro
+}
+
+type addrRef struct {
+	file int32
+	kind string
+}
+
+func (g *Graph) six() *symIndex {
+	if x := g.symIx; x != nil && x.nSym == len(g.Symbols) && x.nDecl == len(g.Decls) &&
+		x.nAddr == len(g.Addr) && x.nMacro == len(g.Macros) {
+		return x
+	}
+	n := len(g.Symbols) + 1
+	x := &symIndex{nSym: len(g.Symbols), nDecl: len(g.Decls), nAddr: len(g.Addr),
+		nMacro: len(g.Macros),
+		nameN:  make([]int32, n), fnDefs: make([]int32, n), rank: make([]int32, n),
+		declN: make([]int32, n), declHdr: make([]int32, n),
+		addrAny: make([]bool, n), addrInFile: make([]bool, n),
+		bodyN: make([]int32, n), bodyInFile: make([]int32, n),
+		refs: map[string][]addrRef{}, macro: make([]*Macro, n)}
+	if g.byName == nil {
+		buildIndex(g)
+	}
+	for _, ids := range g.byName {
+		fns := int32(0)
+		for _, id := range ids {
+			if g.Symbols[id-1].Kind() == "function" {
+				fns++
+			}
+		}
+		for _, id := range ids {
+			x.nameN[id], x.fnDefs[id] = int32(len(ids)), fns
+		}
+	}
+	for i, s := range g.syms() {
+		x.rank[s.ID] = int32(i)
+	}
+	for i := range g.Decls {
+		d := &g.Decls[i]
+		hdr := int32(0)
+		if f := g.fileOf2(d.FileID); f != nil && f.Ext() == ".h" {
+			hdr = 1
+		}
+		for _, id := range g.byName[d.Name()] {
+			x.declN[id]++
+			x.declHdr[id] += hdr
+		}
+	}
+	for i := range g.Addr {
+		a := &g.Addr[i]
+		nm := a.Name()
+		for _, id := range g.byName[nm] {
+			own := g.Symbols[id-1].FileID == a.FileID
+			x.addrAny[id] = true
+			if own {
+				x.addrInFile[id] = true
+			}
+			if a.HasSym {
+				x.bodyN[id]++
+				if own {
+					x.bodyInFile[id]++
+				}
+			}
+		}
+		if !a.HasSym {
+			x.refs[nm] = append(x.refs[nm], addrRef{a.FileID, a.Kind()})
+		}
+	}
+	for i := range g.Macros {
+		if id := g.Macros[i].SymbolID; id >= 0 && int(id) < n {
+			x.macro[id] = &g.Macros[i]
+		}
+	}
+	g.symIx = x
+	return x
+}
+
+// perID is a count per symbol, file or module id. It takes any id a table
+// row may carry -- a row with no symbol has id 0, a damaged one anything --
+// where a map took them silently and a bare slice would not.
+type perID []int32
+
+func (g *Graph) perSym() perID  { return make(perID, len(g.Symbols)+1) }
+func (g *Graph) perFile() perID { return make(perID, len(g.Files)+1) }
+func (g *Graph) perMod() perID  { return make(perID, len(g.Modules)+1) }
+
+func (p perID) add(id, n int32) {
+	if uint32(id) < uint32(len(p)) {
+		p[id] += n
+	}
+}
+
+func (p perID) at(id int32) int32 {
+	if uint32(id) < uint32(len(p)) {
+		return p[id]
+	}
+	return 0
+}
+
+// groupRows groups row numbers 0..n-1 by key(i), a value in [0, nk): the rows
+// of key k are idx[start[k]:start[k+1]], in row order. Rows whose key is out
+// of range are left out.
+func groupRows(n, nk int, key func(i int) int32) (start, idx []int32) {
+	start = make([]int32, nk+1)
+	for i := 0; i < n; i++ {
+		if k := key(i); k >= 0 && int(k) < nk {
+			start[k+1]++
+		}
+	}
+	for k := 1; k <= nk; k++ {
+		start[k] += start[k-1]
+	}
+	idx = make([]int32, start[nk])
+	fill := slices.Clone(start[:nk])
+	for i := 0; i < n; i++ {
+		if k := key(i); k >= 0 && int(k) < nk {
+			idx[fill[k]] = int32(i)
+			fill[k]++
+		}
+	}
+	return start, idx
+}
+
+// discards is, per callee name, how many call sites drop its result and in
+// how many callers. Built once; callers must not write to it.
+func (ix *hazIndex) discards(g *Graph) (ign, who map[string]int32) {
+	if ix.ign == nil {
+		ix.ign, ix.who = map[string]int32{}, map[string]int32{}
+		for _, i := range ix.byCat["discard"] {
+			h := &g.Hazards[i]
+			ix.ign[h.Pattern()] += h.N
+			ix.who[h.Pattern()]++
+		}
+	}
+	return ix.ign, ix.who
+}
+
+// hazRows is the rows whose pattern is one of pats, in table order.
+func (g *Graph) hazRows(pats []string) []int32 {
+	ix := g.hz()
+	var out []int32
+	for k, pat := range pats {
+		if !slices.Contains(pats[:k], pat) {
+			out = append(out, ix.byPat[pat]...)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// hazCats is the rows in any of the categories, in table order.
+func (g *Graph) hazCats(cats ...string) []int32 {
+	ix := g.hz()
+	if len(cats) == 1 {
+		return ix.byCat[cats[0]]
+	}
+	var out []int32
+	for _, c := range cats {
+		out = append(out, ix.byCat[c]...)
+	}
+	slices.Sort(out)
+	return out
 }
 
 func qQ20(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "unguarded_divs", "var_divs", "div_in_loop",
 		"n_params", "cyclo", "fan_in", "at"}
-	ung := g.shapeCounts("div_unguarded")
-	all := g.shapeCounts("div_by_var")
+	ung := g.shapeDense("div_unguarded")
+	all := g.shapeDense("div_by_var")
 	var rows [][]fval
 	for _, s := range g.syms() {
 		if ung[s.ID] <= 0 {
@@ -8904,9 +9266,9 @@ func qQ20(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(ung[s.ID]), fI32(all[s.ID]),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(ung[s.ID]), fI32(all[s.ID]),
 			fI32(g.rv(s).DivInLoop), fI32(s.NParams), fI32(s.Cyclomatic),
-			fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(6), cmpS(0))
 	return cols, limit(rows, p)
@@ -8926,8 +9288,8 @@ func qQ21(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NSwitch), fI32(s.NCases),
-			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NSwitch), fI32(s.NCases),
+			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(4))
 	return cols, limit(rows, p)
@@ -8948,9 +9310,9 @@ func qQ22(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NConcurrency),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NConcurrency),
 			fI32(s.NAtomic), fI32(s.NReentrancy), fI32(s.NMemory),
-			fI32(s.FanIn), fI32(s.Cyclomatic), fStr(g.at(s))})
+			fI32(s.FanIn), fI32(s.Cyclomatic), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5))
 	return cols, limit(rows, p)
@@ -8977,9 +9339,9 @@ func qQ23(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fInt(len(list[s.ID])),
+		rows = append(rows, mkrow(fStr(s.Name()), fInt(len(list[s.ID])),
 			fStr(groupConcat(list[s.ID])), fI32(s.NIO), fI32(s.NMemory),
-			fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5))
 	return cols, limit(rows, p)
@@ -8988,8 +9350,8 @@ func qQ23(g *Graph, p params) ([]string, [][]fval) {
 func qQ24(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "no_exit_loops", "forever_loops", "returns", "cyclo",
 		"fan_in", "sloc", "at"}
-	nox := g.shapeCounts("loop_forever_noexit")
-	all := g.shapeCounts("loop_forever")
+	nox := g.shapeDense("loop_forever_noexit")
+	all := g.shapeDense("loop_forever")
 	var rows [][]fval
 	for _, s := range g.syms() {
 		if nox[s.ID] <= 0 || s.Kind() != "function" {
@@ -9002,9 +9364,9 @@ func qQ24(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(nox[s.ID]), fI32(all[s.ID]),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(nox[s.ID]), fI32(all[s.ID]),
 			fI32(s.NReturns), fI32(s.Cyclomatic), fI32(s.FanIn), fI32(s.Sloc),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5), cmpS(0))
 	return cols, limit(rows, p)
@@ -9013,25 +9375,23 @@ func qQ24(g *Graph, p params) ([]string, [][]fval) {
 func qQ25(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "ignored_sites", "call_sites", "pct_ignored",
 		"callers_ignoring", "returns", "at"}
-	ign := map[string]int32{}
-	who := map[string]int32{}
-	for _, h := range g.Hazards {
-		if h.Category() == "discard" {
-			ign[h.Pattern()] += h.N
-			who[h.Pattern()]++
+	ign, who := g.hz().discards(g)
+	// a name defined twice cannot say which definition was called. The
+	// candidates are the few symbols named by a discard row, taken in scan
+	// order; asking every symbol in the tree for its name's count was most of
+	// this query.
+	x := g.six()
+	var cand []*Symbol
+	for nm := range ign {
+		for _, id := range g.byName[nm] {
+			cand = append(cand, g.Symbols[id-1])
 		}
 	}
-	// a name defined twice cannot say which definition was called
-	defs := map[string]int32{}
-	for _, s := range g.syms() {
-		if s.Kind() == "function" {
-			defs[s.Name()]++
-		}
-	}
+	slices.SortFunc(cand, func(a, b *Symbol) int { return cmp.Compare(x.rank[a.ID], x.rank[b.ID]) })
 	var rows [][]fval
-	for _, s := range g.syms() {
+	for _, s := range cand {
 		n := ign[s.Name()]
-		if n <= 0 || s.Kind() != "function" || defs[s.Name()] != 1 {
+		if n <= 0 || s.Kind() != "function" || x.fnDefs[s.ID] != 1 {
 			continue
 		}
 		rt := strings.TrimSpace(s.ReturnType())
@@ -9046,9 +9406,9 @@ func qQ25(g *Graph, p params) ([]string, [][]fval) {
 			continue
 		}
 		sites := max(s.NCallsites, n)
-		rows = append(rows, []fval{fStr(s.Name()), fI32(n), fI32(sites),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(n), fI32(sites),
 			fI32(pct(int64(n), int64(sites))), fI32(who[s.Name()]),
-			fStr(jtrunc(rt, 24)), fStr(g.at(s))})
+			fStr(jtrunc(rt, 24)), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(3), cmpS(0))
 	return cols, limit(rows, p)
@@ -9056,21 +9416,18 @@ func qQ25(g *Graph, p params) ([]string, [][]fval) {
 
 func qQ26(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "uses", "params", "body_len", "multiline", "at"}
-	bySym := map[int32]*Macro{}
-	for i := range g.Macros {
-		bySym[g.Macros[i].SymbolID] = &g.Macros[i]
-	}
+	bySym := g.six().macro
 	var rows [][]fval
 	for _, s := range g.syms() {
-		m, ok := bySym[s.ID]
-		if !ok || m.IsFunctionlike != 1 || m.NUses <= 3 {
+		m := bySym[s.ID]
+		if m == nil || m.IsFunctionlike != 1 || m.NUses <= 3 {
 			continue
 		}
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(m.NUses), fI32(m.NParams),
-			fI32(m.BodyLen), fI32(m.IsMultiline), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(m.NUses), fI32(m.NParams),
+			fI32(m.BodyLen), fI32(m.IsMultiline), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1))
 	return cols, limit(rows, p)
@@ -9092,9 +9449,9 @@ func qQ27(g *Graph, p params) ([]string, [][]fval) {
 			continue
 		}
 		direct := maxI(0, s.NCalls-g.rv(s).NFnptrCalls-s.NDynamicCalls)
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NFnptrCalls),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NFnptrCalls),
 			fI32(s.NDynamicCalls), fI32(direct), fI32(s.FanIn), fI32(s.Sloc),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dSum(1, 2), cmpS(0))
 	return cols, limit(rows, p)
@@ -9128,8 +9485,8 @@ func qQ28(g *Graph, p params) ([]string, [][]fval) {
 			continue
 		}
 		a := byFile[fid]
-		rows = append(rows, []fval{fStr(f.Path()), fI32(a.user), fI32(a.sys),
-			fI32(pct(int64(a.user), int64(a.user+a.sys))), fI32(f.Sloc)})
+		rows = append(rows, mkrow(fStr(f.Path()), fI32(a.user), fI32(a.sys),
+			fI32(pct(int64(a.user), int64(a.user+a.sys))), fI32(f.Sloc)))
 	}
 	orderBy(rows, cmpI(3), dSum(1, 2))
 	return cols, limit(rows, p)
@@ -9137,18 +9494,19 @@ func qQ28(g *Graph, p params) ([]string, [][]fval) {
 
 func qQ29(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"fn_a", "fn_b", "at_a", "at_b", "a_calls_b", "b_calls_a"}
-	type ek struct{ c, d int32 }
-	n := map[ek]int32{}
-	for _, e := range g.Edges {
-		n[ek{e.CallerID, e.CalleeID}] = e.NCalls
-	}
+	out := g.edgeCSR(false)
 	var rows [][]fval
 	for i := range g.Edges {
 		a := &g.Edges[i]
 		if a.CallerID >= a.CalleeID {
 			continue
 		}
-		rev := n[ek{a.CalleeID, a.CallerID}]
+		rev := int32(0)
+		for _, j := range out.of(a.CalleeID) {
+			if g.Edges[j].CalleeID == a.CallerID {
+				rev = g.Edges[j].NCalls
+			}
+		}
 		if rev == 0 {
 			continue
 		}
@@ -9160,8 +9518,8 @@ func qQ29(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(sa.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(sa.Name()), fStr(sb.Name()), fStr(g.at(sa)),
-			fStr(g.at(sb)), fI32(a.NCalls), fI32(rev)})
+		rows = append(rows, mkrow(fStr(sa.Name()), fStr(sb.Name()), fStr(g.at(sa)),
+			fStr(g.at(sb)), fI32(a.NCalls), fI32(rev)))
 	}
 	orderBy(rows, dSum(4, 5))
 	return cols, limit(rows, p)
@@ -9183,9 +9541,9 @@ func qQ30(g *Graph, p params) ([]string, [][]fval) {
 		if f == nil {
 			continue
 		}
-		rows = append(rows, []fval{fStr(f.Path()), fStr(gl.Name()), fStr(gl.Type()),
+		rows = append(rows, mkrow(fStr(f.Path()), fStr(gl.Name()), fStr(gl.Type()),
 			fI32(gl.Line), fI32(gl.HasInit), fI32(gl.IsVolatile),
-			fI32(gl.IsAtomic), fI32(gl.PtrDepth)})
+			fI32(gl.IsAtomic), fI32(gl.PtrDepth)))
 	}
 	orderBy(rows, dI(6), dI(5), cmpS(0), cmpI(3))
 	return cols, limit(rows, p)
@@ -9201,45 +9559,52 @@ func (g *Graph) fileOf2(id int32) *File {
 func qQ31(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"header", "sloc", "n_syms", "n_fns", "inbound_calls",
 		"included_by"}
-	nFns := map[int32]int32{}
-	nSyms := map[int32]int32{}
-	for _, s := range g.syms() {
+	nf := len(g.Files) + 1
+	okF := func(id int32) bool { return id >= 0 && int(id) < nf }
+	nFns := make([]int32, nf)
+	nSyms := make([]int32, nf)
+	for _, s := range g.Symbols {
+		if !okF(s.FileID) {
+			continue
+		}
 		nSyms[s.FileID]++
 		if s.Kind() == "function" {
 			nFns[s.FileID]++
 		}
 	}
-	inbound := map[int32]int32{}
-	for _, e := range g.Edges {
-		if s := g.sym(e.CalleeID); s != nil {
-			inbound[s.FileID]++
+	inbound := make([]bool, nf)
+	for i := range g.Edges {
+		if s := g.sym(g.Edges[i].CalleeID); s != nil && okF(s.FileID) {
+			inbound[s.FileID] = true
 		}
 	}
-	includedBy := map[int32]int32{}
-	seenInc := map[[2]int32]bool{}
-	for _, im := range g.Imports {
-		if im.Kind() != "include" || !im.HasTargetID {
-			continue
+	// distinct (header, includer) pairs
+	var pairs []uint64
+	for i := range g.Imports {
+		im := &g.Imports[i]
+		if im.Kind() == "include" && im.HasTargetID && okF(im.TargetID) {
+			pairs = append(pairs, uint64(uint32(im.TargetID))<<32|uint64(uint32(im.FileID)))
 		}
-		k := [2]int32{im.TargetID, im.FileID}
-		if !seenInc[k] {
-			seenInc[k] = true
-			includedBy[im.TargetID]++
+	}
+	slices.Sort(pairs)
+	includedBy := make([]int32, nf)
+	for i, k := range pairs {
+		if i == 0 || k != pairs[i-1] {
+			includedBy[k>>32]++
 		}
 	}
 	var rows [][]fval
 	for i := range g.Files {
 		f := &g.Files[i]
-
-		if includedBy[f.ID] == 0 || f.NSymbols <= 0 || nFns[f.ID] <= 0 ||
-			inbound[f.ID] != 0 {
+		if !okF(f.ID) || includedBy[f.ID] == 0 || f.NSymbols <= 0 || nFns[f.ID] <= 0 ||
+			inbound[f.ID] {
 			continue
 		}
 		if !likeMatch(g.modName(f.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(f.Path()), fI32(f.Sloc), fI32(nSyms[f.ID]),
-			fI32(nFns[f.ID]), fI32(0), fI32(includedBy[f.ID])})
+		rows = append(rows, mkrow(fStr(f.Path()), fI32(f.Sloc), fI32(nSyms[f.ID]),
+			fI32(nFns[f.ID]), fI32(0), fI32(includedBy[f.ID])))
 	}
 	orderBy(rows, dI(5), dI(1))
 	return cols, limit(rows, p)
@@ -9260,8 +9625,8 @@ func qQ32(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(r.NTransitive),
-			fI32(s.FanIn), fI32(s.NCalls), fI32(s.Sloc), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(r.NTransitive),
+			fI32(s.FanIn), fI32(s.NCalls), fI32(s.Sloc), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), cmpS(0))
 	return cols, limit(rows, p)
@@ -9270,15 +9635,14 @@ func qQ32(g *Graph, p params) ([]string, [][]fval) {
 func qQ33(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "total_size", "tail_pad", "total_pad", "n_lines_64",
 		"exact", "n_fields", "n_ptr_fields", "at"}
-	nTop := map[int32]int32{}
-	nPtr := map[int32]int32{}
-	for _, l := range g.Layout {
-
+	nTop, nPtr := g.perSym(), g.perSym()
+	for i := range g.Layout {
+		l := &g.Layout[i]
 		if l.Depth == 0 {
-			nTop[l.SymbolID]++
+			nTop.add(l.SymbolID, 1)
 		}
 		if l.PtrDepth > 0 {
-			nPtr[l.SymbolID]++
+			nPtr.add(l.SymbolID, 1)
 		}
 	}
 	var rows [][]fval
@@ -9293,10 +9657,10 @@ func qQ33(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(ss.TotalSize),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(ss.TotalSize),
 			fI32(ss.TailPad), fI32(ss.TotalPad), fI32(ss.NLines64),
-			fI32(ss.Exact), fI32(nTop[ss.SymbolID]), fI32(nPtr[ss.SymbolID]),
-			fStr(g.at(s))})
+			fI32(ss.Exact), fI32(nTop.at(ss.SymbolID)), fI32(nPtr.at(ss.SymbolID)),
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(3))
 	return cols, limit(rows, p)
@@ -9305,29 +9669,31 @@ func qQ33(g *Graph, p params) ([]string, [][]fval) {
 func qQ34(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"path", "extern_globals", "extern_calls", "total_calls",
 		"pct_external"}
-	eg := map[int32]int32{}
-	for _, gl := range g.Globals {
-		if gl.IsStatic == 0 && gl.IsConst == 0 {
+	nf := len(g.Files) + 1
+	okF := func(id int32) bool { return id >= 0 && int(id) < nf }
+	eg := make([]int32, nf)
+	for i := range g.Globals {
+		if gl := &g.Globals[i]; gl.IsStatic == 0 && gl.IsConst == 0 && okF(gl.FileID) {
 			eg[gl.FileID]++
 		}
 	}
-	ec := map[int32]int32{}
-	tot := map[int32]int32{}
-	nSym := map[int32]int32{}
-	for _, s := range g.syms() {
-		if s.Kind() != "function" {
+	ec := make([]int32, nf)
+	tot := make([]int32, nf)
+	nSym := make([]int32, nf)
+	for _, s := range g.Symbols {
+		if !okF(s.FileID) {
 			continue
 		}
-		ec[s.FileID] += g.rv(s).NExternalCalls
-		tot[s.FileID] += s.NCalls
-	}
-	for i := range g.Symbols {
-		nSym[g.Symbols[i].FileID]++
+		nSym[s.FileID]++
+		if s.Kind() == "function" {
+			ec[s.FileID] += g.rv(s).NExternalCalls
+			tot[s.FileID] += s.NCalls
+		}
 	}
 	var rows [][]fval
 	for i := range g.Files {
 		f := &g.Files[i]
-		if nSym[f.ID] == 0 || (ec[f.ID] == 0 && eg[f.ID] == 0) {
+		if !okF(f.ID) || nSym[f.ID] == 0 || (ec[f.ID] == 0 && eg[f.ID] == 0) {
 			continue
 		}
 		if !likeMatch(g.modName(f.ModuleID), p.mod) {
@@ -9337,8 +9703,8 @@ func qQ34(g *Graph, p params) ([]string, [][]fval) {
 		if tot[f.ID] != 0 {
 			pv = fI32(pct(int64(ec[f.ID]), int64(tot[f.ID])))
 		}
-		rows = append(rows, []fval{fStr(f.Path()), fI32(eg[f.ID]), fI32(ec[f.ID]),
-			fI32(tot[f.ID]), pv})
+		rows = append(rows, mkrow(fStr(f.Path()), fI32(eg[f.ID]), fI32(ec[f.ID]),
+			fI32(tot[f.ID]), pv))
 	}
 	orderBy(rows, dI(2))
 	return cols, limit(rows, p)
@@ -9346,14 +9712,22 @@ func qQ34(g *Graph, p params) ([]string, [][]fval) {
 
 func qQ35(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "n_sigs", "n_files", "where_defined"}
-	type grp struct {
-		sigs  map[string]bool
-		files map[int32]bool
+	// the scan is in name order, so the definitions of one name are adjacent
+	// and a group is a run, not a map entry
+	var rows [][]fval
+	var (
+		cur   string
+		open  bool
+		sigs  []string
+		files []int32
 		paths []string
-		order []string
+	)
+	flush := func() {
+		if open && len(sigs) > 1 {
+			rows = append(rows, mkrow(fStr(cur), fInt(len(sigs)), fInt(len(files)),
+				fStr(groupConcat(paths))))
+		}
 	}
-	m := map[string]*grp{}
-	var names []string
 	for _, s := range g.symsName() {
 		if s.Kind() != "function" || !s.HasSignature || s.Signature() == "" {
 			continue
@@ -9365,45 +9739,42 @@ func qQ35(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		gp := m[s.Name()]
-		if gp == nil {
-			gp = &grp{sigs: map[string]bool{}, files: map[int32]bool{}}
-			m[s.Name()] = gp
-			names = append(names, s.Name())
+		if nm := s.Name(); !open || nm != cur {
+			flush()
+			cur, open = nm, true
+			sigs, files, paths = sigs[:0], files[:0], paths[:0]
 		}
-		gp.sigs[s.Signature()] = true
-		if !gp.files[f.ID] {
-			gp.files[f.ID] = true
-			gp.paths = append(gp.paths, f.Path())
+		if sig := s.Signature(); !slices.Contains(sigs, sig) {
+			sigs = append(sigs, sig)
+		}
+		if !slices.Contains(files, f.ID) {
+			files = append(files, f.ID)
+			paths = append(paths, f.Path())
 		}
 	}
-	var rows [][]fval
-	for _, n := range names {
-		gp := m[n]
-		if len(gp.sigs) <= 1 {
-			continue
-		}
-		rows = append(rows, []fval{fStr(n), fInt(len(gp.sigs)), fInt(len(gp.files)),
-			fStr(groupConcat(gp.paths))})
-	}
+	flush()
 	orderBy(rows, dI(2), dI(1), cmpS(0))
 	return cols, limit(rows, p)
 }
 
 func qQ36(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "path", "line_start", "fan_in", "n_caller_files"}
-	callerFiles := map[int32]map[int32]bool{}
-	for _, e := range g.Edges {
+	// only "none, one, or more than one calling file" is ever asked
+	n1 := len(g.Symbols) + 1
+	first := make([]int32, n1)
+	nFiles := make([]uint8, n1)
+	for i := range g.Edges {
+		e := &g.Edges[i]
 		cs := g.sym(e.CallerID)
-		if cs == nil {
+		if cs == nil || e.CalleeID < 0 || int(e.CalleeID) >= n1 {
 			continue
 		}
-		m := callerFiles[e.CalleeID]
-		if m == nil {
-			m = map[int32]bool{}
-			callerFiles[e.CalleeID] = m
+		switch id := e.CalleeID; {
+		case nFiles[id] == 0:
+			first[id], nFiles[id] = cs.FileID, 1
+		case first[id] != cs.FileID:
+			nFiles[id] = 2
 		}
-		m[cs.FileID] = true
 	}
 	var rows [][]fval
 	for _, s := range g.syms() {
@@ -9417,12 +9788,12 @@ func qQ36(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		n := int32(len(callerFiles[s.ID]))
+		n := int32(nFiles[s.ID])
 		if s.FanIn <= 0 || n > 1 {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(f.Path()),
-			fI32(s.LineStart), fI32(s.FanIn), fI32(n)})
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(f.Path()),
+			fI32(s.LineStart), fI32(s.FanIn), fI32(n)))
 	}
 	orderBy(rows, dI(3), cmpS(0))
 	return cols, limit(rows, p)
@@ -9436,10 +9807,8 @@ func qQ37(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"path", "caller", "api", "category", "sites", "first_line",
 		"fan_in"}
 	var rows [][]fval
-	for _, h := range g.Hazards {
-		if !containsStr(riskyApis, h.Pattern()) {
-			continue
-		}
+	for _, i := range g.hazRows(riskyApis) {
+		h := &g.Hazards[i]
 		s := g.sym(h.SymbolID)
 		if s == nil {
 			continue
@@ -9451,8 +9820,8 @@ func qQ37(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(f.Path()), fStr(s.Name()), fStr(h.Pattern()),
-			fStr(h.Category()), fI32(h.N), fI32(h.FirstLine), fI32(s.FanIn)})
+		rows = append(rows, mkrow(fStr(f.Path()), fStr(s.Name()), fStr(h.Pattern()),
+			fStr(h.Category()), fI32(h.N), fI32(h.FirstLine), fI32(s.FanIn)))
 	}
 	orderBy(rows, dI(6), dI(4))
 	return cols, limit(rows, p)
@@ -9478,8 +9847,8 @@ func qQ38(g *Graph, p params) ([]string, [][]fval) {
 			strings.Contains(v, "%") {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(v), fI32(sc.Line),
-			fStr(f.Path() + ":" + strconv.Itoa(int(sc.Line)))})
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(v), fI32(sc.Line),
+			fStr(f.Path()+":"+strconv.Itoa(int(sc.Line)))))
 	}
 	orderBy(rows, dLenStr(1))
 	return cols, limit(rows, p)
@@ -9495,16 +9864,16 @@ func qQ39(g *Graph, p params) ([]string, [][]fval) {
 	for _, c := range g.Cycles {
 		fid, ok := byPath[c.APath()]
 		if !ok {
-			rows = append(rows, []fval{fStr(c.APath()), fStr(c.BPath()),
-				fI32(c.Length), fStr(c.Members())})
+			rows = append(rows, mkrow(fStr(c.APath()), fStr(c.BPath()),
+				fI32(c.Length), fStr(c.Members())))
 			continue
 		}
 		f := &g.Files[fid-1]
 		if !likeMatch(g.modName(f.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(c.APath()), fStr(c.BPath()), fI32(c.Length),
-			fStr(c.Members())})
+		rows = append(rows, mkrow(fStr(c.APath()), fStr(c.BPath()), fI32(c.Length),
+			fStr(c.Members())))
 	}
 	orderBy(rows, cmpI(2), cmpS(0))
 	return cols, limit(rows, p)
@@ -9524,8 +9893,8 @@ func qQ40(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NConstCast),
-			fI32(s.NCast), fI32(s.FanIn), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NConstCast),
+			fI32(s.NCast), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(3))
 	return cols, limit(rows, p)
@@ -9533,15 +9902,7 @@ func qQ40(g *Graph, p params) ([]string, [][]fval) {
 
 func qQ41(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "path", "line_start", "sloc", "addr_taken"}
-	body := map[[2]any]int32{}
-	byName := map[string]int32{}
-	for _, a := range g.Addr {
-		if !a.HasSym {
-			continue
-		}
-		body[[2]any{a.Name(), a.FileID}]++
-		byName[a.Name()] += 1
-	}
+	x := g.six()
 	var rows [][]fval
 	for _, s := range g.syms() {
 		if s.Kind() != "function" || s.FanIn != 0 || s.IsTest != 0 {
@@ -9551,15 +9912,15 @@ func qQ41(g *Graph, p params) ([]string, [][]fval) {
 		if f == nil || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		n := body[[2]any{s.Name(), f.ID}]
+		n := x.bodyInFile[s.ID]
 		if s.IsStatic == 0 {
-			n = byName[s.Name()]
+			n = x.bodyN[s.ID]
 		}
 		if n == 0 {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(f.Path()), fI32(s.LineStart),
-			fI32(s.Sloc), fI32(n)})
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(f.Path()), fI32(s.LineStart),
+			fI32(s.Sloc), fI32(n)))
 	}
 	orderBy(rows, dI(4), dI(3), cmpS(0))
 	return cols, limit(rows, p)
@@ -9567,19 +9928,12 @@ func qQ41(g *Graph, p params) ([]string, [][]fval) {
 
 func qQ42(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "path", "line", "defined_count"}
-	byName := map[string][]int32{}
-	for _, s := range g.syms() {
-		if s.Kind() != "function" {
-			continue
-		}
-		byName[s.Name()] = append(byName[s.Name()], s.ID)
-	}
 	var rows [][]fval
 	for _, d := range g.Decls {
 		cnt := int32(0)
-		for _, sid := range byName[d.Name()] {
-
-			if sy := g.sym(sid); sy.IsStatic == 0 || sy.FileID == d.FileID {
+		for _, sid := range g.byName[d.Name()] {
+			if sy := g.sym(sid); sy.Kind() == "function" &&
+				(sy.IsStatic == 0 || sy.FileID == d.FileID) {
 				cnt++
 			}
 		}
@@ -9593,8 +9947,8 @@ func qQ42(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(f.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(d.Name()), fStr(f.Path()), fI32(d.Line),
-			fI32(0)})
+		rows = append(rows, mkrow(fStr(d.Name()), fStr(f.Path()), fI32(d.Line),
+			fI32(0)))
 	}
 	orderBy(rows, cmpS(0), cmpS(1))
 	return cols, limit(rows, p)
@@ -9614,8 +9968,8 @@ func qQ43(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NToctou), fI32(s.NIO),
-			fI32(s.FanIn), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NToctou), fI32(s.NIO),
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(3))
 	return cols, limit(rows, p)
@@ -9636,10 +9990,10 @@ func qQ44(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NLockAcquire),
-			fI32(g.rv(s).NLockRelease), fI32(g.rv(s).NLockAcquire - g.rv(s).NLockRelease),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NLockAcquire),
+			fI32(g.rv(s).NLockRelease), fI32(g.rv(s).NLockAcquire-g.rv(s).NLockRelease),
 			fI32(s.NReturns), fI32(s.NGotos), fI32(s.FanIn),
-			fI32(s.Cyclomatic), fStr(g.at(s))})
+			fI32(s.Cyclomatic), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(3), dI(6), cmpS(0))
 	return cols, limit(rows, p)
@@ -9660,8 +10014,8 @@ func qQ45(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NLockAcquire), fI32(s.NIO),
-			fI32(s.NMemory), fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NLockAcquire), fI32(s.NIO),
+			fI32(s.NMemory), fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(2), dI(1), cmpS(0))
 	return cols, limit(rows, p)
@@ -9693,9 +10047,9 @@ func qQ46(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(m.Fn()), fStr(m.Dst()), fStr(m.Src()),
+		rows = append(rows, mkrow(fStr(m.Fn()), fStr(m.Dst()), fStr(m.Src()),
 			fStr(m.SizeArg()), fStr(m.SizeBuf()), fStr(s.Name()), fI32(s.FanIn),
-			fStr(f.Path() + ":" + strconv.Itoa(int(m.Line)))})
+			fStr(f.Path()+":"+strconv.Itoa(int(m.Line)))))
 	}
 	orderBy(rows, dI(6), cmpLine(7), cmpS(0))
 	return cols, limit(rows, p)
@@ -9719,9 +10073,9 @@ func qQ47(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(a.Fn()), fStr(a.SizeExpr()), fStr(s.Name()),
+		rows = append(rows, mkrow(fStr(a.Fn()), fStr(a.SizeExpr()), fStr(s.Name()),
 			fI32(s.FanIn), fI32(g.rv(s).NAllocsite),
-			fStr(f.Path() + ":" + strconv.Itoa(int(a.Line)))})
+			fStr(f.Path()+":"+strconv.Itoa(int(a.Line)))))
 	}
 	orderBy(rows, dI(3), cmpLine(5), cmpS(0))
 	return cols, limit(rows, p)
@@ -9812,9 +10166,9 @@ func qQ48(g *Graph, p params) ([]string, [][]fval) {
 		if f == nil {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(x.writes),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(x.writes),
 			fStr(g.modName(s.ModuleID)), fI32(mutable[f.ID]), fI32(s.FanIn),
-			fI32(s.Cyclomatic), fI32(rank[x.id]), fStr(g.at(s))})
+			fI32(s.Cyclomatic), fI32(rank[x.id]), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(4))
 	return cols, limit(rows, p)
@@ -9842,9 +10196,9 @@ func qQ49(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NNarrowCast),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NNarrowCast),
 			fI32(s.NArith), fI32(s.NShift), fI32(s.NIO), fI32(s.FanIn),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5), cmpS(0))
 	return cols, limit(rows, p)
@@ -9864,8 +10218,8 @@ func qQ50(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NSignCmp), fI32(s.NCmp),
-			fI32(s.NParams), fI32(s.FanIn), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NSignCmp), fI32(s.NCmp),
+			fI32(s.NParams), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(4), cmpS(0))
 	return cols, limit(rows, p)
@@ -9875,8 +10229,9 @@ func qQ51(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "fmt_calls", "stdio_calls", "fan_in", "via", "at"}
 	want := []string{"vsnprintf", "vsprintf", "vfprintf", "vprintf", "syslog"}
 	bySym := map[int32][]string{}
-	for _, h := range g.Hazards {
-		if containsStr(want, h.Pattern()) && !containsStr(bySym[h.SymbolID], h.Pattern()) {
+	for _, i := range g.hazRows(want) {
+		h := &g.Hazards[i]
+		if !containsStr(bySym[h.SymbolID], h.Pattern()) {
 			bySym[h.SymbolID] = append(bySym[h.SymbolID], h.Pattern())
 		}
 	}
@@ -9896,8 +10251,8 @@ func qQ51(g *Graph, p params) ([]string, [][]fval) {
 		if l := bySym[s.ID]; len(l) > 0 {
 			via = fStr(groupConcat(l))
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NVariadicFmt),
-			fI32(s.NStdio), fI32(s.FanIn), via, fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NVariadicFmt),
+			fI32(s.NStdio), fI32(s.FanIn), via, fStr(g.at(s))))
 	}
 	orderBy(rows, dI(3), dI(1), cmpS(0))
 	return cols, limit(rows, p)
@@ -9906,34 +10261,19 @@ func qQ51(g *Graph, p params) ([]string, [][]fval) {
 func qQ52(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "table_refs", "plain_refs", "tables_in", "sloc",
 		"cyclo", "at"}
-	type ref struct {
-		file int32
-		kind string
-	}
-	refs := map[string][]ref{}
-
-	bodyRefFiles := map[string][]int32{}
-	for _, a := range g.Addr {
-		if a.HasSym {
-			bodyRefFiles[a.Name()] = append(bodyRefFiles[a.Name()], a.FileID)
-			continue
+	x := g.six()
+	vetoed := func(s *Symbol) bool {
+		if s.IsStatic == 0 {
+			return x.bodyN[s.ID] > 0
 		}
-		refs[a.Name()] = append(refs[a.Name()], ref{a.FileID, a.Kind()})
-	}
-	vetoed := func(name string, fid, isStatic int32) bool {
-		files := bodyRefFiles[name]
-		if isStatic == 0 {
-			return len(files) > 0
-		}
-		return slices.Contains(files, fid)
+		return x.bodyInFile[s.ID] > 0
 	}
 	var rows [][]fval
 	for _, s := range g.syms() {
-		if s.Kind() != "function" || s.FanIn != 0 ||
-			vetoed(s.Name(), s.FileID, s.IsStatic) {
+		if s.Kind() != "function" || s.FanIn != 0 || vetoed(s) {
 			continue
 		}
-		rs := refs[s.Name()]
+		rs := x.refs[s.Name()]
 		n := int32(0)
 		plain := int32(0)
 		var names []string
@@ -9958,9 +10298,9 @@ func qQ52(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(n), fI32(plain),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(n), fI32(plain),
 			fStr(groupConcat(distinctStrings(names))), fI32(s.Sloc),
-			fI32(s.Cyclomatic), fStr(g.at(s))})
+			fI32(s.Cyclomatic), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(4), cmpS(0))
 	return cols, limit(rows, p)
@@ -9982,9 +10322,9 @@ func qQ53(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NAllocsite),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NAllocsite),
 			fI32(g.rv(s).NFree), fI32(s.NReturns), fI32(s.NBranches), fI32(s.NGotos),
-			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(3), dI(1), cmpS(0))
 	return cols, limit(rows, p)
@@ -9998,9 +10338,9 @@ func qQ54(g *Graph, p params) ([]string, [][]fval) {
 		if g.rv(s).NReallocSelf <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NReallocSelf),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NReallocSelf),
 			fI32(s.NAlloc), fI32(g.rv(s).NFree), fI32(s.NReturns), fI32(s.FanIn),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5))
 	return cols, limit(rows, p)
@@ -10022,9 +10362,9 @@ func qQ55(g *Graph, p params) ([]string, [][]fval) {
 		if f == nil {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(a.Fn()), fStr(a.SizeExpr()),
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(a.Fn()), fStr(a.SizeExpr()),
 			fI32(s.NAlloc), fI32(s.FanIn),
-			fStr(f.Path() + ":" + strconv.Itoa(int(a.Line)))})
+			fStr(f.Path()+":"+strconv.Itoa(int(a.Line)))))
 	}
 	orderBy(rows, dI(4), cmpS(0))
 	return cols, limit(rows, p)
@@ -10038,10 +10378,8 @@ func qQ56(g *Graph, p params) ([]string, [][]fval) {
 	closeFns := []string{"close", "fclose", "closedir", "munmap", "pclose", "shutdown"}
 	o := map[int32]int32{}
 	c := map[int32]int32{}
-	for _, h := range g.Hazards {
-		if h.Category() != "io" && h.Category() != "stdio" {
-			continue
-		}
+	for _, i := range g.hazCats("io", "stdio") {
+		h := &g.Hazards[i]
 		if containsStr(openFns, h.Pattern()) {
 			o[h.SymbolID] += h.N
 		}
@@ -10063,9 +10401,9 @@ func qQ56(g *Graph, p params) ([]string, [][]fval) {
 		if s == nil || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(o[sid]), fI32(c[sid]),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(o[sid]), fI32(c[sid]),
 			fI32(s.NReturns), fI32(s.NGotos), fI32(s.Cyclomatic),
-			fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dWeighted([][3]int32{{1, 1}, {-1, 2}}), dI(6))
 	return cols, limit(rows, p)
@@ -10082,9 +10420,9 @@ func qQ57(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NAlloc),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NAlloc),
 			fI32(s.NNullCheck), fI32(s.NReturns), fI32(s.Cyclomatic),
-			fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5), cmpS(0))
 	return cols, limit(rows, p)
@@ -10101,9 +10439,9 @@ func qQ58(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NVla), fI32(s.NIO),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NVla), fI32(s.NIO),
 			fI32(s.NMemory), fI32(s.NInteger), fI32(s.MaxNesting),
-			fI32(s.FanIn), fI32(s.IsRecursive), fStr(g.at(s))})
+			fI32(s.FanIn), fI32(s.IsRecursive), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2), dI(6))
 	return cols, limit(rows, p)
@@ -10116,9 +10454,9 @@ func qQ59(g *Graph, p params) ([]string, [][]fval) {
 		if g.rv(s).NFreeThenUse <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NFreeThenUse),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NFreeThenUse),
 			fI32(g.rv(s).NFree), fI32(s.Sloc), fI32(s.NReturns), fI32(s.FanIn),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5))
 	return cols, limit(rows, p)
@@ -10131,9 +10469,9 @@ func qQ60(g *Graph, p params) ([]string, [][]fval) {
 		if g.rv(s).NWeakRandom <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NWeakRandom),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NWeakRandom),
 			fI32(s.NIO), fI32(s.NExec), fI32(s.FanIn), fI32(s.IsPublic),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(4))
 	return cols, limit(rows, p)
@@ -10147,9 +10485,9 @@ func qQ61(g *Graph, p params) ([]string, [][]fval) {
 		if g.rv(s).NShiftVar <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NShiftVar), fI32(s.NCast),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NShiftVar), fI32(s.NCast),
 			fI32(s.NIO), fI32(s.NInteger), fI32(s.Cyclomatic), fI32(s.FanIn),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(3), dI(6))
 	return cols, limit(rows, p)
@@ -10159,11 +10497,8 @@ func qQ62(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "errno_reads", "fallible_calls", "returns_", "cyclo",
 		"fan_in", "at"}
 	fallible := map[int32]int32{}
-	for _, h := range g.Hazards {
-		switch h.Category() {
-		case "io", "stdio", "alloc", "memory":
-			fallible[h.SymbolID] += h.N
-		}
+	for _, i := range g.hazCats("io", "stdio", "alloc", "memory") {
+		fallible[g.Hazards[i].SymbolID] += g.Hazards[i].N
 	}
 	var rows [][]fval
 	for _, s := range g.symsName() {
@@ -10177,9 +10512,9 @@ func qQ62(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NErrno),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NErrno),
 			fI32(fallible[s.ID]), fI32(s.NReturns), fI32(s.Cyclomatic),
-			fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2))
 	return cols, limit(rows, p)
@@ -10192,8 +10527,8 @@ func qQ63(g *Graph, p params) ([]string, [][]fval) {
 		if g.rv(s).NGetenv <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NGetenv), fI32(s.NMemory),
-			fI32(s.NExec), fI32(s.NIO), fI32(s.FanIn), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NGetenv), fI32(s.NMemory),
+			fI32(s.NExec), fI32(s.NIO), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(3), dI(5))
 	return cols, limit(rows, p)
@@ -10214,9 +10549,9 @@ func qQ64(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NAssertSide),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NAssertSide),
 			fI32(s.Sloc), fI32(s.NCalls), fI32(s.FanIn), fI32(f.IsTest),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(4))
 	return cols, limit(rows, p)
@@ -10301,8 +10636,8 @@ func qQ65(g *Graph, p params) ([]string, [][]fval) {
 		if !modOK {
 			continue
 		}
-		rows = append(rows, []fval{fStr(k.lo), fStr(k.hi), fI32(af), fI32(bf),
-			fStr(groupConcat(lp.aNames)), fStr(groupConcat(lp.bNames))})
+		rows = append(rows, mkrow(fStr(k.lo), fStr(k.hi), fI32(af), fI32(bf),
+			fStr(groupConcat(lp.aNames)), fStr(groupConcat(lp.bNames))))
 	}
 	orderBy(rows, dSum(2, 3), dI(2))
 	return cols, limit(rows, p)
@@ -10327,10 +10662,10 @@ func appendDistinct(l []string, s string) []string {
 func qQ66(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"struct_name", "sharing_fields", "cache_line", "first_off",
 		"last_off", "size", "pad", "conc_fns_in_module", "at"}
-	modc := map[int32]int32{}
+	modc := g.perMod()
 	for i := range g.Symbols {
 		if g.Symbols[i].NConcurrency > 0 {
-			modc[g.Symbols[i].ModuleID]++
+			modc.add(g.Symbols[i].ModuleID, 1)
 		}
 	}
 	type grp struct {
@@ -10355,11 +10690,11 @@ func qQ66(g *Graph, p params) ([]string, [][]fval) {
 			e.hi = l.ByteOff
 		}
 	}
-	size := map[int32]int32{}
-	pad := map[int32]int32{}
-	for _, ss := range g.SSize {
-		size[ss.SymbolID] = ss.TotalSize
-		pad[ss.SymbolID] = ss.TotalPad
+	size, pad := g.perSym(), g.perSym()
+	for i := range g.SSize {
+		if ss := &g.SSize[i]; uint32(ss.SymbolID) < uint32(len(size)) {
+			size[ss.SymbolID], pad[ss.SymbolID] = ss.TotalSize, ss.TotalPad
+		}
 	}
 	var keys []int64
 	for k, v := range byKey {
@@ -10376,9 +10711,9 @@ func qQ66(g *Graph, p params) ([]string, [][]fval) {
 			continue
 		}
 		e := byKey[k]
-		rows = append(rows, []fval{fStr(s.Name()), fI32(e.n), fI32(int32(k & 0xffffffff)),
-			fI32(e.lo), fI32(e.hi), fI32(size[sid]), fI32(pad[sid]),
-			fI32(modc[s.ModuleID]), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(e.n), fI32(int32(k&0xffffffff)),
+			fI32(e.lo), fI32(e.hi), fI32(size.at(sid)), fI32(pad.at(sid)),
+			fI32(modc.at(s.ModuleID)), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(7), dI(5))
 	return cols, limit(rows, p)
@@ -10402,9 +10737,9 @@ func qQ67(g *Graph, p params) ([]string, [][]fval) {
 		if f == nil {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(m.Fn()), fStr(m.Dst()),
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(m.Fn()), fStr(m.Dst()),
 			fStr(m.SizeArg()), fI32(s.FanIn),
-			fStr(f.Path() + ":" + strconv.Itoa(int(m.Line)))})
+			fStr(f.Path()+":"+strconv.Itoa(int(m.Line)))))
 	}
 	orderBy(rows, dI(4), cmpS(0))
 	return cols, limit(rows, p)
@@ -10412,10 +10747,10 @@ func qQ67(g *Graph, p params) ([]string, [][]fval) {
 
 func qQ68(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"struct_name", "size", "pad", "pct_pad", "copied_whole", "at"}
-	copied := map[int32]bool{}
-	for _, m := range g.Memops {
-		if m.Fn() == "memcpy" || m.Fn() == "memmove" || m.Fn() == "memset" {
-			copied[m.SymbolID] = true
+	copied := g.perSym()
+	for i := range g.Memops {
+		if m := &g.Memops[i]; m.Fn() == "memcpy" || m.Fn() == "memmove" || m.Fn() == "memset" {
+			copied.add(m.SymbolID, 1)
 		}
 	}
 	var rows [][]fval
@@ -10428,12 +10763,12 @@ func qQ68(g *Graph, p params) ([]string, [][]fval) {
 			continue
 		}
 		cw := int32(0)
-		if copied[ss.SymbolID] {
+		if copied.at(ss.SymbolID) > 0 {
 			cw = 1
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(ss.TotalSize),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(ss.TotalSize),
 			fI32(ss.TotalPad), fI32(pct(int64(ss.TotalPad), int64(ss.TotalSize))),
-			fI32(cw), fStr(g.at(s))})
+			fI32(cw), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(2), dI(4), dI(1))
 	return cols, limit(rows, p)
@@ -10444,24 +10779,12 @@ func qQ68(g *Graph, p params) ([]string, [][]fval) {
 // in a file-scope table. A static function is only visible in its own file,
 // unless that file is a header.
 func (g *Graph) namedAsValue() func(*Symbol) bool {
-	any := map[string]bool{}
-	inFile := map[string]map[int32]bool{}
-	for _, a := range g.Addr {
-		nm := a.Name()
-		any[nm] = true
-		m := inFile[nm]
-		if m == nil {
-			m = map[int32]bool{}
-			inFile[nm] = m
-		}
-		m[a.FileID] = true
-	}
+	x := g.six()
 	return func(s *Symbol) bool {
-		nm := s.Name()
-		if !any[nm] {
+		if !x.addrAny[s.ID] {
 			return false
 		}
-		if s.IsStatic == 0 || inFile[nm][s.FileID] {
+		if s.IsStatic == 0 || x.addrInFile[s.ID] {
 			return true
 		}
 		f := g.fileOf(s.ID)
@@ -10484,8 +10807,8 @@ func qQ69(g *Graph, p params) ([]string, [][]fval) {
 		if f == nil {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.Sloc), fI32(s.Cyclomatic),
-			fI32(s.NCalls), fStr(f.Path()), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.Sloc), fI32(s.Cyclomatic),
+			fI32(s.NCalls), fStr(f.Path()), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2), cmpS(0))
 	return cols, limit(rows, p)
@@ -10493,24 +10816,21 @@ func qQ69(g *Graph, p params) ([]string, [][]fval) {
 
 func qQ70(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "fan_in", "sloc", "external", "at"}
-	declared := map[string]bool{}
-	for _, d := range g.Decls {
-		declared[d.Name()] = true
-	}
+	declN := g.six().declN
 	var rows [][]fval
 	for _, s := range g.syms() {
 		if s.Kind() != "function" || s.IsStatic != 0 || s.IsInline != 0 {
 			continue
 		}
 		f := g.fileOf(s.ID)
-		if f == nil || f.Ext() != ".c" || declared[s.Name()] {
+		if f == nil || f.Ext() != ".c" || declN[s.ID] > 0 {
 			continue
 		}
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.FanIn), fI32(s.Sloc),
-			fI32(s.IsPublic), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.FanIn), fI32(s.Sloc),
+			fI32(s.IsPublic), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2), cmpS(0))
 	return cols, limit(rows, p)
@@ -10518,31 +10838,30 @@ func qQ70(g *Graph, p params) ([]string, [][]fval) {
 
 func qQ71(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"path", "sloc", "syms", "includes", "included_by"}
-	inc := map[int32]int32{}
-	incBy := map[int32]int32{}
-	for _, im := range g.Imports {
-		inc[im.FileID]++
+	inc, incBy, guarded := g.perFile(), g.perFile(), g.perFile()
+	for i := range g.Imports {
+		im := &g.Imports[i]
+		inc.add(im.FileID, 1)
 		if im.HasTargetID {
-			incBy[im.TargetID]++
+			incBy.add(im.TargetID, 1)
 		}
 	}
-	guarded := map[int32]bool{}
-	for _, cb := range g.Cfgs {
-		if cb.Directive() == "ifndef" && cb.Line <= 12 {
-			guarded[cb.FileID] = true
+	for i := range g.Cfgs {
+		if cb := &g.Cfgs[i]; cb.Line <= 12 && cb.Directive() == "ifndef" {
+			guarded.add(cb.FileID, 1)
 		}
 	}
 	var rows [][]fval
 	for i := range g.Files {
 		f := &g.Files[i]
-		if f.Ext() != ".h" || guarded[f.ID] {
+		if f.Ext() != ".h" || guarded.at(f.ID) > 0 {
 			continue
 		}
 		if !likeMatch(g.modName(f.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(f.Path()), fI32(f.Sloc), fI32(f.NSymbols),
-			fI32(inc[f.ID]), fI32(incBy[f.ID])})
+		rows = append(rows, mkrow(fStr(f.Path()), fI32(f.Sloc), fI32(f.NSymbols),
+			fI32(inc.at(f.ID)), fI32(incBy.at(f.ID))))
 	}
 	orderBy(rows, dI(4), dI(1))
 	return cols, limit(rows, p)
@@ -10551,25 +10870,50 @@ func qQ71(g *Graph, p params) ([]string, [][]fval) {
 func qQ72(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"from_module", "to_module", "hops_out", "hops_back",
 		"out_edges", "back_edges"}
+	// the distinct module-to-module edges. A table of nm x nm flags answers
+	// "seen this pair?" for all but absurd module counts.
 	medge := map[[2]int32]bool{}
+	nm := len(g.Modules) + 1
+	var flags []bool
+	if nm <= 4096 {
+		flags = make([]bool, nm*nm)
+	}
+	first := func(k [2]int32) bool {
+		if flags != nil && uint32(k[0]) < uint32(nm) && uint32(k[1]) < uint32(nm) {
+			i := int(k[0])*nm + int(k[1])
+			was := flags[i]
+			flags[i] = true
+			return !was
+		}
+		was := medge[k]
+		medge[k] = true
+		return !was
+	}
 	deg := map[int32]int32{}
 	var direct [][2]int32
-	for _, e := range g.Edges {
+	for i := range g.Edges {
+		e := &g.Edges[i]
 		a, b := g.sym(e.CallerID), g.sym(e.CalleeID)
 		if a == nil || b == nil || a.ModuleID == 0 || b.ModuleID == 0 ||
 			a.ModuleID == b.ModuleID {
 			continue
 		}
-		k := [2]int32{a.ModuleID, b.ModuleID}
-		if !medge[k] {
-			medge[k] = true
+		if k := [2]int32{a.ModuleID, b.ModuleID}; first(k) {
 			direct = append(direct, k)
 			deg[a.ModuleID]++
 		}
 	}
 
+	// successors by module: stepping every reached pair against the whole
+	// edge list is pairs x edges, which is fine at 139 modules and not at
+	// the few thousand a kernel-sized tree has
+	succ := map[int32][]int32{}
+	for _, e := range direct {
+		succ[e[0]] = append(succ[e[0]], e[1])
+	}
+
 	best := map[[2]int32]int32{}
-	for k := range medge {
+	for _, k := range direct {
 		best[k] = 1
 	}
 
@@ -10581,11 +10925,8 @@ func qQ72(g *Graph, p params) ([]string, [][]fval) {
 			if d != depth-1 {
 				continue
 			}
-			for _, e := range direct {
-				if k[1] != e[0] {
-					continue
-				}
-				nk := [2]int32{k[0], e[1]}
+			for _, to := range succ[k[1]] {
+				nk := [2]int32{k[0], to}
 				if _, ok := best[nk]; !ok {
 					next[nk] = depth
 				}
@@ -10625,8 +10966,8 @@ func qQ72(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(k.a), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(g.modName(k.a)), fStr(g.modName(k.b)),
-			fI32(out), fI32(back), fI32(deg[k.a]), fI32(deg[k.b])})
+		rows = append(rows, mkrow(fStr(g.modName(k.a)), fStr(g.modName(k.b)),
+			fI32(out), fI32(back), fI32(deg[k.a]), fI32(deg[k.b])))
 	}
 	orderBy(rows, dSum(2, 3), dI(4))
 	return cols, limit(rows, p)
@@ -10634,57 +10975,63 @@ func qQ72(g *Graph, p params) ([]string, [][]fval) {
 
 func qQ73(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "dominant_prefix", "prefix_users", "fan_in", "sloc", "at"}
-	counts := map[int32]map[string]int32{}
-	prefix := map[int32]string{}
-	for _, s := range g.syms() {
-		if s.Kind() != "function" {
+	// A file has a handful of distinct prefixes, so each file keeps a short
+	// list of them rather than a map: no hashing, nothing allocated per
+	// function.
+	type pc struct {
+		pr string
+		n  int32
+	}
+	prefixOf := func(s *Symbol) string {
+		nm := s.Name()
+		if u := strings.IndexByte(nm, '_'); u >= 1 {
+			return nm[:u+1]
+		}
+		return ""
+	}
+	nf := len(g.Files) + 1
+	counts := make([][]pc, nf)
+syms:
+	for _, s := range g.Symbols {
+		if s.Kind() != "function" || s.FileID < 0 || int(s.FileID) >= nf {
 			continue
 		}
-		u := strings.IndexByte(s.Name(), '_')
-		var pr string
-		if u >= 1 {
-			pr = s.Name()[:u+1]
-		}
+		pr := prefixOf(s)
 		if pr == "" {
 			continue
 		}
-		m := counts[s.FileID]
-		if m == nil {
-			m = map[string]int32{}
-			counts[s.FileID] = m
-		}
-		m[pr]++
-	}
-	for fid, m := range counts {
-
-		best, bn := int32(0), ""
-		for k, v := range m {
-			if v > best || (v == best && k > bn) {
-				best, bn = v, k
+		l := counts[s.FileID]
+		for i := range l {
+			if l[i].pr == pr {
+				l[i].n++
+				continue syms
 			}
 		}
-		prefix[fid] = bn
+		counts[s.FileID] = append(l, pc{pr, 1})
+	}
+	dom := make([]pc, nf)
+	for fid, l := range counts {
+		for _, c := range l {
+			if c.n > dom[fid].n || (c.n == dom[fid].n && c.pr > dom[fid].pr) {
+				dom[fid] = c
+			}
+		}
 	}
 	var rows [][]fval
 	for _, s := range g.syms() {
-		if s.Kind() != "function" {
+		if s.Kind() != "function" || s.FileID < 0 || int(s.FileID) >= nf {
 			continue
 		}
-		u := strings.IndexByte(s.Name(), '_')
-		if u < 1 {
-			continue
-		}
-		pr := s.Name()[:u+1]
-		dom := prefix[s.FileID]
-		n := counts[s.FileID][dom]
-		if pr == dom || n < 3 {
+		pr := prefixOf(s)
+		d := dom[s.FileID]
+		if pr == "" || pr == d.pr || d.n < 3 {
 			continue
 		}
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(dom), fI32(n),
-			fI32(s.FanIn), fI32(s.Sloc), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(d.pr), fI32(d.n),
+			fI32(s.FanIn), fI32(s.Sloc), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(2), dI(3))
 	return cols, limit(rows, p)
@@ -10692,16 +11039,14 @@ func qQ73(g *Graph, p params) ([]string, [][]fval) {
 
 func qQ74(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "fan_in", "cyclo", "sloc", "module", "at"}
-	untested := map[int32]bool{}
-	for _, e := range g.Edges {
+	untested := make([]bool, len(g.Symbols)+1)
+	for i := range g.Edges {
+		e := &g.Edges[i]
 		cs := g.sym(e.CallerID)
-		if cs == nil {
+		if cs == nil || e.CalleeID < 0 || int(e.CalleeID) >= len(untested) {
 			continue
 		}
-		if f := g.fileOf(cs.ID); f != nil && f.IsTest == 1 {
-			untested[e.CalleeID] = true
-		}
-		if cs.IsTest == 1 {
+		if f := g.fileOf(cs.ID); (f != nil && f.IsTest == 1) || cs.IsTest == 1 {
 			untested[e.CalleeID] = true
 		}
 	}
@@ -10721,8 +11066,8 @@ func qQ74(g *Graph, p params) ([]string, [][]fval) {
 		if m == "" {
 			m = "(none)"
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.FanIn),
-			fI32(s.Cyclomatic), fI32(s.Sloc), fStr(m), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.FanIn),
+			fI32(s.Cyclomatic), fI32(s.Sloc), fStr(m), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2), cmpS(0))
 	return cols, limit(rows, p)
@@ -10735,9 +11080,9 @@ func qQ75(g *Graph, p params) ([]string, [][]fval) {
 		if s.IOInLoop <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.IOInLoop),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.IOInLoop),
 			fI32(s.MaxLoopDepth), fI32(s.NLoops), fI32(s.CallInLoop),
-			fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2))
 	return cols, limit(rows, p)
@@ -10751,9 +11096,9 @@ func qQ76(g *Graph, p params) ([]string, [][]fval) {
 		if s.LockInLoop <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.LockInLoop),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.LockInLoop),
 			fI32(s.MaxLoopDepth), fI32(g.rv(s).NLockAcquire), fI32(g.rv(s).NLockRelease),
-			fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2))
 	return cols, limit(rows, p)
@@ -10770,16 +11115,16 @@ func qQ77(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.BranchInLoop),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.BranchInLoop),
 			fI32(s.MaxLoopDepth), fI32(g.rv(s).SwitchInLoop), fI32(s.CallInLoop),
-			fI32(s.Sloc), fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.Sloc), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2))
 	return cols, limit(rows, p)
 }
 
 func simpleQ(cols []string, keep func(s *Symbol) bool, g *Graph, p params,
-	fill func(s *Symbol) []fval, keys ...func(a, b []fval) int) ([]string, [][]fval) {
+	fill func(s *Symbol) []fval, keys ...ordKey) ([]string, [][]fval) {
 	var rows [][]fval
 	for _, s := range g.syms() {
 		if !keep(s) {
@@ -10799,9 +11144,9 @@ func qQ78(g *Graph, p params) ([]string, [][]fval) {
 		"eagain_checks", "loops", "cyclo", "fan_in", "at"}
 	return simpleQ(cols, func(s *Symbol) bool { return g.rv(s).NEtReg > 0 && g.rv(s).NEagain == 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NEtReg), fI32(g.rv(s).NEpoll),
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NEtReg), fI32(g.rv(s).NEpoll),
 				fI32(g.rv(s).NKqueue), fI32(g.rv(s).NEagain), fI32(s.NLoops),
-				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(1), cmpI(6))
 }
 
@@ -10810,9 +11155,9 @@ func qQ79(g *Graph, p params) ([]string, [][]fval) {
 		"kqueue_calls", "eintr_checks", "loops", "cyclo", "fan_in", "at"}
 	return simpleQ(cols, func(s *Symbol) bool { return g.rv(s).NEventWait > 0 && g.rv(s).NEintr == 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NEventWait), fI32(g.rv(s).NEpoll),
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NEventWait), fI32(g.rv(s).NEpoll),
 				fI32(g.rv(s).NUring), fI32(g.rv(s).NKqueue), fI32(g.rv(s).NEintr), fI32(s.NLoops),
-				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(1), cmpI(7))
 }
 
@@ -10822,9 +11167,9 @@ func qQ80(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return g.rv(s).NWriteReady > 0 && g.rv(s).NDereg == 0
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NWriteReady), fI32(g.rv(s).NEpoll),
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NWriteReady), fI32(g.rv(s).NEpoll),
 			fI32(g.rv(s).NKqueue), fI32(g.rv(s).NDereg), fI32(s.NLoops), fI32(s.FanIn),
-			fStr(g.at(s))}
+			fStr(g.at(s)))
 	}, dI(1), dI(6))
 }
 
@@ -10834,10 +11179,10 @@ func qQ81(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return (g.rv(s).NEpoll > 0 || g.rv(s).NKqueue > 0) && g.rv(s).NErrFlag == 0
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NEpoll), fI32(g.rv(s).NKqueue),
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NEpoll), fI32(g.rv(s).NKqueue),
 			fI32(g.rv(s).NErrFlag), fI32(g.rv(s).NEventWait), fI32(s.Cyclomatic),
-			fI32(s.FanIn), fStr(g.at(s))}
-	}, func(a, b []fval) int { return -cmpI32(a[1].i+a[2].i, b[1].i+b[2].i) },
+			fI32(s.FanIn), fStr(g.at(s)))
+	}, dSum(1, 2),
 		dI(6))
 }
 
@@ -10847,9 +11192,9 @@ func qQ82(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return g.rv(s).NOneshotReg > 0 && g.rv(s).NRearm == 0
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NOneshotReg), fI32(g.rv(s).NRearm),
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NOneshotReg), fI32(g.rv(s).NRearm),
 			fI32(g.rv(s).NEpoll), fI32(g.rv(s).NKqueue), fI32(s.Cyclomatic), fI32(s.FanIn),
-			fStr(g.at(s))}
+			fStr(g.at(s)))
 	}, cmpI(1), cmpI(6))
 }
 
@@ -10858,9 +11203,9 @@ func qQ83(g *Graph, p params) ([]string, [][]fval) {
 		"cyclo", "fan_in", "at"}
 	return simpleQ(cols, func(s *Symbol) bool { return g.rv(s).NUring > 0 && g.rv(s).NUringRes == 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NUring), fI32(g.rv(s).NUringRes),
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NUring), fI32(g.rv(s).NUringRes),
 				fI32(g.rv(s).NEventWait), fI32(g.rv(s).NErrno), fI32(s.Cyclomatic),
-				fI32(s.FanIn), fStr(g.at(s))}
+				fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(1), cmpI(6))
 }
 
@@ -10869,9 +11214,9 @@ func qQ84(g *Graph, p params) ([]string, [][]fval) {
 		"fan_in", "at"}
 	return simpleQ(cols, func(s *Symbol) bool { return g.rv(s).NUring > 0 && g.rv(s).NErrno > 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NUring), fI32(g.rv(s).NErrno),
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NUring), fI32(g.rv(s).NErrno),
 				fI32(g.rv(s).NUringRes), fI32(s.Cyclomatic), fI32(s.FanIn),
-				fStr(g.at(s))}
+				fStr(g.at(s)))
 		}, cmpI(1), cmpI(2))
 }
 
@@ -10881,8 +11226,8 @@ func qQ85(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return g.rv(s).NUring > 0 && g.rv(s).NUringSqpoll > 0 && g.rv(s).NFree > 0
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NUring), fI32(g.rv(s).NUringSqpoll),
-			fI32(g.rv(s).NFree), fI32(s.NAlloc), fI32(s.Cyclomatic), fStr(g.at(s))}
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NUring), fI32(g.rv(s).NUringSqpoll),
+			fI32(g.rv(s).NFree), fI32(s.NAlloc), fI32(s.Cyclomatic), fStr(g.at(s)))
 	}, cmpI(2), cmpI(3))
 }
 
@@ -10892,9 +11237,9 @@ func qQ86(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return g.rv(s).NUringRing > 0 && g.rv(s).NUringBarrier == 0
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NUringRing), fI32(g.rv(s).NUring),
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NUringRing), fI32(g.rv(s).NUring),
 			fI32(g.rv(s).NUringBarrier), fI32(s.Cyclomatic), fI32(s.FanIn),
-			fStr(g.at(s))}
+			fStr(g.at(s)))
 	}, cmpI(1), cmpI(5))
 }
 
@@ -10903,9 +11248,9 @@ func qQ87(g *Graph, p params) ([]string, [][]fval) {
 		"calls_in_loop", "cyclo", "fan_in", "at"}
 	return simpleQ(cols, func(s *Symbol) bool { return g.rv(s).NEventWait > 0 && s.NAlloc > 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NEventWait), fI32(s.NAlloc),
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NEventWait), fI32(s.NAlloc),
 				fI32(s.AllocInLoop), fI32(s.MaxLoopDepth), fI32(s.CallInLoop),
-				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(2), cmpI(3))
 }
 
@@ -10915,12 +11260,10 @@ func qQ88(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return g.rv(s).NEvTimeoutIndefinite > 0 || g.rv(s).NEvTimeoutZero > 0
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NEvTimeoutIndefinite),
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NEvTimeoutIndefinite),
 			fI32(g.rv(s).NEvTimeoutZero), fI32(g.rv(s).NEventWait), fI32(g.rv(s).NEpoll),
-			fI32(g.rv(s).NKqueue), fI32(s.NLoops), fI32(s.Cyclomatic), fStr(g.at(s))}
-	}, func(a, b []fval) int {
-		return -cmpI32(a[1].i+a[2].i, b[1].i+b[2].i)
-	}, cmpI(7))
+			fI32(g.rv(s).NKqueue), fI32(s.NLoops), fI32(s.Cyclomatic), fStr(g.at(s)))
+	}, dSum(1, 2), cmpI(7))
 }
 
 func qQ89(g *Graph, p params) ([]string, [][]fval) {
@@ -10928,9 +11271,9 @@ func qQ89(g *Graph, p params) ([]string, [][]fval) {
 		"epoll_calls", "kqueue_calls", "cyclo", "fan_in", "at"}
 	return simpleQ(cols, func(s *Symbol) bool { return g.rv(s).NEtReg > 0 && g.rv(s).NNonblockSet == 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NEtReg), fI32(g.rv(s).NNonblockSet),
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NEtReg), fI32(g.rv(s).NNonblockSet),
 				fI32(g.rv(s).NEagain), fI32(g.rv(s).NEpoll), fI32(g.rv(s).NKqueue),
-				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(1), cmpI(6))
 }
 
@@ -10940,9 +11283,9 @@ func qQ90(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return g.rv(s).NEventCreate > 0 && g.rv(s).NEventDestroy == 0
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NEventCreate), fI32(g.rv(s).NEventDestroy),
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NEventCreate), fI32(g.rv(s).NEventDestroy),
 			fI32(g.rv(s).NEpoll), fI32(g.rv(s).NUring), fI32(g.rv(s).NKqueue), fI32(s.NReturns),
-			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 	}, dI(1), dI(8))
 }
 
@@ -10951,8 +11294,8 @@ func qQ91(g *Graph, p params) ([]string, [][]fval) {
 		"fan_in", "at"}
 	return simpleQ(cols, func(s *Symbol) bool { return g.rv(s).NUringSqe > 0 && s.NNullCheck == 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NUringSqe), fI32(s.NNullCheck),
-				fI32(g.rv(s).NUring), fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NUringSqe), fI32(s.NNullCheck),
+				fI32(g.rv(s).NUring), fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(1), cmpI(5))
 }
 
@@ -10962,9 +11305,9 @@ func qQ92(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return g.rv(s).NUring > 0 && g.rv(s).NEventWait > 0 && g.rv(s).NUringSeen == 0
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NUringSeen), fI32(g.rv(s).NEventWait),
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NUringSeen), fI32(g.rv(s).NEventWait),
 			fI32(g.rv(s).NUring), fI32(g.rv(s).NUringSqe), fI32(s.Cyclomatic),
-			fI32(s.FanIn), fStr(g.at(s))}
+			fI32(s.FanIn), fStr(g.at(s)))
 	}, cmpI(2), cmpI(3))
 }
 
@@ -10974,9 +11317,9 @@ func qQ93(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return g.rv(s).NUringSqe >= 2 && g.rv(s).NUringSqe > g.rv(s).NUringUdata
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NUringSqe - g.rv(s).NUringUdata),
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NUringSqe-g.rv(s).NUringUdata),
 			fI32(g.rv(s).NUringSqe), fI32(g.rv(s).NUringUdata), fI32(g.rv(s).NEventWait),
-			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 	}, cmpI(1), cmpI(2))
 }
 
@@ -10986,9 +11329,9 @@ func qQ94(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return g.rv(s).NUringStreamOps > 0 && g.rv(s).NUringLink == 0
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NUringStreamOps), fI32(g.rv(s).NUringLink),
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NUringStreamOps), fI32(g.rv(s).NUringLink),
 			fI32(g.rv(s).NUringSqe), fI32(s.MaxLoopDepth), fI32(s.Cyclomatic),
-			fI32(s.FanIn), fStr(g.at(s))}
+			fI32(s.FanIn), fStr(g.at(s)))
 	}, cmpI(1), cmpI(6))
 }
 
@@ -10998,9 +11341,9 @@ func qQ95(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return g.rv(s).NUring > 0 && g.rv(s).NEventCreate > 0 && g.rv(s).NUringTeardown == 0
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NEventCreate), fI32(g.rv(s).NUringTeardown),
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NEventCreate), fI32(g.rv(s).NUringTeardown),
 			fI32(g.rv(s).NUring), fI32(g.rv(s).NEventDestroy), fI32(s.Cyclomatic),
-			fI32(s.FanIn), fStr(g.at(s))}
+			fI32(s.FanIn), fStr(g.at(s)))
 	}, cmpI(1), cmpI(2))
 }
 
@@ -11009,8 +11352,8 @@ func qQ96(g *Graph, p params) ([]string, [][]fval) {
 		"fan_in", "at"}
 	return simpleQ(cols, func(s *Symbol) bool { return g.rv(s).NKqTimerZeroData > 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NKqTimer), fI32(g.rv(s).NKqTimerZeroData),
-				fI32(g.rv(s).NKqueue), fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NKqTimer), fI32(g.rv(s).NKqTimerZeroData),
+				fI32(g.rv(s).NKqueue), fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(2), cmpI(5))
 }
 
@@ -11019,8 +11362,8 @@ func qQ97(g *Graph, p params) ([]string, [][]fval) {
 		"cyclo", "fan_in", "at"}
 	return simpleQ(cols, func(s *Symbol) bool { return g.rv(s).NKqReceipt > 0 && g.rv(s).NErrFlag == 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NKqReceipt), fI32(g.rv(s).NErrFlag),
-				fI32(g.rv(s).NKqueue), fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NKqReceipt), fI32(g.rv(s).NErrFlag),
+				fI32(g.rv(s).NKqueue), fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(1), cmpI(5))
 }
 
@@ -11030,12 +11373,10 @@ func qQ98(g *Graph, p params) ([]string, [][]fval) {
 	return simpleQ(cols, func(s *Symbol) bool {
 		return g.rv(s).NEventWait > 0 && (s.IOInLoop > 0 || s.LockInLoop > 0)
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(g.rv(s).NEventWait), fI32(s.IOInLoop),
+		return mkrow(fStr(s.Name()), fI32(g.rv(s).NEventWait), fI32(s.IOInLoop),
 			fI32(s.LockInLoop), fI32(s.CallInLoop), fI32(s.MaxLoopDepth),
-			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
-	}, func(a, b []fval) int {
-		return -cmpI32(a[2].i+a[3].i, b[2].i+b[3].i)
-	}, cmpI(7))
+			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
+	}, dSum(2, 3), cmpI(7))
 }
 
 func (g *Graph) apiUseIndex() map[int32][]int32 {
@@ -11067,10 +11408,37 @@ func fnIs(names ...string) func(a *APIUse) bool {
 }
 
 func apiQ(cols []string, fns []string, keep func(s *Symbol) bool, g *Graph, p params,
-	fill func(s *Symbol) []fval, keys ...func(a, b []fval) int) ([]string, [][]fval) {
+	fill func(s *Symbol) []fval, keys ...ordKey) ([]string, [][]fval) {
+	// mark the few symbols that call one of fns, then scan: asking each of
+	// the tree's symbols for its API uses was a map lookup apiece
+	if g.apiByFn == nil {
+		g.apiByFn = map[string][]int32{}
+		for i := range g.APIUses {
+			u := &g.APIUses[i]
+			g.apiByFn[u.Fn()] = append(g.apiByFn[u.Fn()], u.SymbolID)
+		}
+	}
+	if len(g.symMark) != len(g.Symbols)+1 {
+		g.symMark = make([]bool, len(g.Symbols)+1)
+	}
+	mark := g.symMark
+	var marked []int32
+	for _, fn := range fns {
+		for _, id := range g.apiByFn[fn] {
+			if id > 0 && int(id) < len(mark) && !mark[id] {
+				mark[id] = true
+				marked = append(marked, id)
+			}
+		}
+	}
+	defer func() {
+		for _, id := range marked {
+			mark[id] = false
+		}
+	}()
 	var rows [][]fval
 	for _, s := range g.syms() {
-		if !keep(s) || !hasAPIUse(g, s.ID, fnIs(fns...)) {
+		if !mark[s.ID] || !keep(s) {
 			continue
 		}
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
@@ -11087,9 +11455,9 @@ func qQ99(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"snprintf", "vsnprintf"},
 		func(s *Symbol) bool { return g.rv(s).NRetNegCheck == 0 }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.Sloc), fI32(s.Cyclomatic),
-				fI32(s.FanIn), fStr(g.at(s))}
-		}, func(a, b []fval) int { return -cmpI32(a[1].i, b[1].i) }, dI(3))
+			return mkrow(fStr(s.Name()), fI32(s.Sloc), fI32(s.Cyclomatic),
+				fI32(s.FanIn), fStr(g.at(s)))
+		}, dI(1), dI(3))
 }
 
 func qQ100(g *Graph, p params) ([]string, [][]fval) {
@@ -11098,9 +11466,9 @@ func qQ100(g *Graph, p params) ([]string, [][]fval) {
 		"fprintf", "fputs", "fputc"},
 		func(s *Symbol) bool { return g.rv(s).NRetNegCheck == 0 && s.NNullCheck == 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.Sloc), fI32(s.Cyclomatic),
-				fI32(s.FanIn), fStr(g.at(s))}
-		}, func(a, b []fval) int { return -cmpI32(a[1].i, b[1].i) }, dI(3))
+			return mkrow(fStr(s.Name()), fI32(s.Sloc), fI32(s.Cyclomatic),
+				fI32(s.FanIn), fStr(g.at(s)))
+		}, dI(1), dI(3))
 }
 
 func qQ101(g *Graph, p params) ([]string, [][]fval) {
@@ -11109,8 +11477,8 @@ func qQ101(g *Graph, p params) ([]string, [][]fval) {
 		"strtod", "strtof", "strtold", "strtoimax", "strtoumax"},
 		func(s *Symbol) bool { return !(g.rv(s).NErrnoZero > 0 && g.rv(s).NEndptr > 0) },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NErrno), fI32(g.rv(s).NEndptr),
-				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NErrno), fI32(g.rv(s).NEndptr),
+				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, dI(3), dI(4))
 }
 
@@ -11121,8 +11489,8 @@ func qQ102(g *Graph, p params) ([]string, [][]fval) {
 		"isupper", "isxdigit", "tolower", "toupper"},
 		func(s *Symbol) bool { return g.rv(s).NUcharCast == 0 }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.NParams),
-				fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.NParams),
+				fI32(s.FanIn), fStr(g.at(s)))
 		}, dI(3), dI(1))
 }
 
@@ -11131,8 +11499,8 @@ func qQ103(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"nanosleep", "usleep", "sleep"},
 		func(s *Symbol) bool { return g.rv(s).NEintr == 0 }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.NLoops), fI32(s.Cyclomatic),
-				fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(s.NLoops), fI32(s.Cyclomatic),
+				fI32(s.FanIn), fStr(g.at(s)))
 		}, dI(3), dI(2))
 }
 
@@ -11141,8 +11509,8 @@ func qQ104(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"send", "sendto", "sendmsg", "write", "writev",
 		"pwritev"}, func(s *Symbol) bool { return g.rv(s).NRetNegCheck == 0 }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.MaxLoopDepth), fI32(s.IOInLoop),
-				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(s.MaxLoopDepth), fI32(s.IOInLoop),
+				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, dI(4), dI(1))
 }
 
@@ -11151,8 +11519,8 @@ func qQ105(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"mmap"},
 		func(s *Symbol) bool { return !hasAPIUse(g, s.ID, fnIs("munmap")) }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.NReturns), fI32(s.Cyclomatic),
-				fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(s.NReturns), fI32(s.Cyclomatic),
+				fI32(s.FanIn), fStr(g.at(s)))
 		}, dI(3), dI(2))
 }
 
@@ -11161,8 +11529,8 @@ func qQ106(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"waitpid", "wait", "waitid", "wait3", "wait4"},
 		func(s *Symbol) bool { return g.rv(s).NRetNegCheck == 0 }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.NReturns),
-				fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.NReturns),
+				fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(3), cmpI(1))
 }
 
@@ -11171,8 +11539,8 @@ func qQ107(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"scanf", "fscanf", "sscanf", "vscanf", "vfscanf",
 		"vsscanf"}, func(s *Symbol) bool { return g.rv(s).NRetNegCheck == 0 }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.FanIn),
-				fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.FanIn),
+				fStr(g.at(s)))
 		}, dI(2), dI(1))
 }
 
@@ -11182,8 +11550,8 @@ func qQ108(g *Graph, p params) ([]string, [][]fval) {
 		"asin", "acos", "atanh", "acosh", "tgamma", "lgamma", "pow"},
 		func(s *Symbol) bool { return g.rv(s).NDomainGuard == 0 }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.MaxLoopDepth),
-				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(s.MaxLoopDepth),
+				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, dI(3), dI(1))
 }
 
@@ -11192,8 +11560,8 @@ func qQ109(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"localtime", "gmtime", "ctime", "asctime"},
 		func(s *Symbol) bool { return true }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.NConcurrency),
-				fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.NConcurrency),
+				fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(3), cmpI(1))
 }
 
@@ -11202,7 +11570,7 @@ func qQ110(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"signal"}, func(s *Symbol) bool {
 		return !hasAPIUse(g, s.ID, fnIs("sigaction"))
 	}, g, p, func(s *Symbol) []fval {
-		return []fval{fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+		return mkrow(fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 	}, dI(2), dI(1))
 }
 
@@ -11211,8 +11579,8 @@ func qQ111(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"mmap"},
 		func(s *Symbol) bool { return g.rv(s).NMapFailed == 0 && s.NNullCheck == 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.FanIn),
-				fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.FanIn),
+				fStr(g.at(s)))
 		}, dI(2), dI(1))
 }
 
@@ -11221,8 +11589,8 @@ func qQ112(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"accept", "accept4"},
 		func(s *Symbol) bool { return g.rv(s).NNonblockSet == 0 }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.MaxLoopDepth),
-				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(s.MaxLoopDepth),
+				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(3), cmpI(1))
 }
 
@@ -11231,8 +11599,8 @@ func qQ113(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"va_start"},
 		func(s *Symbol) bool { return g.rv(s).NVaEnd == 0 }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.NReturns),
-				fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(s.Cyclomatic), fI32(s.NReturns),
+				fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(3), cmpI(1))
 }
 
@@ -11240,8 +11608,8 @@ func qQ114(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "sized_arrays", "cyclo", "fan_in", "at"}
 	return apiQ(cols, []string{}, func(s *Symbol) bool { return g.rv(s).NStackszArray > 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NStackszArray),
-				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NStackszArray),
+				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(1), cmpI(3))
 }
 
@@ -11250,8 +11618,8 @@ func qQ115(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"memcpy", "memmove", "memset", "malloc", "realloc",
 		"strlen", "strcpy"}, func(s *Symbol) bool { return g.rv(s).NPtrOvfCheck > 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NPtrOvfCheck), fI32(s.Cyclomatic),
-				fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NPtrOvfCheck), fI32(s.Cyclomatic),
+				fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(1), cmpI(3))
 }
 
@@ -11260,8 +11628,8 @@ func qQ116(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"calloc"},
 		func(s *Symbol) bool { return g.rv(s).NCallocTransposed > 0 }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NCallocTransposed),
-				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NCallocTransposed),
+				fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(1), cmpI(3))
 }
 
@@ -11270,8 +11638,8 @@ func qQ117(g *Graph, p params) ([]string, [][]fval) {
 	return apiQ(cols, []string{"va_arg", "va_start"},
 		func(s *Symbol) bool { return g.rv(s).NVaArgArr > 0 }, g, p,
 		func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NVaArgArr), fI32(s.Cyclomatic),
-				fI32(s.FanIn), fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NVaArgArr), fI32(s.Cyclomatic),
+				fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(1), cmpI(3))
 }
 
@@ -11282,9 +11650,9 @@ func qQ118(g *Graph, p params) ([]string, [][]fval) {
 			return g.rv(s).NMonotonicClock == 0 &&
 				!hasAPIUse(g, s.ID, fnIs("clock_gettime"))
 		}, g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NMonotonicClock),
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NMonotonicClock),
 				fI32(s.Cyclomatic), fI32(s.MaxLoopDepth), fI32(s.FanIn),
-				fStr(g.at(s))}
+				fStr(g.at(s)))
 		}, dI(4), dI(2))
 }
 
@@ -11293,9 +11661,9 @@ func qQ119(g *Graph, p params) ([]string, [][]fval) {
 		"kqueue_calls", "cyclo", "fan_in", "at"}
 	return simpleQ(cols, func(s *Symbol) bool { return g.rv(s).NEvBatchOne > 0 },
 		g, p, func(s *Symbol) []fval {
-			return []fval{fStr(s.Name()), fI32(g.rv(s).NEvBatchOne), fI32(g.rv(s).NEventWait),
+			return mkrow(fStr(s.Name()), fI32(g.rv(s).NEvBatchOne), fI32(g.rv(s).NEventWait),
 				fI32(g.rv(s).NEpoll), fI32(g.rv(s).NKqueue), fI32(s.Cyclomatic),
-				fI32(s.FanIn), fStr(g.at(s))}
+				fI32(s.FanIn), fStr(g.at(s)))
 		}, cmpI(1), cmpI(6))
 }
 
@@ -11354,12 +11722,25 @@ func (g *Graph) fileOf(symID int32) *File {
 	return &g.Files[fid-1]
 }
 
+// at is "path:line" for a symbol. Nearly every row of every query ends with
+// one, so each is built once.
 func (g *Graph) at(s *Symbol) string {
+	if len(g.atCache) != len(g.Symbols)+1 {
+		g.atCache = make([]string, len(g.Symbols)+1)
+	}
+	own := s.ID >= 1 && int(s.ID) <= len(g.Symbols) && g.Symbols[s.ID-1] == s
+	if own && g.atCache[s.ID] != "" {
+		return g.atCache[s.ID]
+	}
 	f := g.fileOf(s.ID)
 	if f == nil {
 		return ""
 	}
-	return f.Path() + ":" + strconv.Itoa(int(s.LineStart))
+	v := f.Path() + ":" + strconv.Itoa(int(s.LineStart))
+	if own {
+		g.atCache[s.ID] = v
+	}
+	return v
 }
 
 func pct(a, b int64) int32 {
@@ -11375,6 +11756,21 @@ func maxI(a, b int32) int32 {
 	}
 	return b
 }
+
+// mkrow makes one result row. The values are copied into a block shared by
+// many rows, so a query that returns twenty thousand rows makes a few dozen
+// allocations for them, not twenty thousand. Queries run one at a time; the
+// blocks are never reused, only dropped with the rows that point into them.
+func mkrow(v ...fval) []fval {
+	if cap(rowBlock)-len(rowBlock) < len(v) {
+		rowBlock = make([]fval, 0, max(1024, len(v)))
+	}
+	n := len(rowBlock)
+	rowBlock = append(rowBlock, v...)
+	return rowBlock[n:len(rowBlock):len(rowBlock)]
+}
+
+var rowBlock []fval
 
 func limit(rows [][]fval, p params) [][]fval {
 	if p.lim >= 0 && len(rows) > p.lim {
@@ -11394,8 +11790,31 @@ func (r rowSorter) Less(i, j int) bool {
 	return r.less(i, j)
 }
 
-func cmpI(col int) func(a, b []fval) int {
-	return func(a, b []fval) int { return cmpI32(a[col].i, b[col].i) }
+// ordKey is one sort key: a comparison, and where the key is an integer the
+// integer itself, so a sort can compare leading keys without a call.
+type ordKey struct {
+	cmp   func(a, b []fval) int
+	lead  func(r []fval) int64
+	loose bool     // equal leads do not mean equal keys (a string's prefix)
+	parts []ordKey // the keys a then() was made from
+}
+
+// strLead is the first eight bytes of s as an integer that orders the way
+// the bytes do, so most string comparisons never reach the string.
+func strLead(s string) int64 {
+	var v uint64
+	for i := 0; i < 8; i++ {
+		v <<= 8
+		if i < len(s) {
+			v |= uint64(s[i])
+		}
+	}
+	return int64(v ^ 1<<63)
+}
+
+func cmpI(col int) ordKey {
+	return ordKey{cmp: func(a, b []fval) int { return cmpI32(a[col].i, b[col].i) },
+		lead: func(r []fval) int64 { return r[col].i }}
 }
 
 func cmpI32(a, b int64) int {
@@ -11408,34 +11827,149 @@ func cmpI32(a, b int64) int {
 	return 0
 }
 
-func cmpLine(col int) func(a, b []fval) int {
-	return func(a, b []fval) int {
-		sa, sb := a[col].s, b[col].s
-		ia, ib := strings.LastIndexByte(sa, ':'), strings.LastIndexByte(sb, ':')
-		na, _ := strconv.Atoi(sa[ia+1:])
-		nb, _ := strconv.Atoi(sb[ib+1:])
-		return cmpI32(int64(na), int64(nb))
+func lineOf(at string) int64 {
+	n, _ := strconv.Atoi(at[strings.LastIndexByte(at, ':')+1:])
+	return int64(n)
+}
+
+func cmpLine(col int) ordKey {
+	return ordKey{cmp: func(a, b []fval) int { return cmpI32(lineOf(a[col].s), lineOf(b[col].s)) },
+		lead: func(r []fval) int64 { return lineOf(r[col].s) }}
+}
+
+func cmpS(col int) ordKey {
+	return ordKey{cmp: func(a, b []fval) int { return strings.Compare(a[col].s, b[col].s) },
+		lead: func(r []fval) int64 { return strLead(r[col].s) }, loose: true}
+}
+
+func then(cs ...ordKey) ordKey {
+	if len(cs) == 1 {
+		return cs[0]
 	}
-}
-
-func cmpS(col int) func(a, b []fval) int {
-	return func(a, b []fval) int { return strings.Compare(a[col].s, b[col].s) }
-}
-
-func then(cs ...func(a, b []fval) int) func(a, b []fval) int {
-	return func(a, b []fval) int {
-		for _, c := range cs {
-			if v := c(a, b); v != 0 {
+	k := ordKey{cmp: func(a, b []fval) int {
+		for i := range cs {
+			if v := cs[i].cmp(a, b); v != 0 {
 				return v
 			}
 		}
 		return 0
+	}}
+	if len(cs) > 0 {
+		k.lead = cs[0].lead
 	}
+	for _, c := range cs {
+		if c.parts != nil {
+			k.parts = append(k.parts, c.parts...)
+		} else {
+			k.parts = append(k.parts, c)
+		}
+	}
+	return k
 }
 
-func orderBy(rows [][]fval, keys ...func(a, b []fval) int) {
-	cmp := then(keys...)
-	sort.SliceStable(rows, func(i, j int) bool { return cmp(rows[i], rows[j]) < 0 })
+func orderBy(rows [][]fval, keys ...ordKey) {
+	if len(rows) < 2 {
+		return
+	}
+	k := then(keys...)
+	cmp := k.cmp
+	if len(rows) < 64 {
+		slices.SortStableFunc(rows, cmp)
+		return
+	}
+	// Nearly every key is an integer column, so the rows are not compared at
+	// all: the leading keys are read out once, packed into one or two words
+	// per row, and the row numbers are radix-sorted by those words. Radix
+	// sort is stable, which is the order SortStableFunc gave. Only rows whose
+	// words tie are then compared, and only on the keys the words leave out
+	// (a string's tail, or a key with no integer form). Comparing was nine of
+	// the eleven milliseconds a 26,000-row result took.
+	parts := k.parts
+	if parts == nil {
+		parts = []ordKey{k}
+	}
+	n := len(rows)
+	w0 := make([]uint64, n) // the exact leading keys, packed high to low
+	w1 := make([]uint64, n) // the key after them
+	col := make([]int64, n)
+	bits0, bits1 := 0, 0
+	used := 0 // parts fully settled by the words
+	for used < len(parts) && parts[used].lead != nil {
+		pk := parts[used]
+		lo, hi := int64(math.MaxInt64), int64(math.MinInt64)
+		for i, r := range rows {
+			v := pk.lead(r)
+			col[i] = v
+			lo, hi = min(lo, v), max(hi, v)
+		}
+		width := bits.Len64(uint64(hi) - uint64(lo))
+		if !pk.loose && bits0+width <= 64 {
+			for i := range col {
+				w0[i] = w0[i]<<width | (uint64(col[i]) - uint64(lo))
+			}
+			bits0 += width
+			used++
+			continue
+		}
+		for i := range col {
+			w1[i] = uint64(col[i]) - uint64(lo)
+		}
+		bits1 = width
+		if !pk.loose {
+			used++
+		}
+		break
+	}
+	rest := parts[used:]
+	perm := make([]int32, n)
+	for i := range perm {
+		perm[i] = int32(i)
+	}
+	tmp := make([]int32, n)
+	radix := func(key []uint64, width int) {
+		for shift := 0; shift < width; shift += 8 {
+			var pos [257]int32
+			for _, i := range perm {
+				pos[(key[i]>>shift)&255+1]++
+			}
+			for d := 1; d < 257; d++ {
+				pos[d] += pos[d-1]
+			}
+			for _, i := range perm {
+				d := (key[i] >> shift) & 255
+				tmp[pos[d]] = i
+				pos[d]++
+			}
+			perm, tmp = tmp, perm
+		}
+	}
+	radix(w1, bits1)
+	radix(w0, bits0)
+	if len(rest) > 0 {
+		tie := func(a, b int32) int {
+			for i := range rest {
+				if c := rest[i].cmp(rows[a], rows[b]); c != 0 {
+					return c
+				}
+			}
+			return int(a) - int(b)
+		}
+		for lo := 0; lo < n; {
+			hi := lo + 1
+			for hi < n && w0[perm[hi]] == w0[perm[lo]] && w1[perm[hi]] == w1[perm[lo]] {
+				hi++
+			}
+			if hi-lo > 1 {
+				slices.SortFunc(perm[lo:hi], tie)
+			}
+			lo = hi
+		}
+	}
+	out := make([][]fval, n)
+	for i, at := range perm {
+		out[i] = rows[at]
+	}
+	copy(rows, out)
 }
 
 func groupConcat(vals []string) string { return strings.Join(vals, ",") }
@@ -11463,37 +11997,49 @@ func (g *Graph) sym(id int32) *Symbol {
 	return g.Symbols[id-1]
 }
 
-func dI(col int) func(a, b []fval) int {
-	return func(a, b []fval) int { return cmpI32(b[col].i, a[col].i) }
+func dI(col int) ordKey {
+	return ordKey{cmp: func(a, b []fval) int { return cmpI32(b[col].i, a[col].i) },
+		lead: func(r []fval) int64 { return -r[col].i }}
 }
 
-func dSum(cols ...int) func(a, b []fval) int {
-	return func(a, b []fval) int {
-		sa, sb := int64(0), int64(0)
+func dSum(cols ...int) ordKey {
+	sum := func(r []fval) int64 {
+		t := int64(0)
 		for _, c := range cols {
-			sa += a[c].i
-			sb += b[c].i
+			t += r[c].i
 		}
-		return cmpI32(sb, sa)
+		return t
 	}
+	return ordKey{cmp: func(a, b []fval) int { return cmpI32(sum(b), sum(a)) },
+		lead: func(r []fval) int64 { return -sum(r) }}
 }
 
-func dWeighted(w [][3]int32) func(a, b []fval) int {
-	return func(a, b []fval) int {
-		sa, sb := int64(0), int64(0)
+func dWeighted(w [][3]int32) ordKey {
+	sum := func(r []fval) int64 {
+		t := int64(0)
 		for _, x := range w {
-			sa += int64(x[0]) * a[x[1]].i
-			sb += int64(x[0]) * b[x[1]].i
+			t += int64(x[0]) * r[x[1]].i
 		}
-		return cmpI32(sb, sa)
+		return t
 	}
+	return ordKey{cmp: func(a, b []fval) int { return cmpI32(sum(b), sum(a)) },
+		lead: func(r []fval) int64 { return -sum(r) }}
 }
 
-func dLenStr(col int) func(a, b []fval) int {
-	return func(a, b []fval) int { return cmpI32(int64(len(b[col].s)), int64(len(a[col].s))) }
+func dLenStr(col int) ordKey {
+	return ordKey{cmp: func(a, b []fval) int { return cmpI32(int64(len(b[col].s)), int64(len(a[col].s))) },
+		lead: func(r []fval) int64 { return -int64(len(r[col].s)) }}
 }
 
-func (g *Graph) symsByName() []*Symbol { return g.scanByName() }
+// symsByName is every symbol in (name, id) order. Five queries and the build
+// ask for it; the order depends only on the symbol table, so it is sorted
+// once per table rather than once per caller.
+func (g *Graph) symsByName() []*Symbol {
+	if len(g.nameOrder) != len(g.Symbols) {
+		g.nameOrder = g.scanByName()
+	}
+	return g.nameOrder
+}
 
 func (g *Graph) scanByName() []*Symbol {
 	out := make([]*Symbol, 0, len(g.Symbols))
@@ -11520,14 +12066,9 @@ func (g *Graph) scanByID() []*Symbol {
 }
 
 func (g *Graph) hazardsByCatN(cat string) []int32 {
-	out := make([]int32, 0, 64)
-	for i := range g.Hazards {
-		if g.Hazards[i].Category() == cat {
-			out = append(out, int32(i))
-		}
-	}
-	sort.SliceStable(out, func(a, b int) bool {
-		return g.Hazards[out[a]].N > g.Hazards[out[b]].N
+	out := slices.Clone(g.hz().byCat[cat])
+	slices.SortStableFunc(out, func(a, b int32) int {
+		return cmp.Compare(g.Hazards[b].N, g.Hazards[a].N)
 	})
 	return out
 }
@@ -11536,11 +12077,10 @@ func (g *Graph) hazardsByPattern(pats []string) []*Hazard {
 	sorted := append([]string{}, pats...)
 	sort.Strings(sorted)
 	var out []*Hazard
+	ix := g.hz()
 	for _, pat := range sorted {
-		for i := range g.Hazards {
-			if g.Hazards[i].Pattern() == pat {
-				out = append(out, &g.Hazards[i])
-			}
+		for _, i := range ix.byPat[pat] {
+			out = append(out, &g.Hazards[i])
 		}
 	}
 	return out
@@ -11595,16 +12135,12 @@ func mM1(g *Graph, p params) ([]string, [][]fval) {
 	type agg struct {
 		fns, fp, mac, ext, unr, calls int32
 	}
-	m := map[int32]*agg{}
-	for _, s := range g.syms() {
-		if s.Kind() != "function" {
+	m := make([]agg, len(g.Modules)+1)
+	for _, s := range g.Symbols {
+		if s.Kind() != "function" || s.ModuleID < 0 || int(s.ModuleID) >= len(m) {
 			continue
 		}
-		a := m[s.ModuleID]
-		if a == nil {
-			a = &agg{}
-			m[s.ModuleID] = a
-		}
+		a := &m[s.ModuleID]
 		a.fns++
 		a.fp += g.rv(s).NFnptrCalls
 		a.mac += g.rv(s).NMacroCalls
@@ -11618,16 +12154,16 @@ func mM1(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(mod.Name(), p.mod) {
 			continue
 		}
-		a := m[mod.ID]
-		if a == nil {
+		if mod.ID < 0 || int(mod.ID) >= len(m) || m[mod.ID].fns == 0 {
 			continue
 		}
+		a := &m[mod.ID]
 		var pv fval = fNull()
 		if a.calls != 0 {
 			pv = fI32(pct(int64(a.fp+a.unr), int64(a.calls)))
 		}
-		rows = append(rows, []fval{fStr(mod.Name()), fI32(a.fns), fI32(a.fp),
-			fI32(a.mac), fI32(a.ext), fI32(a.unr), pv})
+		rows = append(rows, mkrow(fStr(mod.Name()), fI32(a.fns), fI32(a.fp),
+			fI32(a.mac), fI32(a.ext), fI32(a.unr), pv))
 	}
 	orderBy(rows, dI(2), dI(5))
 	return cols, limit(rows, p)
@@ -11641,9 +12177,9 @@ func mM2(g *Graph, p params) ([]string, [][]fval) {
 		if s.Kind() != "function" || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.FanIn), fI32(s.NCallsites),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.FanIn), fI32(s.NCallsites),
 			fI32(s.Cyclomatic), fI32(s.Sloc), fI32(s.IsStatic), fI32(s.IsInline),
-			fOptStr(g.modName(s.ModuleID), s.ModuleID != 0), fStr(g.at(s))})
+			fOptStr(g.modName(s.ModuleID), s.ModuleID != 0), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(3), cmpS(0))
 	return cols, limit(rows, p)
@@ -11657,10 +12193,10 @@ func mM3(g *Graph, p params) ([]string, [][]fval) {
 		if s.Kind() != "function" || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.RiskScore),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.RiskScore),
 			fI32(s.Cyclomatic), fI32(s.Cognitive), fI32(s.MaxNesting),
 			fI32(s.NMemory), fI32(s.NIO), fI32(s.NInteger), fI32(s.IsRecursive),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), cmpS(0))
 	return cols, limit(rows, p)
@@ -11668,39 +12204,42 @@ func mM3(g *Graph, p params) ([]string, [][]fval) {
 
 func mM4(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "xalloc", "direct", "loops", "module", "at"}
-	type ek struct{ c, d int32 }
-	mult := map[ek]int32{}
-	for _, c := range g.Callsites {
-		mult[ek{c.CallerID, c.CalleeID}]++
-	}
-	direct := map[int32]int32{}
-	for _, h := range g.Hazards {
-		if h.Category() != "alloc" {
-			continue
+	n1 := len(g.Symbols) + 1
+	ok := func(id int32) bool { return id >= 0 && int(id) < n1 }
+	// call sites per (caller, callee), as runs. A pair split across two runs
+	// is harmless: everything below is a sum over them.
+	type run struct{ c, d, n int32 }
+	var mult []run
+	for i := range g.Callsites {
+		c := &g.Callsites[i]
+		if k := len(mult) - 1; k >= 0 && mult[k].c == c.CallerID && mult[k].d == c.CalleeID {
+			mult[k].n++
+		} else {
+			mult = append(mult, run{c.CallerID, c.CalleeID, 1})
 		}
+	}
+	direct := make([]int32, n1)
+	for _, i := range g.hazCats("alloc") {
+		h := &g.Hazards[i]
 		lp := strings.ToLower(h.Pattern())
-		if h.Pattern() == "free" || strings.HasSuffix(lp, "free") {
+		if h.Pattern() == "free" || strings.HasSuffix(lp, "free") || !ok(h.SymbolID) {
 			continue
 		}
 		direct[h.SymbolID] += h.N
 	}
-	levels := []map[int32]int32{direct}
+	total := slices.Clone(direct)
 	cur := direct
 	for range 3 {
-		next := map[int32]int32{}
-		for k, v := range mult {
-			if m, ok := cur[k.d]; ok && m != 0 {
-				next[k.c] += v * m
+		next := make([]int32, n1)
+		for _, k := range mult {
+			if ok(k.c) && ok(k.d) && cur[k.d] != 0 {
+				next[k.c] += k.n * cur[k.d]
 			}
 		}
-		levels = append(levels, next)
-		cur = next
-	}
-	total := map[int32]int32{}
-	for _, lv := range levels {
-		for k, v := range lv {
-			total[k] += v
+		for i, v := range next {
+			total[i] += v
 		}
+		cur = next
 	}
 	var rows [][]fval
 	for _, s := range g.syms() {
@@ -11710,9 +12249,9 @@ func mM4(g *Graph, p params) ([]string, [][]fval) {
 		if total[s.ID] < 8 {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(total[s.ID]),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(total[s.ID]),
 			fI32(direct[s.ID]), fI32(s.NLoops),
-			fOptStr(g.modName(s.ModuleID), s.ModuleID != 0), fStr(g.at(s))})
+			fOptStr(g.modName(s.ModuleID), s.ModuleID != 0), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1))
 	return cols, limit(rows, p)
@@ -11721,42 +12260,57 @@ func mM4(g *Graph, p params) ([]string, [][]fval) {
 func mM5(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"from_module", "to_module", "edges", "calls", "distinct_targets"}
 	type ek struct{ a, b int32 }
-	type agg struct {
-		calls, tgt int32
-		t          map[int32]bool
-		pairs      map[[2]int32]bool
-	}
+	type agg struct{ edges, calls, tgt int32 }
+	// Walk the edges callee by callee. A callee has few calling modules, so
+	// they are gathered in a short list and the module-pair table is touched
+	// once per (callee, calling module) instead of once per edge -- and
+	// "distinct targets" is then simply how often that happens. `edges` is a
+	// count of edge rows: the table holds one row per (caller, callee), which
+	// --selfcheck verifies.
 	m := map[ek]*agg{}
-	for _, e := range g.Edges {
-		if e.SameModule != 0 {
-			continue
+	in := g.edgeCSR(true)
+	type part struct{ mod, edges, calls int32 }
+	var parts []part
+	for id := int32(1); int(id) <= len(g.Symbols); id++ {
+		b := g.sym(id)
+		parts = parts[:0]
+	edges:
+		for _, j := range in.of(id) {
+			e := &g.Edges[j]
+			a := g.sym(e.CallerID)
+			if e.SameModule != 0 || a == nil {
+				continue
+			}
+			for k := range parts {
+				if parts[k].mod == a.ModuleID {
+					parts[k].edges++
+					parts[k].calls += e.NCalls
+					continue edges
+				}
+			}
+			parts = append(parts, part{a.ModuleID, 1, e.NCalls})
 		}
-		a, b := g.sym(e.CallerID), g.sym(e.CalleeID)
-		if a == nil || b == nil {
-			continue
-		}
-		k := ek{a.ModuleID, b.ModuleID}
-		v := m[k]
-		if v == nil {
-			v = &agg{t: map[int32]bool{}, pairs: map[[2]int32]bool{}}
-			m[k] = v
-		}
-		v.calls += e.NCalls
-		if !v.t[e.CalleeID] {
-			v.t[e.CalleeID] = true
+		for _, pt := range parts {
+			k := ek{pt.mod, b.ModuleID}
+			v := m[k]
+			if v == nil {
+				v = &agg{}
+				m[k] = v
+			}
+			v.edges += pt.edges
+			v.calls += pt.calls
 			v.tgt++
 		}
-		v.pairs[[2]int32{e.CallerID, e.CalleeID}] = true
 	}
-	var keys []ek
+	keys := make([]ek, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].a != keys[j].a {
-			return keys[i].a < keys[j].a
+	slices.SortFunc(keys, func(x, y ek) int {
+		if x.a != y.a {
+			return cmp.Compare(x.a, y.a)
 		}
-		return keys[i].b < keys[j].b
+		return cmp.Compare(x.b, y.b)
 	})
 	var rows [][]fval
 	for _, k := range keys {
@@ -11764,8 +12318,8 @@ func mM5(g *Graph, p params) ([]string, [][]fval) {
 			continue
 		}
 		v := m[k]
-		rows = append(rows, []fval{fStr(g.modName(k.a)), fStr(g.modName(k.b)),
-			fI32(int32(len(v.pairs))), fI32(v.calls), fI32(v.tgt)})
+		rows = append(rows, mkrow(fStr(g.modName(k.a)), fStr(g.modName(k.b)),
+			fI32(v.edges), fI32(v.calls), fI32(v.tgt)))
 	}
 	orderBy(rows, dI(2))
 	return cols, limit(rows, p)
@@ -11773,73 +12327,64 @@ func mM5(g *Graph, p params) ([]string, [][]fval) {
 
 func mM6(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"header", "rebuilt_files", "sloc", "syms", "min_depth"}
-
-	inc := map[int32][]int32{}
-	for _, im := range g.Imports {
-		if !im.HasTargetID {
+	// A breadth-first walk of the include graph from every file, four levels
+	// deep. Each file's walk marks what it has reached with its own number in
+	// one shared array, which replaces a map per file.
+	nf := len(g.Files) + 1
+	ok := func(id int32) bool { return id >= 1 && int(id) < nf }
+	inc := make([][]int32, nf)
+	for i := range g.Imports {
+		im := &g.Imports[i]
+		if im.HasTargetID && ok(im.FileID) && ok(im.TargetID) {
+			inc[im.FileID] = append(inc[im.FileID], im.TargetID)
+		}
+	}
+	count := make([]int32, nf)
+	minD := make([]int32, nf)
+	seen := make([]int32, nf)
+	var cur, next []int32
+	for src := int32(1); int(src) < nf; src++ {
+		if len(inc[src]) == 0 {
 			continue
 		}
-		inc[im.FileID] = append(inc[im.FileID], im.TargetID)
-	}
-	reach := map[int32]map[int32]int32{}
-	for src, tgts := range inc {
-		reach[src] = map[int32]int32{}
-
-		for _, t := range tgts {
-			reach[src][t] = 1
+		reach := func(t, d int32) {
+			seen[t] = src
+			count[t]++
+			if minD[t] == 0 || d < minD[t] {
+				minD[t] = d
+			}
 		}
-	}
-	frontier := inc
-	for depth := int32(2); depth <= 4; depth++ {
-		next := map[int32][]int32{}
-		for src, hs := range frontier {
-			for _, h := range hs {
+		cur = cur[:0]
+		for _, t := range inc[src] {
+			if seen[t] != src {
+				reach(t, 1)
+				cur = append(cur, t)
+			}
+		}
+		for depth := int32(2); depth <= 4 && len(cur) > 0; depth++ {
+			next = next[:0]
+			for _, h := range cur {
 				for _, t := range inc[h] {
-					if t == src {
-						continue
-					}
-					if _, ok := reach[src][t]; !ok {
-						reach[src][t] = depth
-						next[src] = append(next[src], t)
+					if t != src && seen[t] != src {
+						reach(t, depth)
+						next = append(next, t)
 					}
 				}
 			}
-		}
-		if len(next) == 0 {
-			break
-		}
-		frontier = next
-	}
-	_ = frontier
-	count := map[int32]int32{}
-	minD := map[int32]int32{}
-	var order []int32
-	for _, hs := range reach {
-		for h, d := range hs {
-			count[h]++
-			if cur, ok := minD[h]; !ok || d < cur {
-				minD[h] = d
-			}
+			cur, next = next, cur
 		}
 	}
-	seen := map[int32]bool{}
-	for _, hs := range reach {
-		for h := range hs {
-			if !seen[h] {
-				seen[h] = true
-				order = append(order, h)
-			}
-		}
-	}
-	slices.Sort(order)
 	var rows [][]fval
-	for _, h := range order {
+	for h := int32(1); int(h) < nf; h++ {
+		if count[h] == 0 {
+			continue
+		}
 		f := g.fileOf2(h)
 		if f == nil || !likeMatch(g.modName(f.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(f.Path()), fI32(count[h]), fI32(f.Sloc),
-			fI32(f.NSymbols), fI32(minD[h])})
+		rows = append(rows, mkrow(fStr(f.Path()), fI32(count[h]), fI32(f.Sloc),
+			fI32(f.NSymbols), fI32(minD[h])))
 	}
 	orderBy(rows, dI(1), dI(2))
 	return cols, limit(rows, p)
@@ -11853,9 +12398,9 @@ func mM7(g *Graph, p params) ([]string, [][]fval) {
 		if s.MaxLoopDepth <= 1 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.MaxLoopDepth),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.MaxLoopDepth),
 			fI32(s.NLoops), fI32(s.CallInLoop), fI32(g.rv(s).DivInLoop),
-			fI32(g.rv(s).LibmInLoop), fI32(s.BranchInLoop), fI32(s.Sloc), fStr(g.at(s))})
+			fI32(g.rv(s).LibmInLoop), fI32(s.BranchInLoop), fI32(s.Sloc), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(3))
 	return cols, limit(rows, p)
@@ -11872,9 +12417,9 @@ func mM8(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NLibm),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NLibm),
 			fI32(g.rv(s).LibmInLoop), fI32(s.NLoops), fI32(s.MaxLoopDepth),
-			fI32(s.Sloc), fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.Sloc), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(2), dI(1))
 	return cols, limit(rows, p)
@@ -11891,9 +12436,9 @@ func mM9(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NIntrinsic),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NIntrinsic),
 			fI32(s.NLikely), fI32(s.NRestrict), fI32(s.NBuiltin),
-			fI32(s.MaxLoopDepth), fI32(s.NAtomic), fStr(g.at(s))})
+			fI32(s.MaxLoopDepth), fI32(s.NAtomic), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2))
 	return cols, limit(rows, p)
@@ -11902,7 +12447,7 @@ func mM9(g *Graph, p params) ([]string, [][]fval) {
 func mM10(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"struct_", "kind", "sz", "pad", "tail", "packed_sz",
 		"saves", "lines64", "lines64_packed", "algn", "at"}
-	packed := g.shapeCounts("packed_size")
+	packed := g.shapeDense("packed_size")
 	var rows [][]fval
 	for _, ss := range g.SSize {
 		if ss.Exact != 1 || ss.TotalPad <= 0 {
@@ -11916,10 +12461,10 @@ func mM10(g *Graph, p params) ([]string, [][]fval) {
 		if v := packed[ss.SymbolID]; v > 0 {
 			best = v
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(s.Kind()),
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(s.Kind()),
 			fI32(ss.TotalSize), fI32(ss.TotalPad), fI32(ss.TailPad),
-			fI32(best), fI32(ss.TotalSize - best), fI32(ss.NLines64),
-			fI32((best + 63) / 64), fI32(ss.MaxAlign), fStr(g.at(s))})
+			fI32(best), fI32(ss.TotalSize-best), fI32(ss.NLines64),
+			fI32((best+63)/64), fI32(ss.MaxAlign), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(6), dI(3), cmpS(0))
 	return cols, limit(rows, p)
@@ -11927,9 +12472,9 @@ func mM10(g *Graph, p params) ([]string, [][]fval) {
 
 func mM11(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"struct_", "sz", "pad", "lines64", "algn", "fields", "at"}
-	nFields := map[int32]int32{}
-	for _, l := range g.Layout {
-		nFields[l.SymbolID]++
+	nFields := g.perSym()
+	for i := range g.Layout {
+		nFields.add(g.Layout[i].SymbolID, 1)
 	}
 	var rows [][]fval
 	for _, ss := range g.SSize {
@@ -11940,9 +12485,9 @@ func mM11(g *Graph, p params) ([]string, [][]fval) {
 		if s == nil || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(ss.TotalSize),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(ss.TotalSize),
 			fI32(ss.TotalPad), fI32(ss.NLines64), fI32(ss.MaxAlign),
-			fI32(nFields[ss.SymbolID]), fStr(g.at(s))})
+			fI32(nFields.at(ss.SymbolID)), fStr(g.at(s))))
 	}
 	orderBy(rows, cmpI(1))
 	return cols, limit(rows, p)
@@ -11951,8 +12496,9 @@ func mM11(g *Graph, p params) ([]string, [][]fval) {
 func mM12(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"struct_", "fields", "ptrs", "fnptr", "arrays", "pct_ptr", "at"}
 	type sh struct{ n, ptr, fnp, arr int32 }
-	m := map[int32]*sh{}
-	for _, l := range g.Layout {
+	m := make([]sh, len(g.Symbols)+1)
+	for i := range g.Layout {
+		l := &g.Layout[i]
 		if l.InUnion != 0 || l.Depth != 0 {
 			continue
 		}
@@ -11960,11 +12506,7 @@ func mM12(g *Graph, p params) ([]string, [][]fval) {
 		if s == nil || (s.Kind() != "struct" && s.Kind() != "union") {
 			continue
 		}
-		e := m[l.SymbolID]
-		if e == nil {
-			e = &sh{}
-			m[l.SymbolID] = e
-		}
+		e := &m[l.SymbolID]
 		e.n++
 		if l.PtrDepth > 0 {
 			e.ptr++
@@ -11978,8 +12520,8 @@ func mM12(g *Graph, p params) ([]string, [][]fval) {
 	}
 	var rows [][]fval
 	for _, s := range g.syms() {
-		e := m[s.ID]
-		if e == nil {
+		e := &m[s.ID]
+		if e.n == 0 {
 			continue
 		}
 		if e.n < 6 || float64(e.ptr)*100/float64(e.n) < 50 {
@@ -11988,9 +12530,9 @@ func mM12(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(e.n), fI32(e.ptr),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(e.n), fI32(e.ptr),
 			fI32(e.fnp), fI32(e.arr),
-			fI32(pct(int64(e.ptr), int64(e.n))), fStr(g.at(s))})
+			fI32(pct(int64(e.ptr), int64(e.n))), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(2))
 	return cols, limit(rows, p)
@@ -12000,35 +12542,36 @@ func mM12(g *Graph, p params) ([]string, [][]fval) {
 // path starting there can have live at once: its own frame plus the deepest
 // callee's. An edge back into a function already on the path is recursion and
 // is not followed -- `cyc` reports that the figure is a floor for that row.
-func (g *Graph) chainBytes(frame map[int32]int32) (total map[int32]int64, depth map[int32]int32, cyc map[int32]bool) {
-	out := map[int32][]int32{}
-	for _, ed := range g.Edges {
-		if ed.IsSelf == 0 {
-			out[ed.CallerID] = append(out[ed.CallerID], ed.CalleeID)
-		}
-	}
-	total = map[int32]int64{}
-	depth = map[int32]int32{}
-	cyc = map[int32]bool{}
-	state := map[int32]uint8{} // 1 on the path, 2 done
+func (g *Graph) chainBytes(frame []int32) (total []int64, depth []int32, cyc []bool) {
+	n := len(g.Symbols) + 1
+	out := g.edgeCSR(false)
+	total = make([]int64, n)
+	depth = make([]int32, n)
+	cyc = make([]bool, n)
+	state := make([]uint8, n) // 1 on the path, 2 done
 	type fr struct {
 		id   int32
 		next int
 		best int64
 		dep  int32
 	}
+	var stack []fr
 	for _, s := range g.syms() {
 		if s.Kind() != "function" || state[s.ID] == 2 {
 			continue
 		}
-		stack := []fr{{id: s.ID}}
+		stack = append(stack[:0], fr{id: s.ID})
 		state[s.ID] = 1
 		for len(stack) > 0 {
 			f := &stack[len(stack)-1]
-			kids := out[f.id]
+			kids := out.of(f.id)
 			if f.next < len(kids) {
-				c := kids[f.next]
+				ed := &g.Edges[kids[f.next]]
 				f.next++
+				c := ed.CalleeID
+				if ed.IsSelf != 0 || c < 0 || int(c) >= n {
+					continue
+				}
 				switch state[c] {
 				case 0:
 					state[c] = 1
@@ -12067,9 +12610,9 @@ func (g *Graph) chainBytes(frame map[int32]int32) (total map[int32]int64, depth 
 func mM13(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "frame_bytes", "biggest_local", "unsized", "locals",
 		"chain_bytes", "chain_depth", "cyclic", "rec", "at"}
-	frame := g.shapeCounts("frame_bytes")
-	big := g.shapeCounts("frame_max_local")
-	uns := g.shapeCounts("frame_unsized")
+	frame := g.shapeDense("frame_bytes")
+	big := g.shapeDense("frame_max_local")
+	uns := g.shapeDense("frame_unsized")
 	total, depth, cyc := g.chainBytes(frame)
 	var rows [][]fval
 	for _, s := range g.syms() {
@@ -12079,10 +12622,10 @@ func mM13(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(frame[s.ID]),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(frame[s.ID]),
 			fI32(big[s.ID]), fI32(uns[s.ID]), fI32(s.NLocals),
 			fval{kind: fkInt, i: total[s.ID]}, fI32(depth[s.ID]),
-			fI32(b2i(cyc[s.ID])), fI32(s.IsRecursive), fStr(g.at(s))})
+			fI32(b2i(cyc[s.ID])), fI32(s.IsRecursive), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(5), dI(1), cmpS(0))
 	return cols, limit(rows, p)
@@ -12095,9 +12638,9 @@ func mM14(g *Graph, p params) ([]string, [][]fval) {
 		if s.NCast <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NCast), fI32(s.NDeref),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NCast), fI32(s.NDeref),
 			fI32(s.NShift), fI32(s.NSizeof), fI32(s.NMemory), fI32(s.NIO),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1))
 	return cols, limit(rows, p)
@@ -12105,11 +12648,8 @@ func mM14(g *Graph, p params) ([]string, [][]fval) {
 
 func macroQ(cols []string, pred func(m *Macro) bool, g *Graph, p params,
 	fill func(s *Symbol, m *Macro) []fval,
-	keys ...func(a, b []fval) int) ([]string, [][]fval) {
-	bySym := make(map[int32]*Macro, len(g.Macros))
-	for i := range g.Macros {
-		bySym[g.Macros[i].SymbolID] = &g.Macros[i]
-	}
+	keys ...ordKey) ([]string, [][]fval) {
+	bySym := g.six().macro
 	var rows [][]fval
 	for _, s := range g.syms() {
 		m := bySym[s.ID]
@@ -12129,9 +12669,9 @@ func mM15(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "uses", "params", "body_len", "multiline", "at"}
 	return macroQ(cols, func(m *Macro) bool { return m.IsFunctionlike == 1 }, g, p,
 		func(s *Symbol, m *Macro) []fval {
-			return []fval{fStr(s.Name()), fI32(m.NUses), fI32(m.NParams),
-				fI32(m.BodyLen), fI32(m.IsMultiline), fStr(g.at(s))}
-		}, dI(1), func(a, b []fval) int { return -cmpI32(a[3].i, b[3].i) })
+			return mkrow(fStr(s.Name()), fI32(m.NUses), fI32(m.NParams),
+				fI32(m.BodyLen), fI32(m.IsMultiline), fStr(g.at(s)))
+		}, dI(1), dI(3))
 }
 
 func mM16(g *Graph, p params) ([]string, [][]fval) {
@@ -12177,8 +12717,8 @@ func mM16(g *Graph, p params) ([]string, [][]fval) {
 		if !ok {
 			continue
 		}
-		rows = append(rows, []fval{fStr(e), fI32(a.sites), fI32(int32(len(a.files))),
-			fStr(groupConcat(a.forms)), fStr(groupConcat(a.inFile))})
+		rows = append(rows, mkrow(fStr(e), fI32(a.sites), fI32(int32(len(a.files))),
+			fStr(groupConcat(a.forms)), fStr(groupConcat(a.inFile))))
 	}
 	orderBy(rows, dI(1))
 	return cols, limit(rows, p)
@@ -12194,8 +12734,10 @@ func mM17(g *Graph, p params) ([]string, [][]fval) {
 	}
 	m := map[string]*grp{}
 	var order []string
+	nameN := g.six().nameN
 	for _, s := range g.syms() {
-		if s.Kind() != "function" {
+		// a name only one symbol carries cannot have a second definition
+		if s.Kind() != "function" || nameN[s.ID] < 2 {
 			continue
 		}
 		f := g.fileOf(s.ID)
@@ -12249,8 +12791,8 @@ func mM17(g *Graph, p params) ([]string, [][]fval) {
 		if len(gp.fileID) >= 2 && minOf(gp.files) == maxOf(gp.files) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(n), fI32(lo), fI32(hi), fI32(gp.defs),
-			fStr(groupConcat(distinctStrings(gp.files)))})
+		rows = append(rows, mkrow(fStr(n), fI32(lo), fI32(hi), fI32(gp.defs),
+			fStr(groupConcat(distinctStrings(gp.files)))))
 	}
 	orderBy(rows, dWeighted([][3]int32{{1, 2}, {-1, 1}}))
 	return cols, limit(rows, p)
@@ -12287,8 +12829,8 @@ func mM18(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.FanIn), fI32(s.Sloc),
-			fI32(s.Cyclomatic), fI32(s.FanIn * s.Sloc), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.FanIn), fI32(s.Sloc),
+			fI32(s.Cyclomatic), fI32(s.FanIn*s.Sloc), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(4), cmpS(0))
 	return cols, limit(rows, p)
@@ -12305,9 +12847,9 @@ func mM19(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.Cyclomatic),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.Cyclomatic),
 			fI32(s.Sloc), fI32(s.NCommentLines), fI32(s.HasDoc),
-			fI32(s.MaxNesting), fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.MaxNesting), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), cmpS(0))
 	return cols, limit(rows, p)
@@ -12320,8 +12862,8 @@ func mM20(g *Graph, p params) ([]string, [][]fval) {
 		if r.NObjs+r.NSrcs < 2 {
 			continue
 		}
-		rows = append(rows, []fval{fStr(r.Path()), fStr(r.Rule()), fI32(r.NObjs),
-			fI32(r.NSrcs), fI32(r.UsesAr), fI32(r.Line)})
+		rows = append(rows, mkrow(fStr(r.Path()), fStr(r.Rule()), fI32(r.NObjs),
+			fI32(r.NSrcs), fI32(r.UsesAr), fI32(r.Line)))
 	}
 	orderBy(rows, dSum(2, 3))
 	return cols, limit(rows, p)
@@ -12357,9 +12899,9 @@ func mM21(g *Graph, p params) ([]string, [][]fval) {
 		if a == nil || !likeMatch(mod.Name(), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(mod.Name()), fI32(a.files), fI32(a.parsed),
+		rows = append(rows, mkrow(fStr(mod.Name()), fI32(a.files), fI32(a.parsed),
 			fI32(a.errs), fI32(a.unc), fI32(a.sloc), fI32(a.fns), fI32(a.inc),
-			fI32(a.ms)})
+			fI32(a.ms)))
 	}
 	orderBy(rows, dI(5))
 	return cols, limit(rows, p)
@@ -12379,8 +12921,8 @@ func mM22(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NGotos), fI32(s.NLabels),
-			fI32(s.Cyclomatic), fI32(s.Sloc), fI32(s.FanIn), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NGotos), fI32(s.NLabels),
+			fI32(s.Cyclomatic), fI32(s.Sloc), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(3))
 	return cols, limit(rows, p)
@@ -12400,9 +12942,9 @@ func mM23(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.MaxNesting),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.MaxNesting),
 			fI32(s.Cyclomatic), fI32(s.NLoops), fI32(s.Sloc), fI32(s.FanIn),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2), cmpS(0))
 	return cols, limit(rows, p)
@@ -12422,8 +12964,8 @@ func mM24(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NParams), fI32(s.Sloc),
-			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NParams), fI32(s.Sloc),
+			fI32(s.Cyclomatic), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(4), cmpS(0))
 	return cols, limit(rows, p)
@@ -12432,6 +12974,14 @@ func mM24(g *Graph, p params) ([]string, [][]fval) {
 func mM25(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "n_caller_modules", "fan_in", "cyclo", "sloc",
 		"modules", "at"}
+	// the edges into each function, in edge order -- scanning the whole edge
+	// table once per function took 1.9s on PostgreSQL
+	in := g.edgeCSR(true)
+	var mods []int32
+	// seen[m] holds the id of the last function that counted module m, so a
+	// function called from a thousand places does not search its own list a
+	// thousand times
+	seen := make([]int32, len(g.Modules)+1)
 	var rows [][]fval
 	for _, s := range g.syms() {
 		if s.Kind() != "function" {
@@ -12441,32 +12991,40 @@ func mM25(g *Graph, p params) ([]string, [][]fval) {
 		if f == nil || f.IsTest != 0 {
 			continue
 		}
-		mods := map[int32]bool{}
-		names := []string{}
-		for _, e := range g.Edges {
-			if e.CalleeID != s.ID || e.IsSelf != 0 {
+		mods = mods[:0]
+		for _, j := range in.of(s.ID) {
+			e := &g.Edges[j]
+			if e.IsSelf != 0 {
 				continue
 			}
 			cs := g.sym(e.CallerID)
 			if cs == nil {
 				continue
 			}
-			if !mods[cs.ModuleID] {
-				mods[cs.ModuleID] = true
-				if n := g.modName(cs.ModuleID); n != "" {
-					names = append(names, n)
+			if m := cs.ModuleID; uint32(m) < uint32(len(seen)) {
+				if seen[m] != s.ID {
+					seen[m] = s.ID
+					mods = append(mods, m)
 				}
+			} else if !slices.Contains(mods, m) {
+				mods = append(mods, m)
 			}
 		}
 		if len(mods) <= 5 {
 			continue
 		}
+		names := []string{}
+		for _, m := range mods {
+			if n := g.modName(m); n != "" {
+				names = append(names, n)
+			}
+		}
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(int32(len(mods))),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(int32(len(mods))),
 			fI32(s.FanIn), fI32(s.Cyclomatic), fI32(s.Sloc),
-			fStr(groupConcat(distinctStrings(names))), fStr(g.at(s))})
+			fStr(groupConcat(distinctStrings(names))), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(2), cmpS(0))
 	return cols, limit(rows, p)
@@ -12487,9 +13045,9 @@ func mM26(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NMagic),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NMagic),
 			fI32(s.NFloatLit), fI32(s.Cyclomatic), fI32(s.Sloc), fI32(s.FanIn),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5), cmpS(0))
 	return cols, limit(rows, p)
@@ -12511,9 +13069,9 @@ func mM27(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(r.NTransitiveOut),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(r.NTransitiveOut),
 			fI32(r.NTransitive), fI32(s.FanOut), fI32(s.Cyclomatic),
-			fOptStr(g.modName(s.ModuleID), s.ModuleID != 0), fStr(g.at(s))})
+			fOptStr(g.modName(s.ModuleID), s.ModuleID != 0), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), cmpS(0))
 	return cols, limit(rows, p)
@@ -12557,8 +13115,8 @@ func mM28(g *Graph, p params) ([]string, [][]fval) {
 		if gs[mod.ID]+wf[mod.ID] <= 0 {
 			continue
 		}
-		rows = append(rows, []fval{fStr(mod.Name()), fI32(gs[mod.ID]),
-			fI32(ss[mod.ID]), fI32(wf[mod.ID]), fI32(ws[mod.ID])})
+		rows = append(rows, mkrow(fStr(mod.Name()), fI32(gs[mod.ID]),
+			fI32(ss[mod.ID]), fI32(wf[mod.ID]), fI32(ws[mod.ID])))
 	}
 	orderBy(rows, dI(1), dI(3))
 	return cols, limit(rows, p)
@@ -12580,9 +13138,9 @@ func mM29(g *Graph, p params) ([]string, [][]fval) {
 		if den := s.NReturns + s.NBranches; den != 0 {
 			pv = fI32(pct(int64(shapes+s.NNullCheck), int64(den)))
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.NReturns), fI32(shapes),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.NReturns), fI32(shapes),
 			fI32(s.NNullCheck), fI32(s.NGotos), pv, fI32(s.Cyclomatic),
-			fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(5), dI(7), cmpS(0))
 	return cols, limit(rows, p)
@@ -12623,8 +13181,8 @@ func mM30(g *Graph, p params) ([]string, [][]fval) {
 		if e.sites != 0 {
 			pv = math.Round(float64(e.with)*100/float64(e.sites)*10) / 10
 		}
-		rows = append(rows, []fval{fStr(fn), fI32(e.sites), fI32(e.with),
-			fI32(e.raw), fI32(int32(len(e.callers))), fF(float64(pv))})
+		rows = append(rows, mkrow(fStr(fn), fI32(e.sites), fI32(e.with),
+			fI32(e.raw), fI32(int32(len(e.callers))), fF(float64(pv))))
 	}
 	orderBy(rows, dI(1))
 	return cols, limit(rows, p)
@@ -12641,10 +13199,10 @@ func mM31(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NMemcpy),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NMemcpy),
 			fI32(s.NMemory), fI32(s.MaxLoopDepth), fI32(s.AllocInLoop),
 			fI32(s.FanIn), fOptStr(g.modName(s.ModuleID), s.ModuleID != 0),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5), cmpS(0))
 	return cols, limit(rows, p)
@@ -12655,39 +13213,38 @@ func mM32(g *Graph, p params) ([]string, [][]fval) {
 		"params", "at"}
 	return macroQ(cols, func(m *Macro) bool { return m.IsFunctionlike == 1 && m.NUses > 0 },
 		g, p, func(s *Symbol, m *Macro) []fval {
-			return []fval{fStr(s.Name()), fI32(m.NUses), fI32(m.BodyLen),
-				fI32(m.NUses * m.BodyLen), fI32(m.IsMultiline), fI32(m.NParams),
-				fStr(g.at(s))}
+			return mkrow(fStr(s.Name()), fI32(m.NUses), fI32(m.BodyLen),
+				fI32(m.NUses*m.BodyLen), fI32(m.IsMultiline), fI32(m.NParams),
+				fStr(g.at(s)))
 		}, dI(3))
 }
 
 func mM33(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"struct_", "sz", "pad", "ptr_fields", "fnptr_fields",
 		"includers", "lines64", "at"}
-	ptr := map[int32]int32{}
-	fnp := map[int32]int32{}
-	for _, l := range g.Layout {
+	ptr, fnp := g.perSym(), g.perSym()
+	for i := range g.Layout {
+		l := &g.Layout[i]
 		if l.PtrDepth > 0 && l.InUnion == 0 && l.Depth == 0 {
-			ptr[l.SymbolID]++
+			ptr.add(l.SymbolID, 1)
 		}
 		if l.IsFnptr == 1 {
-			fnp[l.SymbolID]++
+			fnp.add(l.SymbolID, 1)
 		}
 	}
-
-	seenIn := map[int32]map[int32]bool{}
-	for _, im := range g.Imports {
-		if !im.HasTargetID {
-			continue
+	// distinct files including each header
+	pairs := make([]uint64, 0, len(g.Imports))
+	for i := range g.Imports {
+		if im := &g.Imports[i]; im.HasTargetID {
+			pairs = append(pairs, uint64(uint32(im.TargetID))<<32|uint64(uint32(im.FileID)))
 		}
-		if seenIn[im.TargetID] == nil {
-			seenIn[im.TargetID] = map[int32]bool{}
-		}
-		seenIn[im.TargetID][im.FileID] = true
 	}
-	incl := make(map[int32]int32, len(seenIn))
-	for t, set := range seenIn {
-		incl[t] = int32(len(set))
+	slices.Sort(pairs)
+	incl := g.perFile()
+	for i, k := range pairs {
+		if i == 0 || k != pairs[i-1] {
+			incl.add(int32(k>>32), 1)
+		}
 	}
 	var rows [][]fval
 	for _, ss := range g.SSize {
@@ -12705,9 +13262,9 @@ func mM33(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(ss.TotalSize),
-			fI32(ss.TotalPad), fI32(ptr[ss.SymbolID]), fI32(fnp[ss.SymbolID]),
-			fI32(incl[f.ID]), fI32(ss.NLines64), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(ss.TotalSize),
+			fI32(ss.TotalPad), fI32(ptr.at(ss.SymbolID)), fI32(fnp.at(ss.SymbolID)),
+			fI32(incl.at(f.ID)), fI32(ss.NLines64), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(5), dI(3), dI(1))
 	return cols, limit(rows, p)
@@ -12746,7 +13303,7 @@ func mM34(g *Graph, p params) ([]string, [][]fval) {
 		if mod == "" {
 			mod = "(none)"
 		}
-		row := []fval{fStr(f.Path()), fStr(mod), fI32(a.n)}
+		row := mkrow(fStr(f.Path()), fStr(mod), fI32(a.n))
 		for _, t := range types {
 			row = append(row, fI32(a.by[t]))
 		}
@@ -12760,12 +13317,14 @@ func mM34(g *Graph, p params) ([]string, [][]fval) {
 func mM35(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"shape", "copies", "sloc", "cyclo", "params",
 		"duplicated_sloc", "modules"}
+	// the fingerprint is four numbers; it is only spelled out as text for the
+	// shapes that turn out to have a second copy
+	type key struct{ sloc, cyc, params, calls int32 }
 	type grp struct {
-		copies, sloc, cyc, params, dup int32
-		mods                           map[int32]bool
+		copies, dup int32
+		mods        []int32
 	}
-	m := map[string]*grp{}
-	var order []string
+	m := map[key]*grp{}
 	for _, s := range g.syms() {
 		if s.Kind() != "function" || s.Sloc < 10 || s.Cyclomatic < 3 {
 			continue
@@ -12777,37 +13336,42 @@ func mM35(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		sig := strconv.Itoa(int(s.Sloc)) + "/" + strconv.Itoa(int(s.Cyclomatic)) +
-			"/" + strconv.Itoa(int(s.NParams)) + "/" + strconv.Itoa(int(s.NCalls))
-		gp := m[sig]
+		k := key{s.Sloc, s.Cyclomatic, s.NParams, s.NCalls}
+		gp := m[k]
 		if gp == nil {
-			gp = &grp{mods: map[int32]bool{}}
-			m[sig] = gp
-			order = append(order, sig)
+			gp = &grp{}
+			m[k] = gp
 		}
 		gp.copies++
-		gp.sloc = s.Sloc
-		gp.cyc = s.Cyclomatic
-		gp.params = s.NParams
 		gp.dup += s.Sloc
-		gp.mods[s.ModuleID] = true
-	}
-	sort.Strings(order)
-	var rows [][]fval
-	for _, sig := range order {
-		gp := m[sig]
-		if gp.copies <= 1 {
-			continue
+		if !slices.Contains(gp.mods, s.ModuleID) {
+			gp.mods = append(gp.mods, s.ModuleID)
 		}
-		var names []string
-		for mid := range gp.mods {
+	}
+	type shape struct {
+		sig string
+		k   key
+	}
+	var order []shape
+	for k, gp := range m {
+		if gp.copies > 1 {
+			order = append(order, shape{strconv.Itoa(int(k.sloc)) + "/" +
+				strconv.Itoa(int(k.cyc)) + "/" + strconv.Itoa(int(k.params)) + "/" +
+				strconv.Itoa(int(k.calls)), k})
+		}
+	}
+	slices.SortFunc(order, func(a, b shape) int { return strings.Compare(a.sig, b.sig) })
+	var rows [][]fval
+	for _, sh := range order {
+		gp := m[sh.k]
+		names := make([]string, 0, len(gp.mods))
+		for _, mid := range gp.mods {
 			names = append(names, g.modName(mid))
 		}
-
 		sort.Strings(names)
-		rows = append(rows, []fval{fStr(sig), fI32(gp.copies), fI32(gp.sloc),
-			fI32(gp.cyc), fI32(gp.params), fI32(gp.dup),
-			fStr(groupConcat(distinctStrings(names)))})
+		rows = append(rows, mkrow(fStr(sh.sig), fI32(gp.copies), fI32(sh.k.sloc),
+			fI32(sh.k.cyc), fI32(sh.k.params), fI32(gp.dup),
+			fStr(groupConcat(distinctStrings(names)))))
 	}
 	orderBy(rows, dI(5), dI(1))
 	return cols, limit(rows, p)
@@ -12816,27 +13380,16 @@ func mM35(g *Graph, p params) ([]string, [][]fval) {
 func mM36(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "aliasing_pairs", "restrict_hints", "params",
 		"cyclo", "depth", "fan_in", "at"}
-	type grp struct {
-		typ map[string]int32
-		n   int32
-	}
-	m := map[int32]*grp{}
-	for _, pr := range g.Params {
-		if pr.IsRef != 1 || pr.Type() == "" {
-			continue
+	start, idx := groupRows(len(g.Params), len(g.Symbols)+1, func(i int) int32 {
+		if pr := &g.Params[i]; pr.IsRef == 1 && pr.Type() != "" {
+			return pr.SymbolID
 		}
-		gp := m[pr.SymbolID]
-		if gp == nil {
-			gp = &grp{typ: map[string]int32{}}
-			m[pr.SymbolID] = gp
-		}
-		gp.typ[pr.Type()]++
-		gp.n++
-	}
+		return -1
+	})
 	var rows [][]fval
 	for _, s := range g.syms() {
-		gp := m[s.ID]
-		if gp == nil || s.Kind() != "function" || s.NRestrict != 0 {
+		ps := idx[start[s.ID]:start[s.ID+1]]
+		if len(ps) == 0 || s.Kind() != "function" || s.NRestrict != 0 {
 			continue
 		}
 		f := g.fileOf(s.ID)
@@ -12846,18 +13399,22 @@ func mM36(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
+		// pointer parameters that share a type with another one
 		pairs := int32(0)
-		for _, c := range gp.typ {
-			if c >= 2 {
-				pairs += c
+		for _, a := range ps {
+			for _, b := range ps {
+				if a != b && g.Params[a].Type() == g.Params[b].Type() {
+					pairs++
+					break
+				}
 			}
 		}
 		if pairs == 0 {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(pairs), fI32(s.NRestrict),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(pairs), fI32(s.NRestrict),
 			fI32(s.NParams), fI32(s.Cyclomatic), fI32(s.MaxLoopDepth),
-			fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(5), dI(6), cmpS(0))
 	return cols, limit(rows, p)
@@ -12879,10 +13436,10 @@ func mM37(g *Graph, p params) ([]string, [][]fval) {
 		if mod == "" {
 			mod = "(none)"
 		}
-		rows = append(rows, []fval{fStr(f.Path()), fStr(mod), fI32(f.Sloc),
+		rows = append(rows, mkrow(fStr(f.Path()), fStr(mod), fI32(f.Sloc),
 			fI32(f.NFunctions), fI32(f.NTypes), fI32(f.TotalCyclo),
 			fI32(f.MaxCyclo), fI32(f.TotalRisk), fI32(f.NImports),
-			fI32(pct(int64(f.TotalRisk), int64(f.Sloc)))})
+			fI32(pct(int64(f.TotalRisk), int64(f.Sloc)))))
 	}
 	orderBy(rows, dI(7), dI(2))
 	return cols, limit(rows, p)
@@ -12891,33 +13448,23 @@ func mM37(g *Graph, p params) ([]string, [][]fval) {
 func mM38(g *Graph, p params) ([]string, [][]fval) {
 	cols := []string{"name", "fan_in", "fan_out", "cyclo", "sloc", "documented",
 		"params", "declared_in", "at"}
-	inHeader := map[string]int32{}
-	for _, d := range g.Decls {
-		if f := g.fileOf2(d.FileID); f != nil && f.Ext() == ".h" {
-			inHeader[d.Name()]++
-		}
-	}
+	x := g.six()
 	var rows [][]fval
 	for _, s := range g.syms() {
 		if s.Kind() != "function" || s.IsStatic != 0 || s.IsInline != 0 {
 			continue
 		}
 		f := g.fileOf(s.ID)
-		if f == nil || f.Ext() != ".c" || inHeader[s.Name()] == 0 {
+		if f == nil || f.Ext() != ".c" || x.declHdr[s.ID] == 0 {
 			continue
 		}
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		nDecl := int32(0)
-		for _, d := range g.Decls {
-			if d.Name() == s.Name() {
-				nDecl++
-			}
-		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(s.FanIn), fI32(s.FanOut),
+		nDecl := x.declN[s.ID]
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(s.FanIn), fI32(s.FanOut),
 			fI32(s.Cyclomatic), fI32(s.Sloc), fI32(s.HasDoc), fI32(s.NParams),
-			fI32(nDecl), fStr(g.at(s))})
+			fI32(nDecl), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(1), dI(4), cmpS(0))
 	return cols, limit(rows, p)
@@ -12933,9 +13480,9 @@ func mM39(g *Graph, p params) ([]string, [][]fval) {
 			if strings.Contains(sp, "do{") && strings.Contains(sp, "while(") {
 				dw = 1
 			}
-			return []fval{fStr(s.Name()), fI32(m.NParams), fI32(m.BodyLen),
-				fI32(m.NUses), fI32(m.IsMultiline), fI32(dw), fStr(g.at(s))}
-		}, cmpI(3), func(a, b []fval) int { return -cmpI32(a[2].i, b[2].i) })
+			return mkrow(fStr(s.Name()), fI32(m.NParams), fI32(m.BodyLen),
+				fI32(m.NUses), fI32(m.IsMultiline), fI32(dw), fStr(g.at(s)))
+		}, cmpI(3), dI(2))
 }
 
 func mM40(g *Graph, p params) ([]string, [][]fval) {
@@ -12944,13 +13491,13 @@ func mM40(g *Graph, p params) ([]string, [][]fval) {
 	type agg struct {
 		n, uninit, cst, loop int32
 	}
-	m := map[int32]*agg{}
-	for _, l := range g.Locals {
-		a := m[l.SymbolID]
-		if a == nil {
-			a = &agg{}
-			m[l.SymbolID] = a
+	m := make([]agg, len(g.Symbols)+1)
+	for i := range g.Locals {
+		l := &g.Locals[i]
+		if l.SymbolID < 0 || int(l.SymbolID) >= len(m) {
+			continue
 		}
+		a := &m[l.SymbolID]
 		a.n++
 		if l.HasInit == 0 {
 			a.uninit++
@@ -12960,8 +13507,8 @@ func mM40(g *Graph, p params) ([]string, [][]fval) {
 	}
 	var rows [][]fval
 	for _, s := range g.syms() {
-		a := m[s.ID]
-		if a == nil || s.Kind() != "function" {
+		a := &m[s.ID]
+		if a.n == 0 || s.Kind() != "function" {
 			continue
 		}
 		f := g.fileOf(s.ID)
@@ -12971,9 +13518,9 @@ func mM40(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) || a.uninit < 3 {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(a.n), fI32(a.uninit),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(a.n), fI32(a.uninit),
 			fI32(a.cst), fI32(a.loop), fI32(s.Cyclomatic), fI32(s.Sloc),
-			fStr(g.at(s))})
+			fStr(g.at(s))))
 	}
 	orderBy(rows, dI(2), dI(5), cmpS(0))
 	return cols, limit(rows, p)
@@ -13020,9 +13567,9 @@ func mM41(g *Graph, p params) ([]string, [][]fval) {
 	var rows [][]fval
 	for _, n := range order {
 		a := m[n]
-		rows = append(rows, []fval{fStr(n), fI32(int32(len(a.fns))), fI32(a.sites),
+		rows = append(rows, mkrow(fStr(n), fI32(int32(len(a.fns))), fI32(a.sites),
 			fI32(int32(len(a.fileSet))), fI32(a.cyc), fI32(a.worst), fI32(a.io), fI32(a.alloc),
-			fStr(groupConcat(distinctStrings(a.mods)))})
+			fStr(groupConcat(distinctStrings(a.mods)))))
 	}
 	orderBy(rows, dI(2), dI(4))
 	return cols, limit(rows, p)
@@ -13042,7 +13589,7 @@ func mM42(g *Graph, p params) ([]string, [][]fval) {
 		if !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(rt), fStr(g.at(s))})
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(rt), fStr(g.at(s))))
 	}
 	orderBy(rows, cmpS(0))
 	return cols, limit(rows, p)
@@ -13089,8 +13636,8 @@ func mM43(g *Graph, p params) ([]string, [][]fval) {
 	for _, fid := range sortedIDs(m) {
 		a := m[fid]
 		f := g.fileOf2(fid)
-		rows = append(rows, []fval{fStr(f.Path()), fI32(a.n), fI32(a.sloc),
-			fI32(a.fan), fI32(a.worst), fI32(a.cyc), fI32(incl[fid])})
+		rows = append(rows, mkrow(fStr(f.Path()), fI32(a.n), fI32(a.sloc),
+			fI32(a.fan), fI32(a.worst), fI32(a.cyc), fI32(incl[fid])))
 	}
 	orderBy(rows, dI(3), dI(1))
 	return cols, limit(rows, p)
@@ -13144,9 +13691,9 @@ func mM44(g *Graph, p params) ([]string, [][]fval) {
 		if a.fns < 8 {
 			continue
 		}
-		rows = append(rows, []fval{fStr(g.modName(mid)), fI32(a.fns),
+		rows = append(rows, mkrow(fStr(g.modName(mid)), fI32(a.fns),
 			fI32(a.nul), fI32(a.neg), fI32(a.zer), fI32(a.mixed),
-			fI32(pct(int64(a.mixed), int64(a.fns)))})
+			fI32(pct(int64(a.mixed), int64(a.fns)))))
 	}
 	orderBy(rows, dI(6), dI(1), cmpS(0))
 	return cols, limit(rows, p)
@@ -13192,8 +13739,8 @@ func mM45(g *Graph, p params) ([]string, [][]fval) {
 		if mod == "" {
 			mod = "(none)"
 		}
-		rows = append(rows, []fval{fStr(f.Path()), fStr(mod), fI32(srcN[fid]),
-			fI32(inhN[fid]), fI32(f.Sloc)})
+		rows = append(rows, mkrow(fStr(f.Path()), fStr(mod), fI32(srcN[fid]),
+			fI32(inhN[fid]), fI32(f.Sloc)))
 	}
 	orderBy(rows, dI(2), dI(4))
 	return cols, limit(rows, p)
@@ -13226,11 +13773,11 @@ func mM46(g *Graph, p params) ([]string, [][]fval) {
 		if l := bySym[s.ID]; len(l) > 0 {
 			calls = fStr(groupConcat(l))
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fStr(mod), fI32(g.rv(s).NEpoll),
+		rows = append(rows, mkrow(fStr(s.Name()), fStr(mod), fI32(g.rv(s).NEpoll),
 			fI32(g.rv(s).NUring), fI32(g.rv(s).NKqueue), fI32(g.rv(s).NEventWait), fI32(g.rv(s).NEtReg),
 			fI32(g.rv(s).NOneshotReg), fI32(g.rv(s).NWriteReady), fI32(g.rv(s).NErrFlag),
 			fI32(g.rv(s).NRearm), fI32(g.rv(s).NDereg), fI32(g.rv(s).NEagain), fI32(g.rv(s).NEintr),
-			calls, fStr(g.at(s)), fI32(s.Cyclomatic)})
+			calls, fStr(g.at(s)), fI32(s.Cyclomatic)))
 	}
 	orderBy(rows, dSum(2, 3, 4), dI(len(cols)))
 	for i, r := range rows {
@@ -13247,10 +13794,10 @@ func mM47(g *Graph, p params) ([]string, [][]fval) {
 		if g.rv(s).NEventWait <= 0 || !likeMatch(g.modName(s.ModuleID), p.mod) {
 			continue
 		}
-		rows = append(rows, []fval{fStr(s.Name()), fI32(g.rv(s).NEventWait),
+		rows = append(rows, mkrow(fStr(s.Name()), fI32(g.rv(s).NEventWait),
 			fI32(s.Cyclomatic), fI32(s.Cognitive), fI32(s.MaxNesting),
 			fI32(s.MaxLoopDepth), fI32(s.CallInLoop), fI32(s.IOInLoop),
-			fI32(s.BranchInLoop), fI32(s.Sloc), fI32(s.FanIn), fStr(g.at(s))})
+			fI32(s.BranchInLoop), fI32(s.Sloc), fI32(s.FanIn), fStr(g.at(s))))
 	}
 	orderBy(rows, dI(2), dI(9))
 	return cols, limit(rows, p)
@@ -13300,7 +13847,7 @@ func mM48(g *Graph, p params) ([]string, [][]fval) {
 		if mod == "" {
 			mod = "(none)"
 		}
-		row := []fval{fStr(mod)}
+		row := mkrow(fStr(mod))
 		for _, v := range a.c {
 			row = append(row, fI32(v))
 		}
@@ -13314,134 +13861,118 @@ var retNegNS = []string{"stdio.h", "sys/socket.h", "sys/mman.h", "sys/wait.h",
 	"sys/uio.h", "unistd.h", "fcntl.h", "dirent.h", "stdio.h"}
 
 func mM49(g *Graph, p params) ([]string, [][]fval) {
-	cols := []string{"module", "ns", "call_sites", "fns", "distinct_calls"}
+	cols := []string{"file", "ns", "call_sites", "fns", "distinct_calls"}
+	// One row per (file, namespace). The first column used to be a module
+	// name looked up with the FILE's id: "(none)" on nearly every row, and
+	// some unrelated module's name on the rest.
 	type agg struct {
-		mod, ns string
-		sites   int32
-		fns     map[int32]bool
-		calls   map[string]bool
+		ns    string
+		sites int32
+		fns   []int32
+		calls []string
 	}
-	type key struct {
-		file int32
-		ns   string
-	}
-	m := map[key]*agg{}
-	var keys []key
-	for _, a := range g.APIUses {
+	nf := len(g.Files) + 1
+	per := make([][]agg, nf)
+uses:
+	for i := range g.APIUses {
+		a := &g.APIUses[i]
 		f := g.fileOf2(a.FileID)
-		if f == nil {
+		if f == nil || !likeMatch(g.modName(f.ModuleID), p.mod) {
 			continue
 		}
-		if !likeMatch(g.modName(f.ModuleID), p.mod) {
-			continue
+		l := per[a.FileID]
+		ns, fn := a.NS(), a.Fn()
+		for k := range l {
+			if e := &l[k]; e.ns == ns {
+				e.sites++
+				e.fns = append(e.fns, a.SymbolID)
+				if !slices.Contains(e.calls, fn) {
+					e.calls = append(e.calls, fn)
+				}
+				continue uses
+			}
 		}
-
-		mod := g.modName(a.FileID)
-		if !likeMatch(mod, p.mod) {
-			continue
-		}
-		k := key{a.FileID, a.NS()}
-		e := m[k]
-		if e == nil {
-			e = &agg{fns: map[int32]bool{}, calls: map[string]bool{}, mod: mod,
-				ns: a.NS()}
-			m[k] = e
-			keys = append(keys, k)
-		}
-		e.sites++
-		e.fns[a.SymbolID] = true
-		e.calls[a.Fn()] = true
+		per[a.FileID] = append(l, agg{ns, 1, []int32{a.SymbolID}, []string{fn}})
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].file != keys[j].file {
-			return keys[i].file < keys[j].file
-		}
-		return keys[i].ns < keys[j].ns
-	})
 	var rows [][]fval
-	for _, k := range keys {
-		e := m[k]
-		mod := e.mod
-		if mod == "" {
-			mod = "(none)"
+	for fid, l := range per {
+		if len(l) == 0 {
+			continue
 		}
-		rows = append(rows, []fval{fStr(mod),
-			fStr(e.ns), fI32(e.sites), fI32(int32(len(e.fns))),
-			fI32(int32(len(e.calls)))})
+		slices.SortFunc(l, func(a, b agg) int { return strings.Compare(a.ns, b.ns) })
+		for k := range l {
+			e := &l[k]
+			slices.Sort(e.fns)
+			rows = append(rows, mkrow(fStr(g.Files[fid-1].Path()), fStr(e.ns),
+				fI32(e.sites), fInt(len(slices.Compact(e.fns))), fInt(len(e.calls))))
+		}
 	}
 	orderBy(rows, dI(2))
 	return cols, limit(rows, p)
 }
 
 func mM50(g *Graph, p params) ([]string, [][]fval) {
-	cols := []string{"module", "fns", "unchecked_returns", "unchecked_conversions",
+	cols := []string{"file", "fns", "unchecked_returns", "unchecked_conversions",
 		"ctype_ub", "varargs_unclosed", "mmap_unchecked", "api_call_sites"}
+	// Per file, as the title says. The first column used to be a module name
+	// looked up with the FILE's id -- "(none)" on nearly every row -- and
+	// --module was matched against that same wrong name.
 	type agg struct {
-		mod                            string
-		fns, ur, uc, cu, vu, mu, sites int32
+		hit                       bool
+		ur, uc, cu, vu, mu, sites int32
+		fns                       []int32
 	}
-
-	m := map[int32]*agg{}
-	order := make([]int32, 0, 64)
-	for _, a := range g.APIUses {
+	m := make([]agg, len(g.Files)+1)
+	for i := range g.APIUses {
+		a := &g.APIUses[i]
+		f := g.fileOf2(a.FileID)
+		if f == nil || !likeMatch(g.modName(f.ModuleID), p.mod) {
+			continue
+		}
+		e := &m[a.FileID]
+		e.fns = append(e.fns, a.SymbolID)
 		s := g.sym(a.SymbolID)
 		if s == nil {
 			continue
 		}
-		mod := g.modName(a.FileID)
-		if !likeMatch(mod, p.mod) {
-			continue
-		}
-		e := m[a.FileID]
-		if e == nil {
-			e = &agg{mod: mod}
-			m[a.FileID] = e
-			order = append(order, a.FileID)
-		}
+		e.hit = true
 		e.sites++
-		if containsStr(retNegNS, a.NS()) && g.rv(s).NRetNegCheck == 0 {
+		r := g.rv(s)
+		ns := a.NS()
+		if containsStr(retNegNS, ns) && r.NRetNegCheck == 0 {
 			e.ur++
 		}
 		switch a.Fn() {
 		case "strtol", "strtoll", "strtoul", "strtoull", "strtod":
-			if !(g.rv(s).NErrnoZero > 0 && g.rv(s).NEndptr > 0) {
+			if !(r.NErrnoZero > 0 && r.NEndptr > 0) {
 				e.uc++
 			}
 		}
-		if a.NS() == "ctype.h" && g.rv(s).NUcharCast == 0 {
-			e.cu++
-		}
-		if a.NS() == "stdarg.h" && g.rv(s).NVaEnd == 0 {
-			e.vu++
-		}
-		if a.NS() == "sys/mman.h" && g.rv(s).NMapFailed == 0 {
-			e.mu++
+		switch ns {
+		case "ctype.h":
+			if r.NUcharCast == 0 {
+				e.cu++
+			}
+		case "stdarg.h":
+			if r.NVaEnd == 0 {
+				e.vu++
+			}
+		case "sys/mman.h":
+			if r.NMapFailed == 0 {
+				e.mu++
+			}
 		}
 	}
-	seen := map[int32]map[int32]bool{}
-	for _, a := range g.APIUses {
-		mod := g.modName(a.FileID)
-		if !likeMatch(mod, p.mod) {
+	var rows [][]fval
+	for fid := range m {
+		e := &m[fid]
+		if !e.hit {
 			continue
 		}
-		if seen[a.FileID] == nil {
-			seen[a.FileID] = map[int32]bool{}
-		}
-		if !seen[a.FileID][a.SymbolID] {
-			seen[a.FileID][a.SymbolID] = true
-			m[a.FileID].fns++
-		}
-	}
-	keys := sortedIDs(m)
-	var rows [][]fval
-	for _, fid := range keys {
-		e := m[fid]
-		mod := e.mod
-		if mod == "" {
-			mod = "(none)"
-		}
-		rows = append(rows, []fval{fStr(mod), fI32(e.fns), fI32(e.ur),
-			fI32(e.uc), fI32(e.cu), fI32(e.vu), fI32(e.mu), fI32(e.sites)})
+		slices.Sort(e.fns)
+		rows = append(rows, mkrow(fStr(g.Files[fid-1].Path()),
+			fInt(len(slices.Compact(e.fns))), fI32(e.ur), fI32(e.uc), fI32(e.cu),
+			fI32(e.vu), fI32(e.mu), fI32(e.sites)))
 	}
 	orderBy(rows, dI(7))
 	return cols, limit(rows, p)
@@ -13735,7 +14266,8 @@ func report(g *Graph) {
 		fmt.Fprintln(w, " Fan-in, reachability and dead-code are computed from the first line only.")
 		fmt.Fprintln(w, " `--metrics graph-blindspots` breaks the blind share down per module, and")
 		fmt.Fprintln(w, " the `calls_resolved` row of the meta table says how much of it is names")
-		fmt.Fprintln(w, " defined more than once, where linkage alone cannot pick the target.")
+		fmt.Fprintln(w, " defined more than once, where neither linkage nor a shared prototype")
+		fmt.Fprintln(w, " picks the target.")
 	}
 
 	fmt.Fprintf(w, "\n%s\nBIGGEST MODULES\n%s\n", bar.String(), dash.String())
@@ -13896,19 +14428,6 @@ func fOptStr(v string, ok bool) fval {
 	return fStr(v)
 }
 
-func encodeField(v fval) string {
-	switch v.kind {
-	case fkNull:
-		return `\N`
-	case fkInt:
-		return "i:" + strconv.FormatInt(v.i, 10)
-	case fkFloat:
-		return "f:" + cgFloat(v.f)
-	default:
-		return "s:" + escapeText(v.s)
-	}
-}
-
 func escapeText(s string) string {
 	var sb strings.Builder
 	sb.Grow(len(s) + 2)
@@ -13948,25 +14467,75 @@ func cgFloat(f float64) string {
 }
 
 type dumper struct {
-	w *bufio.Writer
+	w    *bufio.Writer
+	buf  []byte
+	rows [][2]int32
 }
 
-func (d *dumper) table(name string, ncols int, rows [][]fval) {
-	lines := make([]string, 0, len(rows))
-	for _, r := range rows {
-		parts := make([]string, len(r))
-		for i, v := range r {
-			parts[i] = encodeField(v)
-		}
-		lines = append(lines, "R "+strings.Join(parts, " "))
+// appendField is encodeField written into a buffer instead of a new string.
+func appendField(b []byte, v fval) []byte {
+	switch v.kind {
+	case fkNull:
+		return append(b, '\\', 'N')
+	case fkInt:
+		return strconv.AppendInt(append(b, 'i', ':'), v.i, 10)
+	case fkFloat:
+		return append(append(b, 'f', ':'), cgFloat(v.f)...)
 	}
-	sort.Strings(lines)
-	fmt.Fprintf(d.w, "T %s %d %d\n", name, ncols, len(lines))
-	for _, l := range lines {
-		d.w.WriteString(l)
+	b = append(b, 's', ':')
+	const hex = "0123456789ABCDEF"
+	for i := 0; i < len(v.s); i++ {
+		switch c := v.s[i]; c {
+		case '\\':
+			b = append(b, '\\', '\\')
+		case '\n':
+			b = append(b, '\\', 'n')
+		case '\t':
+			b = append(b, '\\', 't')
+		case '\r':
+			b = append(b, '\\', 'r')
+		default:
+			if c < 0x20 || c == 0x7F {
+				b = append(b, '\\', 'x', hex[c>>4], hex[c&15])
+			} else {
+				b = append(b, c)
+			}
+		}
+	}
+	return b
+}
+
+// table writes one table with its rows in byte order. Every row is encoded
+// into one buffer and the sort moves (offset, end) pairs: a string per field,
+// a slice per row and a joined line per row was 1.3 million rows' worth of
+// garbage on PostgreSQL, and most of the time --dump took.
+func (d *dumper) table(name string, ncols int, rows [][]fval) {
+	buf, sp := d.buf[:0], d.rows[:0]
+	for _, r := range rows {
+		lo := len(buf)
+		buf = append(buf, 'R')
+		if len(r) == 0 {
+			buf = append(buf, ' ')
+		}
+		for _, v := range r {
+			buf = append(buf, ' ')
+			buf = appendField(buf, v)
+		}
+		if len(buf) > math.MaxInt32 {
+			panic("dump: table " + name + " exceeds 2 GB of text")
+		}
+		sp = append(sp, [2]int32{int32(lo), int32(len(buf))})
+	}
+	slices.SortFunc(sp, func(a, b [2]int32) int {
+		return bytes.Compare(buf[a[0]:a[1]], buf[b[0]:b[1]])
+	})
+	fmt.Fprintf(d.w, "T %s %d %d\n", name, ncols, len(sp))
+	for _, r := range sp {
+		d.w.Write(buf[r[0]:r[1]])
 		d.w.WriteByte('\n')
 	}
 	fmt.Fprintf(d.w, "E %s\n", name)
+	d.buf, d.rows = buf, sp
 }
 
 func (g *Graph) dump(w io.Writer) {
@@ -14448,8 +15017,13 @@ func main() {
 		jsonN = pickQuery(cat, flags["json"], qv["metrics"])
 	}
 
+	// A saved state has no root to name, so with --load-ast every positional
+	// is a selector. Taking the first as a root anyway turned
+	// `--load-ast s.ast dead-code` into "run all 119 queries".
 	dir := "."
-	if len(positional) > 0 {
+	if loadASTPath != "" {
+		positional = append([]string{dir}, positional...)
+	} else if len(positional) > 0 {
 		dir = positional[0]
 	}
 	// A selector that names nothing is an error, not a silent no-op: dropping
@@ -14488,8 +15062,7 @@ func main() {
 		g = &Graph{}
 		opts := runOpts{includeTests: !qv["no-tests"],
 			includeGenerated: qv["include-generated"],
-			includeVendored:  qv["include-vendored"], quiet: quiet,
-			keepAST: saveAST != ""}
+			includeVendored:  qv["include-vendored"], quiet: quiet}
 		n = build(g, dir, opts, quiet)
 	}
 	took := time.Since(t0)
@@ -14880,16 +15453,28 @@ func selfCheck(g *Graph, w *bufio.Writer) int {
 	rCyclo := add("cyclomatic complexity is at least 1 + the number of loops")
 	rCmp := add("null checks and signed/size compares are subsets of all compares")
 	rLocals := add("n_locals equals the function's rows in locals")
-	rParams := add("n_params equals the function's rows in params")
+	rParams := add("n_params equals the function's rows in params, `...` aside")
+	rVariadic := add("a function is variadic exactly when it has one `...` row, and that row is last")
 	rLine := add("every symbol starts on a line its file has")
 
 	nLoc := map[int32]int32{}
 	for _, l := range g.Locals {
 		nLoc[l.SymbolID]++
 	}
-	nPar := map[int32]int32{}
+	nPar, nVar, lastPos := map[int32]int32{}, map[int32]int32{}, map[int32]int32{}
 	for _, p := range g.Params {
-		nPar[p.SymbolID]++
+		if p.IsVariadic == 1 {
+			nVar[p.SymbolID]++
+		} else {
+			nPar[p.SymbolID]++
+		}
+		lastPos[p.SymbolID] = max(lastPos[p.SymbolID], p.Pos)
+	}
+	varLast := map[int32]bool{}
+	for _, p := range g.Params {
+		if p.IsVariadic == 1 && p.Pos == lastPos[p.SymbolID] {
+			varLast[p.SymbolID] = true
+		}
 	}
 	for _, s := range g.syms() {
 		f := g.fileOf(s.ID)
@@ -14908,12 +15493,33 @@ func selfCheck(g *Graph, w *bufio.Writer) int {
 		fail(rCmp, s.NNullCheck <= s.NCmp && r.NSignCmp <= s.NCmp, at(s))
 		fail(rLocals, s.NLocals == nLoc[s.ID], at(s))
 		fail(rParams, s.NParams == nPar[s.ID], at(s))
+		fail(rVariadic, (s.IsVariadic == 0 && nVar[s.ID] == 0) ||
+			(s.IsVariadic == 1 && nVar[s.ID] == 1 && varLast[s.ID]), at(s))
 	}
 
 	rEdgeEnds := add("both ends of every call edge are functions that exist")
 	rEdgeFlags := add("an edge's is_self/same_file/same_module agree with its two ends")
 	rFan := add("fan_in and fan_out equal the distinct callers/callees in edges")
 	rSites := add("an edge has >= 1 call and no more distinct call lines than calls")
+	rEdgeOne := add("no two edges join the same caller and callee")
+	{
+		// module-coupling counts edge rows as distinct caller/callee pairs
+		out := g.edgeCSR(false)
+		var seen []int32
+		for id := int32(1); int(id) <= len(g.Symbols); id++ {
+			es := out.of(id)
+			if len(es) == 0 {
+				continue
+			}
+			seen = seen[:0]
+			for _, j := range es {
+				seen = append(seen, g.Edges[j].CalleeID)
+			}
+			slices.Sort(seen)
+			s := g.Symbols[id-1]
+			fail(rEdgeOne, len(slices.Compact(seen)) == len(es), at(s))
+		}
+	}
 	fin, fout := map[int32]int32{}, map[int32]int32{}
 	sites := map[[2]int32]int32{}
 	for _, c := range g.Callsites {
@@ -14959,6 +15565,7 @@ func selfCheck(g *Graph, w *bufio.Writer) int {
 
 	rFileLines := add("code + comment + blank lines do not exceed a file's line count")
 	rFileFns := add("a file's n_functions equals its function symbols")
+	rFileDoc := add("doc lines are comment lines: doc_lines <= comment_lines")
 	fileFns := map[int32]int32{}
 	for _, s := range g.syms() {
 		if isFn(s) {
@@ -14970,6 +15577,7 @@ func selfCheck(g *Graph, w *bufio.Writer) int {
 		where := func() string { return f.Path() }
 		fail(rFileLines, f.Sloc+f.CommentLines+f.BlankLines <= f.Lines+1 && f.Sloc >= 0, where)
 		fail(rFileFns, f.NFunctions == fileFns[f.ID], where)
+		fail(rFileDoc, f.DocLines >= 0 && f.DocLines <= f.CommentLines, where)
 	}
 
 	rSize := add("struct: pad < size, size % align == 0, lines64 == ceil(size/64)")
@@ -15043,6 +15651,64 @@ func selfCheck(g *Graph, w *bufio.Writer) int {
 				pk = ss.TotalSize
 			}
 			fail(rPacked, pk == want, at(s))
+		}
+	}
+
+	// The parser stores a struct body as a flat range that also covers the
+	// members of any aggregate declared inside it. Hoisting those is right for
+	// an anonymous member and wrong for a named one, and the sizes above
+	// cannot tell: a struct that swallowed its nested member's fields is still
+	// self-consistent. The fields table can -- there the leak shows as the
+	// nested aggregate's whole member list, same lines and all, sitting
+	// directly in front of the named member that should have hidden it.
+	rNest := add("a named nested struct/union member keeps its fields to itself")
+	{
+		byTag := map[int32][]*Field{}
+		for i := range g.Fields {
+			f := &g.Fields[i]
+			byTag[f.SymbolID] = append(byTag[f.SymbolID], f)
+		}
+		type fkey struct {
+			file, line int32
+			name       string
+		}
+		first := map[fkey][]int32{}
+		for id, fs := range byTag {
+			sort.Slice(fs, func(a, b int) bool { return fs[a].Ordinal < fs[b].Ordinal })
+			if t := g.sym(id); t != nil && fs[0].Name() != "" {
+				k := fkey{t.FileID, fs[0].Line, fs[0].Name()}
+				first[k] = append(first[k], id)
+			}
+		}
+		for id, fs := range byTag {
+			o := g.sym(id)
+			if o == nil {
+				continue
+			}
+			leak := false
+			for i := 0; i < len(fs) && !leak; i++ {
+				for _, tid := range first[fkey{o.FileID, fs[i].Line, fs[i].Name()}] {
+					ts := byTag[tid]
+					if tid == id || i+len(ts) >= len(fs) {
+						continue
+					}
+					same := true
+					for k := range ts {
+						if ts[k].Name() != fs[i+k].Name() || ts[k].Line != fs[i+k].Line ||
+							ts[k].Type() != fs[i+k].Type() {
+							same = false
+							break
+						}
+					}
+					t, m := g.sym(tid), fs[i+len(ts)]
+					if same && m.Name() != "" && (m.Type() == t.Kind() ||
+						m.Type() == t.Kind()+" "+t.Name()) {
+						leak = true
+						break
+					}
+				}
+			}
+			fail(rNest, !leak, at(o))
 		}
 	}
 
@@ -15193,10 +15859,10 @@ func cgasBytes[T any](rows []T) []byte {
 const cgasMagic = "CGAS"
 
 const (
-	cgasVersion  = 4
+	cgasVersion  = 5
 	cgasHeaderSz = 32
 	cgasSecSz    = 24
-	cgasNSec     = 36
+	cgasNSec     = 35
 	cgasArenaLo  = 1 << 20
 )
 
@@ -15236,7 +15902,6 @@ const (
 	cgasSecUnres
 	cgasSecMeta
 	cgasSecCounters
-	cgasSecTrees
 )
 
 type cgasHeader struct {
@@ -15568,7 +16233,7 @@ machine output
   --dump PATH     write every table as text
   --save PATH     same as --dump; refuses to overwrite without --force
   --save-ast PATH write the parsed state; --load-ast PATH reads it back and
-                  skips parsing
+                  skips parsing. It takes no root: --load-ast s.ast dead-code
 
 other
   --quiet         no progress on stderr
@@ -15703,11 +16368,10 @@ func cell(v fval) string {
 	default:
 		t = v.s
 	}
-	r := []rune(t)
-	if len(r) <= maxCell {
+	if len(t) <= maxCell || utf8.RuneCountInString(t) <= maxCell {
 		return t
 	}
-	return string(r[:maxCell-3]) + "..."
+	return string([]rune(t)[:maxCell-3]) + "..."
 }
 
 func render(w *bufio.Writer, rows [][]fval, cols []string) {
@@ -15715,43 +16379,47 @@ func render(w *bufio.Writer, rows [][]fval, cols []string) {
 		fmt.Fprintln(w, " (no rows)")
 		return
 	}
-	body := make([][]string, len(rows))
-	for i, r := range rows {
-		body[i] = make([]string, len(r))
+	// one backing array for every cell, and the padding written straight to
+	// the output: a slice, a padded copy and a joined line per row was most
+	// of what printing a long result cost
+	nc := len(cols)
+	body := make([]string, 0, len(rows)*nc)
+	widths := make([]int, nc)
+	for i, c := range cols {
+		widths[i] = utf8.RuneCountInString(c)
+	}
+	for _, r := range rows {
 		for j, v := range r {
-			body[i][j] = cell(v)
+			c := cell(v)
+			if n := utf8.RuneCountInString(c); j < nc && n > widths[j] {
+				widths[j] = n
+			}
+			body = append(body, c)
 		}
 	}
-	widths := make([]int, len(cols))
-	for i, c := range cols {
-		widths[i] = len([]rune(c))
-	}
-	for _, r := range body {
-		for i, c := range r {
-			if n := len([]rune(c)); n > widths[i] {
-				widths[i] = n
+	line := func(get func(i int) string, n int) {
+		for i := 0; i < n; i++ {
+			c := get(i)
+			w.WriteByte(' ')
+			w.WriteString(c)
+			for k := widths[i] - utf8.RuneCountInString(c); k > 0; k-- {
+				w.WriteByte(' ')
 			}
 		}
+		w.WriteByte('\n')
 	}
-	head := make([]string, len(cols))
-	dash := make([]string, len(cols))
-	for i, c := range cols {
-		head[i] = pad(c, widths[i])
-		dash[i] = strings.Repeat("-", widths[i])
-	}
-	fmt.Fprintf(w, " %s\n", strings.Join(head, " "))
-	fmt.Fprintf(w, " %s\n", strings.Join(dash, " "))
-	for _, r := range body {
-		cells := make([]string, len(r))
-		for i, c := range r {
-			cells[i] = pad(c, widths[i])
-		}
-		fmt.Fprintf(w, " %s\n", strings.Join(cells, " "))
+	line(func(i int) string { return cols[i] }, nc)
+	line(func(i int) string { return strings.Repeat("-", widths[i]) }, nc)
+	at := 0
+	for _, r := range rows {
+		row := body[at : at+len(r)]
+		at += len(r)
+		line(func(i int) string { return row[i] }, len(r))
 	}
 }
 
 func pad(s string, w int) string {
-	n := w - len([]rune(s))
+	n := w - utf8.RuneCountInString(s)
 	if n <= 0 {
 		return s
 	}
@@ -16211,7 +16879,6 @@ func saveASTFile(g *Graph, path string) (int64, error) {
 	body[cgasSecUnres-1] = cgasBytes(g.Unres)
 	body[cgasSecMeta-1] = cgasBytes(metaRows)
 	body[cgasSecCounters-1] = cgasBytes([]cgasCounters{ctr})
-	body[cgasSecTrees-1] = cgTreesBlob(g)
 	body[cgasSecStrings-1] = cgArena
 
 	secLn := map[uint32]uint64{
@@ -16335,7 +17002,7 @@ func loadAST(path string) (*Graph, error) {
 		return nil, bad("bad magic %q, want %q -- not an AST state file", string(mem[0:4]), cgasMagic)
 	}
 	if v := cgGetU32(mem, 4); v != cgasVersion {
-		return nil, bad("unsupported state format version %d -- CGAS v1, v2 and v3 are retired, re-save with this build to produce v%d", v, cgasVersion)
+		return nil, bad("unsupported state format version %d -- CGAS v1 to v4 are retired, re-save with this build to produce v%d", v, cgasVersion)
 	}
 	secCount := int(cgGetU32(mem, 8))
 	total := cgGetU64(mem, 16)
@@ -16892,13 +17559,6 @@ func loadAST(path string) (*Graph, error) {
 	}
 
 	g := &Graph{astBlob: mem}
-	{
-		to, tl := secs[cgasSecTrees].Off, secs[cgasSecTrees].Len
-		if err := cgTreesParse(mem[to:to+tl:to+tl], g); err != nil {
-			syscall.Munmap(mem)
-			return nil, err
-		}
-	}
 	g.Files = files
 	g.Modules = mods
 	g.symStore = symRows
@@ -18133,8 +18793,7 @@ type preprocessor struct {
 // into would let it free them. Slabs of ppMacro and hideSet keep the pointers
 // visible and still turn a million small allocations into a few hundred.
 //
-// A region may only be reused once the unit's rows have been derived. When
-// trees are being kept (--save-ast) each unit gets a region of its own.
+// A region may only be reused once the unit's rows have been derived.
 type ppRegion struct {
 	macros   map[string]*ppMacro
 	fileByID map[uint32]*fileTokSrc
@@ -24360,6 +25019,7 @@ func (df *derivedFile) deriveFunction(fd *FuncDef, n *Node) {
 	df.funcSymByNode[df.lastFuncNode] = sid
 
 	np := int32(0)
+	sawEllipsis := false
 	for pi := uint32(0); pi < fd.NParams; pi++ {
 		pn := &fa.Nodes[fd.Param0+pi]
 		pd := &fa.Params[pn.A-1]
@@ -24372,8 +25032,8 @@ func (df *derivedFile) deriveFunction(fd *FuncDef, n *Node) {
 			pa := ParamRow{SymbolID: sid, Pos: np, IsVariadic: 1,
 				IsMutable: 1, Type: "..."}
 			df.params = append(df.params, pa)
-			np++
 			sym.IsVariadic = 1
+			sawEllipsis = true
 			continue
 		}
 		pa := ParamRow{SymbolID: sid, Pos: np,
@@ -24393,6 +25053,12 @@ func (df *derivedFile) deriveFunction(fd *FuncDef, n *Node) {
 		np++
 	}
 	sym.NParams = np
+	// `...` ends the parameter list in the parser without a node of its own,
+	// so the row is made here. n_params stays the count of named slots.
+	if fd.Variadic && !sawEllipsis {
+		df.params = append(df.params, ParamRow{SymbolID: sid, Pos: np,
+			IsVariadic: 1, IsMutable: 1, Type: "..."})
+	}
 
 	sym.NLocals = int32(len(w.locals))
 	for i := range w.locals {
@@ -24498,8 +25164,9 @@ func (df *derivedFile) textHeuristics(sym *SymbolRow, w *bodyWalk, fd *FuncDef, 
 	r := &sym.SymbolRare
 
 	if df.nlRaw != nil {
-		if doc, _ := leadingComment(df.srcRaw, df.nlRaw, int(n.Line)); doc {
+		if doc, nd := leadingComment(df.srcRaw, df.nlRaw, int(n.Line)); doc {
 			sym.HasDoc = 1
+			df.file.DocLines += int32(nd)
 		}
 	}
 	sym.NBodyBytes = int32(runeLen(rawBody))
@@ -26042,20 +26709,17 @@ type c23tu struct {
 }
 
 type c23run struct {
-	g         *Graph
-	abs       string
-	mu        sync.Mutex
-	claim     map[string]int32
-	turn      int32
-	nPanics   int32
-	paths     map[string]int32
-	absID     map[string]int32
-	quiet     bool
-	keepTrees bool
+	g       *Graph
+	abs     string
+	claim   map[string]int32
+	nPanics int32
+	paths   map[string]int32
+	absID   map[string]int32
+	quiet   bool
 }
 
-func (e *extractor) runC23(abs string, g *Graph, parseIDs []int32, quiet bool, step int, keepTrees bool) []*fileOut {
-	cr := &c23run{g: g, abs: abs, quiet: quiet, keepTrees: keepTrees,
+func (e *extractor) runC23(abs string, g *Graph, parseIDs []int32, quiet bool, step int) []*fileOut {
+	cr := &c23run{g: g, abs: abs, quiet: quiet,
 		claim: map[string]int32{}, paths: map[string]int32{},
 		absID: map[string]int32{}}
 	for _, id := range parseIDs {
@@ -26073,40 +26737,95 @@ func (e *extractor) runC23(abs string, g *Graph, parseIDs []int32, quiet bool, s
 	if workers < 1 {
 		workers = 1
 	}
-	jobs := make(chan int)
-	var wg sync.WaitGroup
-	sem := newByteWindow(parseByteBudget)
+	// The first unit to include a header owns it, so claims are made in unit
+	// order. Nothing else is ordered: a worker whose unit is parsed leaves it
+	// for whoever reaches its turn and takes the next one, and a claimed unit
+	// is derived by any free worker. Waiting for the turn in place, as this
+	// used to, left a third of PostgreSQL's worker time idle behind whichever
+	// unit happened to be large.
+	//
+	// A unit stays live -- tree, region and all -- from the start of its
+	// parse to the end of its derivation, and the live set is bounded both by
+	// count and by root-file bytes so one slow unit cannot pile the rest up.
+	n := len(parseIDs)
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		cond    = sync.NewCond(&mu)
+		next    int // next unit to parse
+		turn    int // next unit to claim
+		live    int
+		liveSz  int64
+		ready   []int // claimed, waiting to be derived
+		parsed  = make([]bool, n)
+		regOf   = make([]*ppRegion, n)
+		regFree []*ppRegion
+	)
+	charge := func(i int) int64 {
+		return min(fileCharge(int64(g.Files[parseIDs[i]-1].Bytes)), parseByteBudget)
+	}
+	maxLive := 2 * workers
+	retire := func(i int) {
+		regFree = append(regFree, regOf[i])
+		regOf[i] = nil
+		live--
+		liveSz -= charge(i)
+	}
 	for k := 0; k < workers; k++ {
 		wg.Go(func() {
-			// one region per worker, reset per unit -- unless trees are kept,
-			// when a unit's preprocessor state has to outlive the next unit
-			var reg *ppRegion
-			if !cr.keepTrees {
-				reg = newPPRegion()
-			}
-			for i := range jobs {
-				sz := fileCharge(int64(cr.g.Files[parseIDs[i]-1].Bytes))
-				sem.take(sz)
-				tu := cr.parseTU(int32(i), parseIDs[i], reg)
-				if tu != nil {
+			mu.Lock()
+			for {
+				if k := len(ready); k > 0 {
+					i := ready[k-1]
+					ready = ready[:k-1]
+					mu.Unlock()
+					tu := tus[i]
 					cr.deriveTU(tu)
-					if !cr.keepTrees {
-						putFA(tu.fa)
-						tu.fa = nil
-					}
+					putFA(tu.fa)
+					tu.fa = nil
 					tu.pp = nil
+					mu.Lock()
+					retire(i)
+					cond.Broadcast()
+					continue
 				}
-				tus[i] = tu
-				sem.give(sz)
+				if next < n && (live == 0 ||
+					(live < maxLive && liveSz+charge(next) <= parseByteBudget)) {
+					i := next
+					next++
+					live++
+					liveSz += charge(i)
+					var reg *ppRegion
+					if k := len(regFree); k > 0 {
+						reg = regFree[k-1]
+						regFree = regFree[:k-1]
+					}
+					mu.Unlock()
+					if reg == nil {
+						reg = newPPRegion()
+					}
+					tu := cr.parseTU(parseIDs[i], reg)
+					mu.Lock()
+					tus[i], regOf[i], parsed[i] = tu, reg, true
+					for ; turn < n && parsed[turn]; turn++ {
+						if t := tus[turn]; t != nil {
+							cr.claimTU(t)
+							ready = append(ready, turn)
+						} else {
+							retire(turn)
+						}
+					}
+					cond.Broadcast()
+					continue
+				}
+				if next >= n && live == 0 {
+					mu.Unlock()
+					return
+				}
+				cond.Wait()
 			}
 		})
 	}
-	go func() {
-		for i := range parseIDs {
-			jobs <- i
-		}
-		close(jobs)
-	}()
 	wg.Wait()
 
 	ppSrcMu.Lock()
@@ -26129,6 +26848,7 @@ func (e *extractor) runC23(abs string, g *Graph, parseIDs []int32, quiet bool, s
 			fl := &g.Files[fid-1]
 			fl.NParseErrors = tu.ferrs[k]
 			fl.NMissingNodes = tu.fmissing[k]
+			fl.DocLines = df.file.DocLines
 			if outs[fid-1] == nil {
 				outs[fid-1] = e.fileOutFrom(cr, df)
 			}
@@ -26138,42 +26858,36 @@ func (e *extractor) runC23(abs string, g *Graph, parseIDs []int32, quiet bool, s
 	return outs
 }
 
-func (cr *c23run) parseTU(pos int32, fid int32, reg *ppRegion) (tu *c23tu) {
+// claimTU gives a parsed unit every file it read that no earlier unit has
+// taken. Callers hold the scheduler lock and call in unit order.
+func (cr *c23run) claimTU(tu *c23tu) {
+	if tu.pp == nil {
+		return
+	}
+	for _, src := range tu.pp.files {
+		p := src.path
+		if id, ok := cr.paths[p]; ok {
+			if _, cdone := cr.claim[p]; !cdone {
+				cr.claim[p] = tu.root
+				tu.claimed = append(tu.claimed, id)
+			} else if id == tu.root {
+				tu.redundant = true
+			}
+		}
+	}
+}
+
+func (cr *c23run) parseTU(fid int32, reg *ppRegion) (tu *c23tu) {
 	tu = &c23tu{root: fid}
-	claiming := true
 	defer func() {
 		if r := recover(); r != nil {
 			atomic.AddInt32(&cr.nPanics, 1)
 			tu = &c23tu{root: fid}
 		}
-		if claiming {
-			for atomic.LoadInt32(&cr.turn) != pos {
-				time.Sleep(50 * time.Microsecond)
-			}
-			cr.mu.Lock()
-			if tu.pp != nil {
-				for _, src := range tu.pp.files {
-					p := src.path
-					if id, ok := cr.paths[p]; ok {
-						if _, cdone := cr.claim[p]; !cdone {
-							cr.claim[p] = fid
-							tu.claimed = append(tu.claimed, id)
-						} else if id == fid {
-							tu.redundant = true
-						}
-					}
-				}
-			}
-			cr.mu.Unlock()
-			atomic.AddInt32(&cr.turn, 1)
-			claiming = false
-		}
 	}()
 	f := &cr.g.Files[fid-1]
 	abs := filepath.Join(cr.abs, filepath.FromSlash(f.Path()))
 	if _, ok := ppCachedRead(abs); !ok {
-		claiming = false
-		atomic.AddInt32(&cr.turn, 1)
 		return nil
 	}
 	tu.fa = getFA()
@@ -26210,19 +26924,12 @@ func (cr *c23run) deriveTU(tu *c23tu) {
 			tu.fmissing = append(tu.fmissing, nmiss)
 		}
 	}
-	if tu.fa != nil && cr.keepTrees {
-		cr.mu.Lock()
-		cr.g.trees = append(cr.g.trees, cgTree{root: tu.root, fa: tu.fa})
-		cr.mu.Unlock()
+	for _, df := range tu.files {
+		df.ast = nil
+		df.pp = nil
+		df.tu, df.tuFuncs, df.glSet = nil, nil, nil
 	}
-	if !cr.keepTrees {
-		for _, df := range tu.files {
-			df.ast = nil
-			df.pp = nil
-			df.tu, df.tuFuncs, df.glSet = nil, nil, nil
-		}
-		tu.marks, tu.funcSet = nil, nil
-	}
+	tu.marks, tu.funcSet = nil, nil
 }
 
 func (cr *c23run) deriveOne(tu *c23tu, fid int32) (df *derivedFile, nerrs int32, nmiss int32) {
@@ -26595,583 +27302,4 @@ func rowRare(s *SymbolRare) symRare {
 		NCallocTransposed:    s.NCallocTransposed,
 		NVaArgArr:            s.NVaArgArr,
 	}
-}
-
-type cgTree struct {
-	root int32
-	fa   *FileAST
-}
-
-type cgBlob struct {
-	b []byte
-}
-
-func (w *cgBlob) u8(v uint8) { w.b = append(w.b, v) }
-func (w *cgBlob) u32(v uint32) {
-	w.b = append(w.b, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
-}
-func (w *cgBlob) i32(v int32) { w.u32(uint32(v)) }
-func (w *cgBlob) i64(v int64) {
-	w.u32(uint32(v))
-	w.u32(uint32(v >> 32))
-}
-func (w *cgBlob) bl(v bool) uint8 {
-	if v {
-		return 1
-	}
-	return 0
-}
-func (w *cgBlob) str(s string) {
-	w.u32(uint32(len(s)))
-	w.b = append(w.b, s...)
-}
-func cgTag8(s string) uint8 {
-	switch s {
-	case "union":
-		return 1
-	case "enum":
-		return 2
-	}
-	return 0
-}
-func cgUntag8(v uint8) string {
-	switch v {
-	case 1:
-		return "union"
-	case 2:
-		return "enum"
-	}
-	return "struct"
-}
-
-func cgTreesBlob(g *Graph) []byte {
-	w := &cgBlob{b: make([]byte, 0, 1<<20)}
-	w.u32(uint32(len(g.trees)))
-	for _, t := range g.trees {
-		fa := t.fa
-		w.i32(t.root)
-		w.u32(uint32(len(fa.Names)))
-		for _, nm := range fa.Names {
-			w.str(nm)
-		}
-		w.u32(uint32(len(fa.Nodes)))
-		for i := range fa.Nodes {
-			n := &fa.Nodes[i]
-			w.u32(uint32(n.Kind))
-			w.u32(uint32(n.Flags))
-			w.u32(n.A)
-			w.u32(n.B)
-			w.u32(n.C)
-			w.u32(n.D)
-			w.u32(n.File)
-			w.i32(n.Off)
-			w.i32(n.End)
-			w.i32(n.Line)
-			w.i32(n.Col)
-		}
-		w.u32(uint32(len(fa.Funcs)))
-		for i := range fa.Funcs {
-			f := &fa.Funcs[i]
-			w.u32(f.NameIdx)
-			w.u32(f.SigIdx)
-			w.u32(f.RetIdx)
-			w.u32(f.Param0)
-			w.u32(f.NParams)
-			w.u32(f.Body)
-			w.i32(f.LineEnd)
-			w.u32(uint32(f.Storage))
-			w.u8(w.bl(f.Variadic))
-			w.u8(w.bl(f.KR))
-			w.u32(f.Attr0)
-			w.u32(f.NAttr)
-		}
-		w.u32(uint32(len(fa.Decls)))
-		for i := range fa.Decls {
-			d := &fa.Decls[i]
-			w.u32(d.NameIdx)
-			w.u32(d.TypeIdx)
-			w.u32(d.Typename)
-			w.i32(d.Bitfield)
-			w.i32(d.ArrayLen)
-			w.i32(d.Ptr)
-			w.u32(d.Init)
-			w.u32(uint32(d.Storage))
-			w.u8(d.Kind)
-			w.i32(d.Line)
-		}
-		w.u32(uint32(len(fa.Params)))
-		for i := range fa.Params {
-			d := &fa.Params[i]
-			w.u32(d.NameIdx)
-			w.u32(d.TypeIdx)
-			w.i32(d.Ptr)
-			w.i32(d.ArrayLen)
-			w.u32(uint32(d.Storage))
-			w.u8(w.bl(d.Variadic))
-			w.u8(w.bl(d.Unnamed))
-			w.u8(w.bl(d.IsConst))
-			w.i32(d.Line)
-		}
-		w.u32(uint32(len(fa.Tags)))
-		for i := range fa.Tags {
-			d := &fa.Tags[i]
-			w.u32(d.NameIdx)
-			w.u8(cgTag8(d.Tag))
-			w.u32(d.Child0)
-			w.u32(d.NChild)
-			w.u32(d.UnderlyingIdx)
-			w.u8(w.bl(d.HasUnderlying))
-			w.u8(w.bl(d.Defined))
-			w.i32(d.Line)
-			w.i32(d.LineEnd)
-		}
-		w.u32(uint32(len(fa.Fields)))
-		for i := range fa.Fields {
-			d := &fa.Fields[i]
-			w.u32(d.NameIdx)
-			w.u32(d.TypeIdx)
-			w.u32(d.PtrTypeIdx)
-			w.i32(d.Ptr)
-			w.i32(d.ArrayLen)
-			w.i32(d.Bitfield)
-			w.u8(w.bl(d.IsFnptr))
-			w.u8(w.bl(d.IsConst))
-			w.i32(d.Depth)
-			w.i32(d.Line)
-		}
-		w.u32(uint32(len(fa.Enums)))
-		for i := range fa.Enums {
-			d := &fa.Enums[i]
-			w.u32(d.NameIdx)
-			w.u32(d.ValueIdx)
-			w.u8(w.bl(d.HasValue))
-			w.i32(d.Line)
-		}
-		w.u32(uint32(len(fa.Types)))
-		for i := range fa.Types {
-			d := &fa.Types[i]
-			w.u32(d.TextIdx)
-			w.i32(d.Ptr)
-			w.u8(w.bl(d.Array))
-			w.i32(d.ArrayLen)
-			w.u8(w.bl(d.IsFn))
-		}
-		w.u32(uint32(len(fa.Inits)))
-		for i := range fa.Inits {
-			d := &fa.Inits[i]
-			w.u32(d.FieldIdx)
-			w.i64(d.Index)
-			w.u8(w.bl(d.HasIndex))
-			w.u8(w.bl(d.IsList))
-		}
-		w.u32(uint32(len(fa.Assocs)))
-		for i := range fa.Assocs {
-			d := &fa.Assocs[i]
-			w.u32(d.TypeIdx)
-			w.u8(w.bl(d.IsDefault))
-			w.u32(d.Expr)
-		}
-		w.u32(uint32(len(fa.Attrs)))
-		for i := range fa.Attrs {
-			a := &fa.Attrs[i]
-			w.str(a.Name)
-			w.str(a.Args)
-			w.i32(a.Line)
-			w.i32(a.Off)
-			w.i32(a.End)
-		}
-	}
-	return w.b
-}
-
-func cgTreesParse(b []byte, g *Graph) error {
-	r := &cgRd{b: b}
-	if !r.u32ok() {
-		return fmt.Errorf("trees: truncated header")
-	}
-	n := r.u32v()
-	if n > 1<<20 {
-		return fmt.Errorf("trees: implausible tree count %d", n)
-	}
-	for k := uint32(0); k < n; k++ {
-		fa := &FileAST{}
-		t := cgTree{fa: fa}
-		var ok bool
-		if t.root, ok = r.i32v(); !ok {
-			return fmt.Errorf("trees: truncated root")
-		}
-		if !r.u32ok() {
-			return fmt.Errorf("trees: truncated names")
-		}
-		nn := r.u32v()
-		if nn > 1<<26 {
-			return fmt.Errorf("trees: implausible name count %d", nn)
-		}
-		fa.Names = make([]string, 0, min(nn, 1<<20))
-		for i := uint32(0); i < nn; i++ {
-			s, ok := r.strv()
-			if !ok {
-				return fmt.Errorf("trees: truncated name")
-			}
-			fa.Names = append(fa.Names, s)
-		}
-		if fa.Nodes, ok = r.nodes(); !ok {
-			return fmt.Errorf("trees: truncated nodes")
-		}
-		if fa.Funcs, ok = r.funcs(); !ok {
-			return fmt.Errorf("trees: truncated funcs")
-		}
-		if fa.Decls, ok = r.decls(); !ok {
-			return fmt.Errorf("trees: truncated decls")
-		}
-		if fa.Params, ok = r.params(); !ok {
-			return fmt.Errorf("trees: truncated params")
-		}
-		if fa.Tags, ok = r.tags(); !ok {
-			return fmt.Errorf("trees: truncated tags")
-		}
-		if fa.Fields, ok = r.fields(); !ok {
-			return fmt.Errorf("trees: truncated fields")
-		}
-		if fa.Enums, ok = r.enums(); !ok {
-			return fmt.Errorf("trees: truncated enums")
-		}
-		if fa.Types, ok = r.types(); !ok {
-			return fmt.Errorf("trees: truncated types")
-		}
-		if fa.Inits, ok = r.inits(); !ok {
-			return fmt.Errorf("trees: truncated inits")
-		}
-		if fa.Assocs, ok = r.assocs(); !ok {
-			return fmt.Errorf("trees: truncated assocs")
-		}
-		if !r.u32ok() {
-			return fmt.Errorf("trees: truncated attrs")
-		}
-		na := r.u32v()
-		if na > 1<<24 {
-			return fmt.Errorf("trees: implausible attr count %d", na)
-		}
-		for i := uint32(0); i < na; i++ {
-			nm, ok1 := r.strv()
-			ar, ok2 := r.strv()
-			ln, ok3 := r.i32v()
-			of, ok4 := r.i32v()
-			en, ok5 := r.i32v()
-			if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 {
-				return fmt.Errorf("trees: truncated attrs")
-			}
-			fa.Attrs = append(fa.Attrs, AttrRec{Name: nm, Args: ar, Line: ln, Off: of, End: en})
-		}
-		g.trees = append(g.trees, t)
-	}
-	return nil
-}
-
-type cgRd struct {
-	b []byte
-	p int
-}
-
-func (r *cgRd) need(n int) bool { return r.p+n <= len(r.b) }
-func (r *cgRd) u32ok() bool     { return r.need(4) }
-func (r *cgRd) u32v() uint32 {
-	v := uint32(r.b[r.p]) | uint32(r.b[r.p+1])<<8 | uint32(r.b[r.p+2])<<16 | uint32(r.b[r.p+3])<<24
-	r.p += 4
-	return v
-}
-func (r *cgRd) i32v() (int32, bool) {
-	if !r.need(4) {
-		return 0, false
-	}
-	return int32(r.u32v()), true
-}
-func (r *cgRd) i64v() (int64, bool) {
-	lo, ok1 := r.i32v()
-	hi, ok2 := r.i32v()
-	if !ok1 || !ok2 {
-		return 0, false
-	}
-	return int64(uint64(uint32(hi))<<32 | uint64(uint32(lo))), true
-}
-func (r *cgRd) strv() (string, bool) {
-	if !r.u32ok() {
-		return "", false
-	}
-	n := r.u32v()
-	if !r.need(int(n)) {
-		return "", false
-	}
-	s := string(r.b[r.p : r.p+int(n)])
-	r.p += int(n)
-	return s, true
-}
-func (r *cgRd) u8v() (uint8, bool) {
-	if !r.need(1) {
-		return 0, false
-	}
-	v := r.b[r.p]
-	r.p++
-	return v, true
-}
-func (r *cgRd) blv(v uint8) bool { return v != 0 }
-
-func (r *cgRd) nodes() ([]Node, bool) {
-	if !r.u32ok() {
-		return nil, false
-	}
-	n := r.u32v()
-	if n > 1<<26 {
-		return nil, false
-	}
-	out := make([]Node, 0, min(n, 1<<20))
-	for i := uint32(0); i < n; i++ {
-		if !r.need(44) {
-			return nil, false
-		}
-		kind := uint16(r.u32v())
-		flags := uint16(r.u32v())
-		a := r.u32v()
-		b := r.u32v()
-		c := r.u32v()
-		d := r.u32v()
-		fl := r.u32v()
-		off, _ := r.i32v()
-		en, _ := r.i32v()
-		ln, _ := r.i32v()
-		col, _ := r.i32v()
-		out = append(out, Node{Kind: kind, Flags: flags, A: a, B: b, C: c, D: d,
-			File: fl, Off: off, End: en, Line: ln, Col: col})
-	}
-	return out, true
-}
-func (r *cgRd) funcs() ([]FuncDef, bool) {
-	if !r.u32ok() {
-		return nil, false
-	}
-	n := r.u32v()
-	if n > 1<<24 {
-		return nil, false
-	}
-	out := make([]FuncDef, 0, min(n, 1<<16))
-	for i := uint32(0); i < n; i++ {
-		if !r.need(42) {
-			return nil, false
-		}
-		ni := r.u32v()
-		si := r.u32v()
-		ri := r.u32v()
-		p0 := r.u32v()
-		np := r.u32v()
-		bd := r.u32v()
-		le, _ := r.i32v()
-		st := r.u32v()
-		va, _ := r.u8v()
-		kr, _ := r.u8v()
-		a0 := r.u32v()
-		an := r.u32v()
-		out = append(out, FuncDef{NameIdx: ni, SigIdx: si, RetIdx: ri,
-			Param0: p0, NParams: np, Body: bd, LineEnd: le, Storage: uint16(st),
-			Variadic: r.blv(va), KR: r.blv(kr), Attr0: a0, NAttr: an})
-	}
-	return out, true
-}
-func (r *cgRd) decls() ([]DeclNode, bool) {
-	if !r.u32ok() {
-		return nil, false
-	}
-	n := r.u32v()
-	if n > 1<<25 {
-		return nil, false
-	}
-	out := make([]DeclNode, 0, min(n, 1<<18))
-	for i := uint32(0); i < n; i++ {
-		if !r.need(37) {
-			return nil, false
-		}
-		ni := r.u32v()
-		ti := r.u32v()
-		ty := r.u32v()
-		bf, _ := r.i32v()
-		al, _ := r.i32v()
-		pt, _ := r.i32v()
-		in := r.u32v()
-		st := r.u32v()
-		kd, _ := r.u8v()
-		ln, _ := r.i32v()
-		out = append(out, DeclNode{NameIdx: ni, TypeIdx: ti, Typename: ty,
-			Bitfield: bf, ArrayLen: al, Ptr: pt, Init: in, Storage: uint16(st),
-			Kind: kd, Line: ln})
-	}
-	return out, true
-}
-func (r *cgRd) params() ([]ParamD, bool) {
-	if !r.u32ok() {
-		return nil, false
-	}
-	n := r.u32v()
-	if n > 1<<25 {
-		return nil, false
-	}
-	out := make([]ParamD, 0, min(n, 1<<18))
-	for i := uint32(0); i < n; i++ {
-		if !r.need(27) {
-			return nil, false
-		}
-		ni := r.u32v()
-		ti := r.u32v()
-		pt, _ := r.i32v()
-		al, _ := r.i32v()
-		st := r.u32v()
-		va, _ := r.u8v()
-		un, _ := r.u8v()
-		ic, _ := r.u8v()
-		ln, _ := r.i32v()
-		out = append(out, ParamD{NameIdx: ni, TypeIdx: ti, Ptr: pt,
-			ArrayLen: al, Storage: uint16(st), Variadic: r.blv(va),
-			Unnamed: r.blv(un), IsConst: r.blv(ic), Line: ln})
-	}
-	return out, true
-}
-func (r *cgRd) tags() ([]TagD, bool) {
-	if !r.u32ok() {
-		return nil, false
-	}
-	n := r.u32v()
-	if n > 1<<24 {
-		return nil, false
-	}
-	out := make([]TagD, 0, min(n, 1<<16))
-	for i := uint32(0); i < n; i++ {
-		if !r.need(27) {
-			return nil, false
-		}
-		ni := r.u32v()
-		tg, _ := r.u8v()
-		c0 := r.u32v()
-		nc := r.u32v()
-		ui := r.u32v()
-		hu, _ := r.u8v()
-		df, _ := r.u8v()
-		ln, _ := r.i32v()
-		le, _ := r.i32v()
-		out = append(out, TagD{NameIdx: ni, Tag: cgUntag8(tg), Child0: c0,
-			NChild: nc, UnderlyingIdx: ui, HasUnderlying: r.blv(hu),
-			Defined: r.blv(df), Line: ln, LineEnd: le})
-	}
-	return out, true
-}
-func (r *cgRd) fields() ([]FieldD, bool) {
-	if !r.u32ok() {
-		return nil, false
-	}
-	n := r.u32v()
-	if n > 1<<25 {
-		return nil, false
-	}
-	out := make([]FieldD, 0, min(n, 1<<18))
-	for i := uint32(0); i < n; i++ {
-		if !r.need(34) {
-			return nil, false
-		}
-		ni := r.u32v()
-		ti := r.u32v()
-		pt := r.u32v()
-		pd, _ := r.i32v()
-		al, _ := r.i32v()
-		bf, _ := r.i32v()
-		fp, _ := r.u8v()
-		ic, _ := r.u8v()
-		dp, _ := r.i32v()
-		ln, _ := r.i32v()
-		out = append(out, FieldD{NameIdx: ni, TypeIdx: ti, PtrTypeIdx: pt,
-			Ptr: pd, ArrayLen: al, Bitfield: bf, IsFnptr: r.blv(fp),
-			IsConst: r.blv(ic), Depth: dp, Line: ln})
-	}
-	return out, true
-}
-func (r *cgRd) enums() ([]EnumD, bool) {
-	if !r.u32ok() {
-		return nil, false
-	}
-	n := r.u32v()
-	if n > 1<<24 {
-		return nil, false
-	}
-	out := make([]EnumD, 0, min(n, 1<<16))
-	for i := uint32(0); i < n; i++ {
-		if !r.need(13) {
-			return nil, false
-		}
-		ni := r.u32v()
-		vi := r.u32v()
-		hv, _ := r.u8v()
-		ln, _ := r.i32v()
-		out = append(out, EnumD{NameIdx: ni, ValueIdx: vi, HasValue: r.blv(hv), Line: ln})
-	}
-	return out, true
-}
-func (r *cgRd) types() ([]TypeD, bool) {
-	if !r.u32ok() {
-		return nil, false
-	}
-	n := r.u32v()
-	if n > 1<<25 {
-		return nil, false
-	}
-	out := make([]TypeD, 0, min(n, 1<<18))
-	for i := uint32(0); i < n; i++ {
-		if !r.need(14) {
-			return nil, false
-		}
-		ti := r.u32v()
-		pt, _ := r.i32v()
-		ar, _ := r.u8v()
-		al, _ := r.i32v()
-		fn, _ := r.u8v()
-		out = append(out, TypeD{TextIdx: ti, Ptr: pt, Array: r.blv(ar),
-			ArrayLen: al, IsFn: r.blv(fn)})
-	}
-	return out, true
-}
-func (r *cgRd) inits() ([]InitD, bool) {
-	if !r.u32ok() {
-		return nil, false
-	}
-	n := r.u32v()
-	if n > 1<<25 {
-		return nil, false
-	}
-	out := make([]InitD, 0, min(n, 1<<18))
-	for i := uint32(0); i < n; i++ {
-		if !r.need(14) {
-			return nil, false
-		}
-		fi := r.u32v()
-		ix, _ := r.i64v()
-		hi, _ := r.u8v()
-		il, _ := r.u8v()
-		out = append(out, InitD{FieldIdx: fi, Index: ix, HasIndex: r.blv(hi), IsList: r.blv(il)})
-	}
-	return out, true
-}
-func (r *cgRd) assocs() ([]GenericAssoc, bool) {
-	if !r.u32ok() {
-		return nil, false
-	}
-	n := r.u32v()
-	if n > 1<<25 {
-		return nil, false
-	}
-	out := make([]GenericAssoc, 0, min(n, 1<<18))
-	for i := uint32(0); i < n; i++ {
-		if !r.need(9) {
-			return nil, false
-		}
-		ti := r.u32v()
-		df, _ := r.u8v()
-		ex := r.u32v()
-		out = append(out, GenericAssoc{TypeIdx: ti, IsDefault: r.blv(df), Expr: ex})
-	}
-	return out, true
 }
